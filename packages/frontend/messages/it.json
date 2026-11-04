@@ -1597,7 +1597,7 @@
       "disable": "Disattiva",
       "enable": "Attiva",
       "proxy": "Proxy",
-      "proxyTitle": "Instrada la richiesta di questo strumento attraverso il proxy / web-unblocker configurato. Consigliato per API con protezione anti-bot, blocchi geografici o limiti di frequenza.",
+      "proxyTitle": "Instrada la richiesta di questo strumento attraverso il proxy / web-unblocker configurato. Consigliato per API con protezione anti-bot, blocchi geografici o limiti di frequenza. Le chiamate tramite proxy partono da indirizzi IP che cambiano: lascialo spento per un server che accetta solo IP autorizzati.",
       "delete": "Elimina",
       "showSql": "Mostra tutto l'SQL",
       "showPath": "Mostra tutto il percorso",
@@ -3370,6 +3370,15 @@
       "body": "La ricerca file indicizza i file PDF, Word, Excel e Outlook sul tuo NAS, server o storage e tiene l'indice aggiornato: così l'AI trova cosa c'è scritto nei file, non solo i loro nomi.",
       "cta": "Configura la ricerca file",
       "for": "Apre la procedura guidata per {name}."
+    },
+    "authorize": {
+      "banner": "Stai collegando una cartella per il tuo assistente AI. Quando la cartella è attiva, torni alla chat.",
+      "skip": "Salta e torna alla chat",
+      "opening": "Apertura della configurazione della cartella…",
+      "openFailedTitle": "Non è stato possibile aprire la configurazione della cartella",
+      "openFailed": "Questa pagina è scaduta.",
+      "openFailedHint": "Torna alla chat e collega di nuovo, oppure accedi alla dashboard e configura lì la cartella.",
+      "openWizard": "Configura la cartella nella dashboard"
     }
   },
   "fileShare": {
@@ -3468,5 +3477,32 @@
       "preparing": "Preparazione…",
       "warning": "Apri solo file di persone di cui ti fidi. AnythingMCP non controlla i file per i virus."
     }
+  },
+  "networkNote": {
+    "title": "Il server accetta solo indirizzi IP autorizzati?",
+    "body": "AnythingMCP chiama l'API da {count, plural, one {questo indirizzo} other {questi indirizzi}}. Se il server o l'account accetta solo IP autorizzati (firewall, whitelist IP), {count, plural, one {aggiungilo} other {aggiungili}} lì; altrimenti non serve fare nulla.",
+    "requiredTitle": "Registra l'indirizzo IP",
+    "requiredBody": "{name} accetta solo chiamate da indirizzi IP registrati. Registra {count, plural, one {questo indirizzo} other {questi indirizzi}} nel tuo account {name} prima di iniziare, altrimenti ogni chiamata viene rifiutata.",
+    "requiredNoIps": "{name} accetta solo chiamate da indirizzi IP registrati. Prima di iniziare registra l'indirizzo IP pubblico del server su cui gira AnythingMCP (lo conosce chi gestisce la tua rete), altrimenti ogni chiamata viene rifiutata.",
+    "proxy": "Lascia disattivata l'opzione \"Proxy\" sui tool di un server con whitelist: le chiamate tramite proxy partono da indirizzi che cambiano.",
+    "copy": "Copia",
+    "copied": "Copiato"
+  },
+  "licenseWall": {
+    "title": "Tieni la tua AI collegata alle tue app",
+    "body": "La tua prova di 7 giorni è terminata. Con l'abbonamento {client} continua a lavorare con i tuoi connettori. Tutto ciò che hai configurato resta.",
+    "yourAi": "la tua AI",
+    "recapCalls": "{client} ha fatto {count, plural, one {# chiamata riuscita} other {# chiamate riuscite}} in questo workspace.",
+    "recapCallsWith": "{client} ha fatto {count, plural, one {# chiamata riuscita} other {# chiamate riuscite}} in questo workspace, con {connectors}.",
+    "recapBlocked": "Da quando la prova è terminata, {client} ha provato di nuovo a usarli. Quelle chiamate sono in pausa finché non ti abboni.",
+    "loading": "Caricamento dei piani…",
+    "trust": {
+      "cancel": "Disdici quando vuoi",
+      "stripe": "Pagamento sicuro con Stripe",
+      "hosted": "Ospitato a Francoforte",
+      "gdpr": "GDPR · DPA"
+    },
+    "workspaces": "{count} workspace su AnythingMCP Cloud",
+    "directory": "Presente nella Claude Directory"
   }
 }

@@ -475,7 +475,7 @@ export const connectors = {
   list: (token: string) =>
     request<Connector[]>('/api/connectors', { token }),
   proxyAvailability: (token: string) =>
-    request<{ available: boolean }>('/api/connectors/proxy-availability', { token }),
+    request<{ available: boolean; egressIps?: string[] }>('/api/connectors/proxy-availability', { token }),
   /**
    * `attachedToServer` is the MCP server the backend put the connector on, or
    * null when the workspace has none yet. Attaching used to be a separate step
@@ -706,6 +706,20 @@ export const setupLinks = {
     }),
 };
 
+/**
+ * The File Search plugin's folder setup, opened from its authorization page
+ * (login.controller.ts): the backend checks the sign-in just made there and
+ * returns a dashboard session on the granted workspace plus the wizard path.
+ */
+export const fileSearchSetup = {
+  openFromAuthorize: (csrf: string, option: string) =>
+    request<{ ok: true; redirect: string; session: SetupLinkSession }>('/auth/file-search/session', {
+      method: 'POST',
+      headers: DASHBOARD_HEADER,
+      body: { csrf, option },
+    }),
+};
+
 // Adapters (built-in connector recipes)
 export type SetupKind = 'none' | 'credentials' | 'oauth_browser';
 
@@ -738,6 +752,10 @@ export interface AdapterSetupInfo {
   prerequisites?: string;
   /** A step-by-step setup, shown instead of the form (see backend setup-guide.ts). */
   setupGuide?: SetupGuide;
+  /** The provider refuses calls from addresses not registered with it. */
+  requiresIpAllowlist?: boolean;
+  /** The addresses this instance calls APIs from (EGRESS_IPS); empty when not configured. */
+  egressIps?: string[];
 }
 
 export type SetupEffortKind = 'none' | 'one_click' | 'api_key' | 'own_app' | 'admin_needed';
@@ -2042,6 +2060,14 @@ export const license = {
       '/api/license/card-trial-offer',
       { token },
     ),
+  /**
+   * Cloud: the ended-trial wall of an admin: its variant ('trust', or the
+   * earlier 'control' wall for about 10% of workspaces) and the workspace's
+   * own numbers, null when it never made a successful call. `wall` is null
+   * for everyone else.
+   */
+  wall: (token: string) =>
+    request<{ wall: LicenseWallView | null }>('/api/license/wall', { token }),
   getInstanceId: () =>
     request<{ instanceId: string }>('/api/license/instance-id'),
   getUsage: (token?: string) =>
@@ -2361,3 +2387,14 @@ export const fileShare = {
       { method: 'POST', token: authToken ?? undefined, skipAutoLogout: true },
     ),
 };
+
+/** GET /api/license/wall (see the backend's license-wall.service.ts). */
+export interface LicenseWallView {
+  variant: 'trust' | 'control';
+  recap: {
+    successfulCalls: number;
+    connectors: string[];
+    client: string | null;
+    blockedSinceEnd: boolean;
+  } | null;
+}
