@@ -324,9 +324,7 @@ export class McpServerService implements OnModuleInit {
   ): Promise<void> {
     const { syncKg = true, notifySessions = true } = opts;
     // Remove old tools from both registries
-    const oldTools = this.toolRegistry
-      .getAllTools()
-      .filter((t) => t.connectorId === connectorId);
+    const oldTools = this.toolRegistry.getToolsForConnectors([connectorId]);
     this.toolRegistry.unregisterConnectorTools(connectorId);
     for (const tool of oldTools) {
       // Only drop from the upstream MCP registry if no other connector
@@ -378,7 +376,8 @@ export class McpServerService implements OnModuleInit {
    *
    * The handler checks role-based access: if the requesting user has a
    * custom MCP role, only tools assigned to that role are executable.
-   * ADMIN users and users without a custom role have unrestricted access.
+   * ADMIN users have unrestricted access. Users without a custom role have it
+   * only while the workspace has no tool whitelist (see RolesService.getAllowedToolIds).
    */
   private registerMcpTool(
     name: string,
@@ -429,6 +428,7 @@ export class McpServerService implements OnModuleInit {
           organizationId: user?.organizationId,
           authMethod: user?.authMethod || 'none',
           apiKeyName: user?.apiKeyName,
+          supportKeyId: user?.supportKeyId,
           // The OAuth client the access token was issued to (`azp` on access
           // tokens, `client_id` on refresh ones), for the blocked-trial event.
           oauthClientId:

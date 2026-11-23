@@ -1,4 +1,6 @@
+import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { inspect } from 'util';
 import axios from 'axios';
 import * as bcrypt from 'bcrypt';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -12,6 +14,10 @@ import {
   LoginTokenAuthConfig,
   proactiveRefreshWindowMs,
   signLoginJwt,
+  loginBasicAuthHeader,
+  renderXmlLoginBody,
+  parseXmlLoginAnswer,
+  extractXmlLoginRefusal,
 } from './login-token.service';
 import { generateKeyPairSync, verify } from 'crypto';
 import { injectLoginTokenHeaders } from './rest.engine';
@@ -335,6 +341,82 @@ describe('LoginTokenService', () => {
     await expect(service.getToken(baseAuth, 'conn-9')).rejects.toThrow(
       /token not found at "data.signIn.token"/,
     );
+  });
+
+  describe('tokenJsonPath as a list (login answer not documented)', () => {
+    const listAuth: LoginTokenAuthConfig = {
+      loginUrl: 'https://login.example.com/token',
+      loginHeaders: { 'x-api-key': 'key-1' },
+      loginBody: { username: '${username}', password: '${password}' },
+      username: 'seller@example.com',
+      password: 'plain-password',
+      tokenJsonPath: ['AuthenticationResult.IdToken', 'data.idToken', 'token', '.'],
+      tokenTTLSeconds: 3600,
+    };
+    const answer = (data: unknown) =>
+      (mockedAxios as unknown as jest.Mock).mockImplementation(async () => ({ data }));
+
+    it('takes the first path that holds a string', async () => {
+      answer({ data: { idToken: 'id-2' }, token: 'later-3' });
+      const bundle = await service.getToken(listAuth, 'conn-list-1');
+      expect(bundle.token).toBe('id-2');
+    });
+
+    it('reads a Cognito-shaped answer from the first path', async () => {
+      answer({ AuthenticationResult: { IdToken: 'id-1', AccessToken: 'acc-1', ExpiresIn: 3600 } });
+      const bundle = await service.getToken(listAuth, 'conn-list-2');
+      expect(bundle.token).toBe('id-1');
+    });
+
+    it('skips empty strings and non-strings', async () => {
+      answer({ AuthenticationResult: { IdToken: '' }, data: { idToken: { nested: true } }, token: 'tok-3' });
+      const bundle = await service.getToken(listAuth, 'conn-list-3');
+      expect(bundle.token).toBe('tok-3');
+    });
+
+    it('takes a bare string answer through "."', async () => {
+      answer('bare-jwt');
+      const bundle = await service.getToken(listAuth, 'conn-list-4');
+      expect(bundle.token).toBe('bare-jwt');
+    });
+
+    it('reports a null token field as a refused login', async () => {
+      answer({ TenantToken: null, UserToken: null });
+      await expect(
+        service.getToken({ ...listAuth, tokenJsonPath: 'TenantToken', audJsonPath: 'UserToken' }, 'conn-null'),
+      ).rejects.toThrow(/refused the login — the token at "TenantToken" was null/);
+    });
+
+    it('names every path when none holds a token', async () => {
+      answer({ ok: true });
+      await expect(
+        service.getToken({ ...listAuth, tokenJsonPath: ['a.b', 'c'] }, 'conn-list-5'),
+      ).rejects.toThrow(/token not found at "a.b", "c" in login response/);
+    });
+
+    it('still quotes the refusal the service gave', async () => {
+      answer({ errors: [{ message: 'Usuario o contraseña inválidos' }] });
+      await expect(service.getToken(listAuth, 'conn-list-6')).rejects.toThrow(
+        /refused the login — Usuario o contraseña inválidos/,
+      );
+    });
+
+    it('reads an empty list as the whole body', async () => {
+      answer('  bare-jwt\n');
+      const bundle = await service.getToken({ ...listAuth, tokenJsonPath: [] }, 'conn-list-7');
+      expect(bundle.token).toBe('bare-jwt');
+    });
+
+    it('refuses a non-string entry before logging in', async () => {
+      const calls = (mockedAxios as unknown as jest.Mock).mock.calls.length;
+      await expect(
+        service.getToken(
+          { ...listAuth, tokenJsonPath: ['token', 5 as unknown as string] },
+          'conn-list-8',
+        ),
+      ).rejects.toThrow(/tokenJsonPath must be a path, or a list of paths/);
+      expect((mockedAxios as unknown as jest.Mock).mock.calls.length).toBe(calls);
+    });
   });
 });
 
@@ -828,9 +910,172 @@ describe('LoginTokenService — signedJwt login (noon Partner API pattern)', () 
     expect(message).not.toContain('secretmaterial');
   });
 
-  it('still asks for username and password when there is no signedJwt', async () => {
+  it('still asks for username and password when there is no signedJwt and the body uses them', async () => {
     const { signedJwt: _omit, ...withoutJwt } = noonAuth as LoginTokenAuthConfig & { signedJwt?: unknown };
-    await expect(service.getToken(withoutJwt as LoginTokenAuthConfig, 'conn-noon-3')).rejects.toThrow(/username/);
+    await expect(
+      service.getToken(
+        { ...withoutJwt, loginBody: { user: '${username}', pass: '${password}' } } as LoginTokenAuthConfig,
+        'conn-noon-3',
+      ),
+    ).rejects.toThrow(/username/);
+  });
+});
+
+/**
+ * loginBasicAuth (#982, Wazuh): the login request carries
+ * `Authorization: Basic base64(username:password)`, built by the engine and
+ * never through a template. An Authorization in loginHeaders is a
+ * configuration error, refused before any request, so there is no doubt about
+ * which credentials the vendor sees.
+ */
+describe('LoginTokenService - loginBasicAuth (Wazuh pattern)', () => {
+  let service: LoginTokenService;
+  const encryptionKey = 'test-encryption-key-32-chars-ok!';
+  // Built at runtime so no literal looks like a real credential.
+  const PASSWORD = ['pw', 'x'.repeat(8), ':*'].join('');
+  const ENCODED = Buffer.from(`api-reader:${PASSWORD}`).toString('base64');
+
+  const wazuhAuth: LoginTokenAuthConfig = {
+    loginUrl: 'https://wazuh.example.com:55000/security/user/authenticate',
+    loginMethod: 'POST',
+    loginHeaders: { Accept: 'application/json' },
+    loginBody: {},
+    loginBasicAuth: true,
+    username: 'api-reader',
+    password: PASSWORD,
+    tokenJsonPath: 'data.token',
+    tokenTTLSeconds: 900,
+  };
+  const axiosMock = () => mockedAxios as unknown as jest.Mock;
+  const logSpies = () =>
+    (['log', 'debug', 'warn', 'error', 'verbose'] as const).map((m) =>
+      jest.spyOn(Logger.prototype, m).mockImplementation(() => undefined),
+    );
+  const logged = (spies: jest.SpyInstance[]) =>
+    spies.flatMap((s) => s.mock.calls.map((c) => c.map((x: unknown) => String(x)).join(' '))).join('\n');
+
+  beforeEach(() => {
+    const mockPrisma = {
+      connectorAuthCache: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        upsert: jest.fn().mockResolvedValue({}),
+      },
+    } as any;
+    service = new LoginTokenService(mockPrisma, { get: jest.fn().mockReturnValue(encryptionKey) } as any);
+    jest.clearAllMocks();
+  });
+  afterEach(() => {
+    jest.restoreAllMocks();
+    axiosMock().mockReset();
+  });
+
+  it('sends Authorization: Basic base64(username:password) on the login, and the token as Bearer afterwards', async () => {
+    axiosMock().mockResolvedValue({ data: { data: { token: 'jwt-1' } }, headers: {} });
+    const bundle = await service.getToken(wazuhAuth, 'conn-wazuh');
+    const call = axiosMock().mock.calls[0][0];
+    expect(call.method).toBe('POST');
+    expect(call.headers.Authorization).toBe(`Basic ${ENCODED}`);
+    expect(call.headers.Accept).toBe('application/json');
+    expect(call.data).toEqual({});
+    expect(call.params).toBeUndefined();
+    expect(bundle.token).toBe('jwt-1');
+    const request: any = { headers: {} };
+    injectLoginTokenHeaders(request, wazuhAuth, bundle.token, bundle.aud);
+    expect(request.headers.Authorization).toBe('Bearer jwt-1');
+  });
+
+  it('never offers the password to templates, and sends no body without a loginBody', async () => {
+    axiosMock().mockResolvedValue({ data: { data: { token: 'jwt-2' } }, headers: {} });
+    await service.getToken({ ...wazuhAuth, loginBody: { user: '${username}', pass: '${password}', h: '${passwordHashed}' } }, 'conn-wazuh-tpl');
+    expect(axiosMock().mock.calls[0][0].data).toEqual({ user: 'api-reader', pass: '', h: '' });
+
+    const { loginBody: _omit, ...noBody } = wazuhAuth;
+    await service.getToken(noBody as LoginTokenAuthConfig, 'conn-wazuh-nobody');
+    const call = axiosMock().mock.calls[1][0];
+    expect(call.data).toBeUndefined();
+    expect(call.params).toBeUndefined();
+    expect(call.headers.Authorization).toBe(`Basic ${ENCODED}`);
+  });
+
+  it('refuses an explicit Authorization in loginHeaders (any case) before any request', async () => {
+    for (const name of ['Authorization', 'authorization', 'AUTHORIZATION']) {
+      const cfg = { ...wazuhAuth, loginHeaders: { [name]: 'Basic something-else' } };
+      const err = await service.forceRelogin(cfg, `conn-${name}`).catch((e: Error) => e);
+      expect((err as Error).message).toBe(
+        'LOGIN_TOKEN: loginBasicAuth sets the login Authorization header itself; remove Authorization from loginHeaders',
+      );
+      expect(inspect(err)).not.toContain(PASSWORD);
+    }
+    expect(axiosMock()).not.toHaveBeenCalled();
+    // Without the flag an explicit Authorization header is sent as before.
+    axiosMock().mockResolvedValue({ data: { data: { token: 'jwt-3' } }, headers: {} });
+    const { loginBasicAuth: _f, ...plain } = wazuhAuth;
+    await service.getToken({ ...plain, loginHeaders: { Authorization: 'Token abc' } }, 'conn-plain');
+    expect(axiosMock().mock.calls[0][0].headers.Authorization).toBe('Token abc');
+  });
+
+  it('keeps the credentials out of a failed login error and out of the logs', async () => {
+    const spies = logSpies();
+    const header = `Basic ${ENCODED}`;
+    axiosMock().mockImplementation(async (cfg: any) => {
+      const err: any = new Error(`Request failed with status code 401 (${header})`);
+      err.isAxiosError = true;
+      err.config = { ...cfg, headers: { ...cfg.headers } };
+      err.request = { _header: `POST /security/user/authenticate HTTP/1.1\r\nAuthorization: ${header}\r\nHost: x\r\n\r\n` };
+      err.response = { status: 401, data: { title: 'Unauthorized' }, headers: {}, config: { headers: { authorization: header } } };
+      throw err;
+    });
+    const err: any = await service.getToken(wazuhAuth, 'conn-wazuh-401').catch((e) => e);
+    expect(err.response.status).toBe(401);
+    for (const text of [err.message, inspect(err, { depth: 6 }), JSON.stringify({ c: err.config, r: err.response, q: err.request }), logged(spies)]) {
+      expect(text).not.toContain(PASSWORD);
+      expect(text).not.toContain(ENCODED);
+    }
+    expect(err.config.headers.Accept).toBe('application/json');
+  });
+
+  it('keeps the credentials out of the proactive re-login warning', async () => {
+    const spies = logSpies();
+    axiosMock().mockResolvedValueOnce({ data: { data: { token: 'jwt-old' } }, headers: {} });
+    // 900 s token: 800 s later it is inside the refresh window but still valid.
+    const cfg = { ...wazuhAuth, proactiveRefreshSeconds: 120, tokenTTLSeconds: 900 };
+    await service.getToken(cfg, 'conn-wazuh-warn');
+    const later = Date.now() + 800_000;
+    jest.spyOn(Date, 'now').mockReturnValue(later);
+    axiosMock().mockRejectedValueOnce(Object.assign(new Error(`boom ${PASSWORD} ${ENCODED}`), { config: { headers: { Authorization: 'x' } } }));
+    const bundle = await service.getToken(cfg, 'conn-wazuh-warn');
+    expect(bundle.token).toBe('jwt-old');
+    const text = logged(spies);
+    expect(text).toContain('proactive re-login failed');
+    expect(text).not.toContain(PASSWORD);
+    expect(text).not.toContain(ENCODED);
+  });
+
+  it('refuses combinations it cannot honour, without quoting credentials', () => {
+    const cases: Array<[Partial<LoginTokenAuthConfig> & Record<string, unknown>, RegExp]> = [
+      [{ loginBasicAuth: 'true' as unknown as boolean }, /loginBasicAuth must be true or false/],
+      [{ signedJwt: { privateKey: 'k' } }, /cannot be combined with signedJwt/],
+      [{ passwordHashing: { scheme: 'bcrypt', saltSource: { type: 'static', value: 's' } } }, /cannot be combined with passwordHashing/],
+      [{ username: 'a:b' }, /username must not contain ":"/],
+      [{ password: '' }, /authConfig\.password is required/],
+    ];
+    for (const [patch, re] of cases) {
+      let message = '';
+      try {
+        loginBasicAuthHeader({ ...wazuhAuth, ...patch } as LoginTokenAuthConfig);
+      } catch (e) {
+        message = (e as Error).message;
+      }
+      expect(message).toMatch(re);
+      expect(message).not.toContain(PASSWORD);
+    }
+    expect(loginBasicAuthHeader({ ...wazuhAuth, passwordHashing: { scheme: 'none' } })?.header).toBe(`Basic ${ENCODED}`);
+    expect(loginBasicAuthHeader({ ...wazuhAuth, loginBasicAuth: false })).toBeUndefined();
+  });
+
+  it('encodes non-ASCII credentials as UTF-8', () => {
+    const h = loginBasicAuthHeader({ ...wazuhAuth, username: 'jos\u00e9', password: 'p\u00e4ss' })!.header;
+    expect(Buffer.from(h.replace(/^Basic /, ''), 'base64').toString('utf8')).toBe('jos\u00e9:p\u00e4ss');
   });
 });
 
@@ -839,6 +1084,234 @@ describe('LoginTokenService — signedJwt login (noon Partner API pattern)', () 
  * "token not found at <our json path>" describes our own configuration and
  * hides theirs, which is what thirteen Sorare failures looked like.
  */
+describe('LoginTokenService - form-encoded client-credentials login with ${uuid} headers (Walmart pattern)', () => {
+  let service: LoginTokenService;
+  const SECRET = ['cs', 'y'.repeat(10)].join('');
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  const walmartAuth: LoginTokenAuthConfig = {
+    loginUrl: 'https://marketplace.walmartapis.com/v3/token',
+    loginMethod: 'POST',
+    loginBasicAuth: true,
+    username: 'client-id-1',
+    password: SECRET,
+    loginBody: 'grant_type=client_credentials',
+    loginHeaders: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: 'application/json',
+      'WM_SVC.NAME': 'AnythingMCP',
+      'WM_QOS.CORRELATION_ID': '${uuid}',
+    },
+    tokenJsonPath: 'access_token',
+    tokenTTLSeconds: 900,
+    headerName: 'WM_SEC.ACCESS_TOKEN',
+    headerTemplate: '${token}',
+    extraHeaders: { 'WM_SVC.NAME': 'AnythingMCP', 'WM_QOS.CORRELATION_ID': '${uuid}', 'X-Trace': 'a-${uuid}' },
+  };
+  const axiosMock = () => mockedAxios as unknown as jest.Mock;
+
+  beforeEach(() => {
+    const mockPrisma = {
+      connectorAuthCache: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        upsert: jest.fn().mockResolvedValue({}),
+      },
+    } as any;
+    service = new LoginTokenService(mockPrisma, { get: jest.fn().mockReturnValue('test-encryption-key-32-chars-ok!') } as any);
+    jest.clearAllMocks();
+  });
+
+  it('posts the string body as is, with the form content type and a fresh correlation id', async () => {
+    axiosMock().mockResolvedValue({ data: { access_token: 'tok-1', token_type: 'Bearer', expires_in: 900 }, headers: {} });
+    const bundle = await service.getToken(walmartAuth, 'conn-walmart');
+    const call = axiosMock().mock.calls[0][0];
+    expect(call.data).toBe('grant_type=client_credentials');
+    expect(call.headers['Content-Type']).toBe('application/x-www-form-urlencoded');
+    expect(call.headers.Authorization).toBe(`Basic ${Buffer.from(`client-id-1:${SECRET}`).toString('base64')}`);
+    expect(call.headers['WM_QOS.CORRELATION_ID']).toMatch(UUID_RE);
+    expect(bundle.token).toBe('tok-1');
+  });
+
+  it('puts the token in its own header and draws one new UUID per request', () => {
+    const first: any = { headers: {} };
+    const second: any = { headers: {} };
+    injectLoginTokenHeaders(first, walmartAuth, 'tok-1');
+    injectLoginTokenHeaders(second, walmartAuth, 'tok-1');
+    expect(first.headers['WM_SEC.ACCESS_TOKEN']).toBe('tok-1');
+    expect(first.headers.Authorization).toBeUndefined();
+    expect(first.headers['WM_QOS.CORRELATION_ID']).toMatch(UUID_RE);
+    expect(first.headers['X-Trace']).toBe(`a-${first.headers['WM_QOS.CORRELATION_ID']}`);
+    expect(second.headers['WM_QOS.CORRELATION_ID']).toMatch(UUID_RE);
+    expect(second.headers['WM_QOS.CORRELATION_ID']).not.toBe(first.headers['WM_QOS.CORRELATION_ID']);
+  });
+});
+
+describe('LoginTokenService - XML login (Fnac Darty pattern)', () => {
+  let service: LoginTokenService;
+  // Built at runtime so no literal looks like a real credential.
+  const KEY = ['k', 'e'.repeat(6), '&<y>'].join('');
+  const TOKEN = '61DF8A84-4465-7D36-20A4-00F941207026';
+  const xmlAuth: LoginTokenAuthConfig = {
+    loginUrl: 'https://vendeur.fnac.com/api.php/auth',
+    loginMethod: 'POST',
+    loginBodyFormat: 'xml',
+    loginBody:
+      '<?xml version="1.0" encoding="utf-8"?><auth xmlns="http://www.fnac.com/schemas/mp-dialog.xsd">' +
+      '<partner_id>${username}</partner_id><shop_id>${aud}</shop_id><key>${password}</key></auth>',
+    username: 'PARTNER-1',
+    password: KEY,
+    aud: 'SHOP "A"',
+    loginResponseFormat: 'xml',
+    tokenJsonPath: 'auth_response.token',
+    expiryJsonPath: 'auth_response.validity',
+    expiryFormat: 'iso8601',
+    tokenTTLSeconds: 900,
+    tokenPlacement: 'body',
+  };
+  const answer = (validity: string) =>
+    '<?xml version="1.0" encoding="utf-8"?>\n' +
+    '<auth_response status="OK" xmlns="http://www.fnac.com/schemas/mp-dialog.xsd">\n' +
+    `  <token>${TOKEN}</token>\n  <validity>${validity}</validity>\n  <version>2.6.0</version>\n</auth_response>`;
+  const axiosMock = () => mockedAxios as unknown as jest.Mock;
+
+  beforeEach(() => {
+    const mockPrisma = {
+      connectorAuthCache: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        upsert: jest.fn().mockResolvedValue({}),
+      },
+    } as any;
+    service = new LoginTokenService(mockPrisma, { get: jest.fn().mockReturnValue('test-encryption-key-32-chars-ok!') } as any);
+    jest.clearAllMocks();
+  });
+
+  it('reads the token and its expiry from an XML answer declared as text/xml', async () => {
+    const validity = new Date(Date.now() + 40 * 60 * 1000).toISOString();
+    axiosMock().mockResolvedValue({ data: answer(validity), headers: { 'content-type': 'text/xml; charset=UTF-8' } });
+    const bundle = await service.getToken(xmlAuth, 'conn-fnac');
+    expect(bundle.token).toBe(TOKEN);
+    expect(bundle.expiresAt).toBe(Date.parse(validity));
+    // The shop id stays available as ${aud}.
+    expect(bundle.aud).toBe('SHOP "A"');
+  });
+
+  it('parses an XML answer that carries no XML content type but starts with <', async () => {
+    axiosMock().mockResolvedValue({ data: `\n  ${answer('2031-04-01T18:04:13+02:00')}`, headers: { 'content-type': 'text/html' } });
+    const bundle = await service.getToken(xmlAuth, 'conn-fnac');
+    expect(bundle.token).toBe(TOKEN);
+    expect(bundle.expiresAt).toBe(Date.parse('2031-04-01T18:04:13+02:00'));
+  });
+
+  it('leaves an XML answer as text without loginResponseFormat, as before', async () => {
+    const { loginResponseFormat: _format, ...plain } = xmlAuth;
+    axiosMock().mockResolvedValue({ data: answer('2031-04-01T18:04:13+02:00'), headers: { 'content-type': 'text/xml' } });
+    await expect(service.getToken(plain, 'conn-fnac')).rejects.toThrow(/token not found at "auth_response\.token"/);
+  });
+
+  it('still reads a JSON answer with loginResponseFormat xml', async () => {
+    axiosMock().mockResolvedValue({ data: { auth_response: { token: 'json-token' } }, headers: { 'content-type': 'application/json' } });
+    const bundle = await service.getToken(xmlAuth, 'conn-fnac');
+    expect(bundle.token).toBe('json-token');
+  });
+
+  it("reports the service's own refusal when the XML answer carries an error instead of a token", async () => {
+    axiosMock().mockResolvedValue({
+      data:
+        '<?xml version="1.0" encoding="UTF-8" ?>\n<auth_response status="ERROR" xmlns="http://www.fnac.com/schemas/mp-dialog.xsd">\n' +
+        '    <error severity="ERROR" code="ERR_097">Authentication failed : one of the parameters (partner_id, key, shop_id) is invalid</error>\n</auth_response>',
+      headers: { 'content-type': 'text/xml; charset=UTF-8' },
+    });
+    await expect(service.getToken(xmlAuth, 'conn-fnac')).rejects.toThrow(
+      'LOGIN_TOKEN: the service refused the login — ERR_097: Authentication failed : one of the parameters (partner_id, key, shop_id) is invalid',
+    );
+  });
+
+  it('sends the XML login body with every value escaped and labels it as XML', async () => {
+    axiosMock().mockResolvedValue({ data: answer('2031-04-01T18:04:13+02:00'), headers: { 'content-type': 'text/xml' } });
+    await service.getToken(xmlAuth, 'conn-fnac');
+    const call = axiosMock().mock.calls[0][0];
+    expect(call.method).toBe('POST');
+    expect(call.url).toBe('https://vendeur.fnac.com/api.php/auth');
+    expect(call.data).toBe(
+      '<?xml version="1.0" encoding="utf-8"?><auth xmlns="http://www.fnac.com/schemas/mp-dialog.xsd">' +
+        '<partner_id>PARTNER-1</partner_id><shop_id>SHOP &quot;A&quot;</shop_id><key>keeeeee&amp;&lt;y&gt;</key></auth>',
+    );
+    expect(call.headers['Content-Type']).toBe('application/xml; charset=utf-8');
+  });
+
+  it("keeps the adapter's own login Content-Type, in any spelling", async () => {
+    for (const [name, value] of [
+      ['Content-Type', 'text/xml; charset=utf-8'],
+      ['content-type', 'text/xml'],
+    ]) {
+      jest.clearAllMocks();
+      axiosMock().mockResolvedValue({ data: answer('2031-04-01T18:04:13+02:00'), headers: { 'content-type': 'text/xml' } });
+      await service.forceRelogin({ ...xmlAuth, loginHeaders: { [name]: value } }, 'conn-fnac');
+      const sent = axiosMock().mock.calls[0][0].headers as Record<string, string>;
+      const types = Object.entries(sent).filter(([k]) => k.toLowerCase() === 'content-type');
+      expect(types).toEqual([[name, value]]);
+    }
+  });
+
+  it('sends a string loginBody unescaped and as JSON without loginBodyFormat, as before', async () => {
+    const { loginBodyFormat: _format, ...plain } = xmlAuth;
+    axiosMock().mockResolvedValue({ data: answer('2031-04-01T18:04:13+02:00'), headers: { 'content-type': 'text/xml' } });
+    await service.getToken(plain, 'conn-fnac');
+    const call = axiosMock().mock.calls[0][0];
+    expect(call.data).toContain(`<key>${KEY}</key>`);
+    expect(call.data).toContain('<shop_id>SHOP "A"</shop_id>');
+    expect(call.headers['Content-Type']).toBe('application/json');
+  });
+
+  it('ignores loginBodyFormat for a structured loginBody', async () => {
+    axiosMock().mockResolvedValue({ data: answer('2031-04-01T18:04:13+02:00'), headers: { 'content-type': 'text/xml' } });
+    await service.getToken({ ...xmlAuth, loginBody: { key: '${password}' } }, 'conn-fnac');
+    const call = axiosMock().mock.calls[0][0];
+    expect(call.data).toEqual({ key: KEY });
+    expect(call.headers['Content-Type']).toBe('application/json');
+  });
+
+  it('sends no token header for tokenPlacement body, but keeps extraHeaders', () => {
+    const request: any = { headers: { 'Content-Type': 'text/xml' } };
+    injectLoginTokenHeaders(request, { ...xmlAuth, extraHeaders: { 'X-Shop': '${aud}' } }, TOKEN, 'SHOP');
+    expect(request.headers).toEqual({ 'Content-Type': 'text/xml', 'X-Shop': 'SHOP' });
+    const header: any = { headers: {} };
+    injectLoginTokenHeaders(header, { ...xmlAuth, tokenPlacement: 'header' }, TOKEN);
+    expect(header.headers).toEqual({ Authorization: `Bearer ${TOKEN}` });
+  });
+});
+
+describe('XML login helpers', () => {
+  it('renderXmlLoginBody escapes values, empties unknown names and never reads the prototype', () => {
+    expect(renderXmlLoginBody('<a k="${k}">${v}</a><b>${missing}</b><c>${constructor}</c>', { k: '"q"', v: 'Tom & Jerry <3' })).toBe(
+      '<a k="&quot;q&quot;">Tom &amp; Jerry &lt;3</a><b></b><c></c>',
+    );
+  });
+
+  it('parseXmlLoginAnswer hoists attributes, drops namespace prefixes and keeps values as strings', () => {
+    expect(
+      parseXmlLoginAnswer({
+        data: '<m:auth_response xmlns:m="urn:x" status="OK"><m:token>0810</m:token></m:auth_response>',
+        headers: { 'content-type': 'application/xml' },
+      }),
+    ).toMatchObject({ auth_response: { status: 'OK', token: '0810' } });
+  });
+
+  it('parseXmlLoginAnswer returns anything that is not an XML document as it arrived', () => {
+    const object = { token: 't' };
+    expect(parseXmlLoginAnswer({ data: object, headers: {} })).toBe(object);
+    expect(parseXmlLoginAnswer({ data: 'plain-token', headers: { 'content-type': 'text/plain' } })).toBe('plain-token');
+    expect(parseXmlLoginAnswer({ data: 'not xml at all', headers: { 'content-type': 'text/xml' } })).toBe('not xml at all');
+    expect(parseXmlLoginAnswer({ data: 'plain-token' })).toBe('plain-token');
+  });
+
+  it('extractXmlLoginRefusal reads the first error element, with its code when there is one', () => {
+    expect(extractXmlLoginRefusal({ auth_response: { status: 'ERROR', error: { '#text': 'Bad key', code: 'ERR_097', severity: 'ERROR' } } })).toBe('ERR_097: Bad key');
+    expect(extractXmlLoginRefusal({ r: { error: [{ '#text': 'First' }, { '#text': 'Second', code: 'E2' }] } })).toBe('First');
+    expect(extractXmlLoginRefusal({ auth_response: { status: 'OK' } })).toBeNull();
+    expect(extractXmlLoginRefusal('text')).toBeNull();
+  });
+});
+
 describe('extractLoginRefusal', () => {
   it('reads a GraphQL errors array nested under the mutation payload', () => {
     expect(

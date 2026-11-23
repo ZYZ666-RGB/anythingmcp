@@ -111,7 +111,8 @@ describe('AdaptersController — starter pack', () => {
       items: pack,
       connectors: { current: 0, max: 2, remaining: 2 },
     });
-    expect((adaptersService as any).starterPack).toHaveBeenCalledWith('org1');
+    // No member visibility service in this unit: every connector counts.
+    expect((adaptersService as any).starterPack).toHaveBeenCalledWith('org1', {});
   });
 
   it('reports an uncapped plan as unlimited remaining', async () => {
@@ -206,6 +207,37 @@ describe('POST /api/adapters/:slug/verify — failures are recorded with the pro
       organizationId: 'org1',
       metadata: { adapterSlug: 'acme', kind: 'auth_failed', status: 401, toolName: 'acme_ping', error: 'Key *** was refused' },
     });
+  });
+
+  it("keeps the provider's error code apart from the message, which is cut after our hint", async () => {
+    const { controller, adaptersService, productEvents } = buildController();
+    const hint = 'The app is not installed on this store yet. '.repeat(12);
+    (adaptersService as any).verifyCredentials = jest.fn().mockResolvedValue({
+      ok: false,
+      kind: 'bad_request',
+      status: 400,
+      toolName: 'shopify_get_shop',
+      message: `${hint}(Request failed with status code 400: {"error":"app_not_installed","error_description":"The application is not installed on this shop."})`,
+    });
+    await controller.verify(req('ADMIN'), 'shopify', { credentials: { SHOPIFY_STORE: 'acme-shop' } });
+    const { metadata } = (productEvents.log as jest.Mock).mock.calls[0][0];
+    expect(metadata.code).toBe('app_not_installed');
+    // What made the code necessary: the stored message ends before Shopify's words.
+    expect(metadata.error).not.toContain('app_not_installed');
+  });
+
+  it('never keeps as a code something the user just entered', async () => {
+    const { controller, adaptersService, productEvents } = buildController();
+    (adaptersService as any).verifyCredentials = jest.fn().mockResolvedValue({
+      ok: false,
+      kind: 'auth_failed',
+      status: 401,
+      message: 'Refused ({"error":"MySecretPassword"})',
+    });
+    await controller.verify(req('ADMIN'), 'acme', { credentials: { ACME_KEY: 'MySecretPassword' } });
+    const { metadata } = (productEvents.log as jest.Mock).mock.calls[0][0];
+    expect(metadata).not.toHaveProperty('code');
+    expect(JSON.stringify(metadata)).not.toContain('MySecretPassword');
   });
 
   it('records an app waiting for the provider approval, with the connector it finishes', async () => {

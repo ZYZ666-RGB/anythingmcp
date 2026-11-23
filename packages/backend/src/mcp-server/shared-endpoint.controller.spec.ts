@@ -3,6 +3,7 @@ import { InMemoryTransport, McpServer } from '@modelcontextprotocol/server';
 import { McpEndpointController, isListenRequest } from './mcp-endpoint.controller';
 import { CHATGPT_EXTRA_TOOL_NAMES, SHARED_TOOL_NAMES, sharedToolsetInstructions } from './shared-toolset';
 import type { RegisteredTool } from './tool-registry';
+import { withRegistryIndexes } from './registry-test-double';
 
 /**
  * The shared `/mcp` in `fixed` mode, end to end through the controller: the
@@ -81,11 +82,10 @@ function build(
     ),
     getSharedGuide: jest.fn(async () => undefined),
     getServerNames: jest.fn(async () => []),
-    getServerNamesByOrg: jest.fn(async (org: string) => [{ id: `srv-${org}`, name: 'Default' }]),
   };
   const controller = new McpEndpointController(
     servers as any,
-    { getAllTools: () => opts.tools ?? ALL, countByName: () => 1 } as any,
+    withRegistryIndexes({ getAllTools: () => opts.tools ?? ALL, countByName: () => 1 }) as any,
     executor as any,
     {
       getAllowedToolIds: jest.fn(async (_sub: string, org: string) =>
@@ -97,6 +97,7 @@ function build(
     {
       resolve: jest.fn().mockResolvedValue(opts.grant ?? null),
       clientRedirectUris: jest.fn(async (id?: string) => (id ? (REDIRECTS[id] ?? []) : [])),
+      serverNamesFor: jest.fn(async (_userId: string, org: string) => [{ id: `srv-${org}`, name: 'Default' }]),
     } as any,
     { create: jest.fn(), hasVisible: jest.fn().mockResolvedValue(false) } as any,
   );
@@ -141,7 +142,7 @@ describe('shared /mcp in fixed mode', () => {
   it('answers subscriptions/listen without resolving the caller\'s tools', async () => {
     const getAllTools = jest.fn(() => ALL);
     const { controller } = build();
-    (controller as any).toolRegistry = { getAllTools, countByName: () => 1 };
+    (controller as any).toolRegistry = withRegistryIndexes({ getAllTools, countByName: () => 1 });
     const grants = (controller as any).grants;
     let built: McpServer | undefined;
     (controller as any).serveStateless = jest.fn(
@@ -159,6 +160,32 @@ describe('shared /mcp in fixed mode', () => {
     expect(grants.resolve).not.toHaveBeenCalled();
     expect(grants.clientRedirectUris).not.toHaveBeenCalled();
     expect(built!.server.getCapabilities()).toEqual({ tools: { listChanged: true } });
+  });
+
+  it('answers server/discover without resolving the caller\'s tools, with the client\'s instructions', async () => {
+    const getAllTools = jest.fn(() => ALL);
+    const { controller } = build();
+    const registry = withRegistryIndexes({ getAllTools, countByName: () => 1 });
+    const byOrg = jest.spyOn(registry, 'getToolsForOrganization');
+    (controller as any).toolRegistry = registry;
+    const grants = (controller as any).grants;
+    let built: McpServer | undefined;
+    (controller as any).serveStateless = jest.fn(
+      async (_req: unknown, _res: unknown, _body: unknown, factory: () => McpServer) => {
+        built = factory();
+      },
+    );
+    const req: any = {
+      user: orgB,
+      body: { jsonrpc: '2.0', id: 1, method: 'server/discover', params: {} },
+      headers: { host: 'x' },
+    };
+    await controller.handleGlobalPost(req, {} as any);
+    expect(getAllTools).not.toHaveBeenCalled();
+    expect(byOrg).not.toHaveBeenCalled();
+    expect(grants.resolve).not.toHaveBeenCalled();
+    expect(built!.server.getCapabilities()).toEqual({ tools: { listChanged: true } });
+    expect((built!.server as any)._instructions).toBeTruthy();
   });
 
   it('recognises only a single subscriptions/listen message as a listen', () => {
@@ -255,6 +282,18 @@ describe('shared /mcp in fixed mode', () => {
     expect(executor.executeTool).not.toHaveBeenCalled();
   });
 
+  it('asks the knowledge graph for the allowed tools only, on a connector the role reaches in part', async () => {
+    // conn-A1 holds crm_find_customer and crm_list_deals; the role allows the second.
+    const { kg, connect } = build({ allowedByOrg: { 'org-A': ['t-a2'] } });
+    const client = await connect({ sub: 'u-a', organizationId: 'org-A', authMethod: 'jwt' });
+    await call(client, 'kg_how_to_obtain', { query: 'customer_id' });
+    expect(kg.lookup).toHaveBeenCalledWith('org-A', 'customer_id', {
+      connectorIds: ['conn-A1'],
+      folders: null,
+      allowedToolNames: new Set(['crm_list_deals']),
+    });
+  });
+
   it('follows a connection grant into another workspace, with that workspace\'s context', async () => {
     const { executor, kg, connect } = build({
       grant: { mode: 'organization', organizationId: 'org-A' },
@@ -266,7 +305,12 @@ describe('shared /mcp in fixed mode', () => {
 
     const graph = await call(client, 'kg_how_to_obtain', { query: 'customer_id' });
     expect(graph.body).toEqual({ org: 'org-A' });
-    expect(kg.lookup).toHaveBeenCalledWith('org-A', 'customer_id', { connectorIds: ['conn-A1'], folders: null });
+    // No role limits tools there, so the graph is not narrowed by tool name.
+    expect(kg.lookup).toHaveBeenCalledWith('org-A', 'customer_id', {
+      connectorIds: ['conn-A1'],
+      folders: null,
+      allowedToolNames: null,
+    });
 
     const cfg = await call(client, 'anythingmcp_get_configuration_url');
     expect(cfg.body.servers[0].url).toMatch(/\/mcp\/srv-org-A$/);

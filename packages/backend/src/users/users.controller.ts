@@ -16,8 +16,8 @@ import {
   NotFoundException,
   ForbiddenException,
 } from '@nestjs/common';
-import { ApiTags, ApiBearerAuth, ApiOperation, ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { AuthGuard } from '@nestjs/passport';
+import { ApiTags, ApiBearerAuth, ApiOperation, ApiProperty, ApiPropertyOptional, ApiSecurity, ApiResponse } from '@nestjs/swagger';
+import { JwtOrManagementKeyGuard } from '../auth/jwt-or-management-key.guard';
 import { IsString, IsOptional, IsEmail, IsEnum, IsBoolean, MinLength, Matches, Equals } from 'class-validator';
 import { UserRole } from '../generated/prisma/client';
 import { UsersService } from './users.service';
@@ -117,7 +117,8 @@ class DeleteSelfDto {
 
 @ApiTags('Users')
 @ApiBearerAuth()
-@UseGuards(AuthGuard('jwt'))
+@ApiSecurity('api-key')
+@UseGuards(JwtOrManagementKeyGuard)
 @Controller('api/users')
 export class UsersController {
   constructor(
@@ -128,7 +129,29 @@ export class UsersController {
   ) {}
 
   @Get('me')
-  @ApiOperation({ summary: 'Get current user profile' })
+  @ApiOperation({
+    summary: 'Get current user profile',
+    description:
+      'The account behind the credential: with an API key, the key\'s owner. A quick way to check that a credential ' +
+      'works; `amcp login` calls it to validate a key. `organizationId` is the workspace last active in the dashboard. ' +
+      'The password hash is never returned.\n\n' +
+      '```bash\ncurl -s "$AMCP_URL/api/users/me" -H "Authorization: Bearer $AMCP_API_KEY"\n```',
+  })
+  @ApiResponse({
+    status: 200,
+    schema: {
+      type: 'object',
+      example: {
+        id: 'cmo8a7b6c0000abcdx1y2z3w4',
+        email: 'ana@example.com',
+        name: 'Ana',
+        role: 'ADMIN',
+        emailVerified: true,
+        organizationId: 'cmo8a7b6c0001abcdk5l6m7n8',
+        createdAt: '2026-03-02T08:15:00.000Z',
+      },
+    },
+  })
   async getProfile(@Req() req: any) {
     const user = await this.usersService.findById(req.user.sub);
     if (!user) return { error: 'User not found' };
@@ -278,7 +301,37 @@ export class UsersController {
   @Get()
   @UseGuards(RolesGuard)
   @Roles('ADMIN')
-  @ApiOperation({ summary: 'List all users in organization (ADMIN only)' })
+  @ApiOperation({
+    summary: 'List all users in organization (ADMIN only)',
+    description:
+      'The members of your workspace, in the order they joined, with their workspace `role` (ADMIN, EDITOR, VIEWER), ' +
+      'whether they are `active` (not deactivated), every MCP role they hold (`mcpRoles`: `source` is `manual` or the ' +
+      'identity provider group sync, `global` marks a grant that applies in every workspace; the member may call the ' +
+      'union of their tools) and their memory access. `mcpRoleId` / `mcpRole` are deprecated: they hold one of the ' +
+      'roles at most. Use the `id` with `/api/roles/assignments/{userId}` to manage MCP roles.',
+  })
+  @ApiResponse({
+    status: 200,
+    schema: {
+      type: 'array',
+      items: { type: 'object' },
+      example: [
+        {
+          id: 'cmo8a7b6c0000abcdx1y2z3w4',
+          email: 'ana@example.com',
+          name: 'Ana',
+          role: 'ADMIN',
+          organizationId: 'cmo8a7b6c0001abcdk5l6m7n8',
+          mcpRoleId: null,
+          mcpRole: null,
+          mcpRoles: [],
+          joinedAt: '2026-03-02T08:15:00.000Z',
+          deactivatedAt: null,
+          active: true,
+        },
+      ],
+    },
+  })
   async listUsers(@Req() req: any) {
     return this.usersService.findAll(req.user.organizationId);
   }

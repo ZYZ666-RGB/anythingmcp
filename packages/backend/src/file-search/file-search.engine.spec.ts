@@ -12,7 +12,7 @@ function make(opts: { entry?: { path: string; size: number; status: string } | n
       opts.render ?? { ok: true, mimeType: 'image/jpeg', base64: JPEG_BASE64, width: 1131, height: 1600, page: 2, pageCount: 3 },
     ),
   };
-  const engine = new FileSearchEngine({} as any, query as any, access as any, worker as any, {} as any);
+  const engine = new FileSearchEngine({} as any, query as any, access as any, worker as any, {} as any, {} as any);
   return { engine, query, access, worker };
 }
 
@@ -91,5 +91,18 @@ describe('FileSearchEngine file_view', () => {
     const out = (await engine.execute('file_view', { path: 'Plans/EG.pdf' }, ctx)) as Record<string, any>;
     expect(out.error).toBe('file_search_locked');
     expect(worker.render).not.toHaveBeenCalled();
+  });
+});
+
+describe('FileSearchEngine file_find', () => {
+  it('refuses an over-long glob before it reaches the matcher', async () => {
+    const { engine, query } = make();
+    (query as any).find = jest.fn().mockResolvedValue({ total: 0, files: [] });
+    const out = (await engine.execute('file_find', { glob: `${'*'.repeat(150)}${'a'.repeat(151)}` }, ctx)) as Record<string, any>;
+    expect(out.error).toMatch(/longer than 300 characters/);
+    expect((query as any).find).not.toHaveBeenCalled();
+
+    await engine.execute('file_find', { glob: 'Suppliers/**/*.pdf' }, ctx);
+    expect((query as any).find).toHaveBeenCalledWith(ctx, expect.objectContaining({ glob: 'Suppliers/**/*.pdf' }));
   });
 });

@@ -5,6 +5,10 @@ import { DeploymentService } from '../../common/deployment.service';
 import { LicenseService } from '../../license/license.service';
 import { instanceHost, supportChatConfig } from './support-config';
 import { compactError } from './support-redact';
+import { getAdapter } from '../../adapters/catalog';
+import { isMachineGrant } from '../../connectors/oauth-grant.util';
+import { findUnresolvedPlaceholders } from '../../common/unresolved-placeholders.util';
+import { workspaceFirstSuccessAt } from '../../audit/first-success-markers';
 
 /** Contact attributes shown to agents and read by the triage. All strings. */
 export type SupportContactAttributes = Record<string, string>;
@@ -22,6 +26,14 @@ const ERROR_WINDOW_MS = 24 * 60 * 60_000;
 const MAX_ISSUES = 5;
 const MAX_NAMES = 15;
 const ISSUES_MAX_CHARS = 900;
+const LINKS_MAX_CHARS = 1500;
+const MAX_SERVERS = 5;
+
+/** Days Cloud keeps tool_invocations, read like KgCronService.retention() does. */
+function invocationRetentionDays(): number {
+  const v = parseInt(process.env.INVOCATION_RETENTION_DAYS || '', 10);
+  return Number.isFinite(v) ? v : 90;
+}
 
 /**
  * Builds the signed identity the Libredesk widget exchanges for a verified
@@ -97,13 +109,29 @@ export class SupportIdentityService {
     if (user && !user.emailVerified) attrs.email_verified = 'no';
     if (!organizationId) return attrs;
 
-    const [org, license, connectors] = await Promise.all([
+    const [org, license, connectors, servers] = await Promise.all([
       this.prisma.organization.findUnique({ where: { id: organizationId }, select: { name: true } }),
       this.license.getCurrentLicense(organizationId).catch(() => null),
       this.prisma.connector.findMany({
         where: { organizationId },
-        select: { id: true, name: true, isActive: true, authStatus: true, authStatusMessage: true },
+        select: {
+          id: true,
+          name: true,
+          isActive: true,
+          authStatus: true,
+          authStatusMessage: true,
+          config: true,
+          type: true,
+          authType: true,
+          envVars: true,
+        },
         orderBy: { createdAt: 'asc' },
+      }),
+      this.prisma.mcpServerConfig.findMany({
+        where: { organizationId, isActive: true },
+        select: { id: true, name: true },
+        orderBy: { createdAt: 'asc' },
+        take: MAX_SERVERS + 1,
       }),
     ]);
 
@@ -118,21 +146,40 @@ export class SupportIdentityService {
     const inactive = connectors.filter((c) => !c.isActive).length;
     attrs.connectors = inactive ? `${connectors.length} (${inactive} inactive)` : String(connectors.length);
     if (connectors.length) attrs.connector_names = connectorNames(connectors);
+    // The desk's assistant reads these: a customer asking where to put a
+    // token gets the page of the connector they already have, not the
+    // generic setup page, which would add a second one.
+    const links = connectorLinks(connectors, process.env.FRONTEND_URL);
+    if (links) attrs.connector_links = links;
+    // The URL an AI client (Claude, ChatGPT, Cursor) is pointed at. Without
+    // it the assistant offered a connector setup page as the server URL.
+    const serverUrls = mcpServerUrls(servers, process.env.SERVER_URL);
+    if (serverUrls) attrs.mcp_server_urls = serverUrls;
     attrs.connector_issues = await this.connectorIssues(organizationId, connectors);
     // "never" with connectors installed is the most common blocker: no AI
-    // client is connected to the workspace's MCP server yet.
+    // client is connected to the workspace's MCP server yet. A workspace
+    // whose calls are all older than the kept history is not "never".
     attrs.last_tool_call = await this.lastToolCall(organizationId);
     return attrs;
   }
 
-  /** Day of the workspace's latest successful tool call, or "never". */
+  /**
+   * Day of the workspace's latest successful tool call (YYYY-MM-DD). With no
+   * SUCCESS row left but a stored first-success marker, the calls were
+   * deleted: on Cloud by the retention (INVOCATION_RETENTION_DAYS, 90 by
+   * default), so "more than N days ago"; otherwise "not in the call history"
+   * (a deleted tool takes its rows along). "never" only without any marker.
+   */
   private async lastToolCall(organizationId: string): Promise<string> {
     const last = await this.prisma.toolInvocation.findFirst({
       where: { organizationId, status: 'SUCCESS' },
       orderBy: { createdAt: 'desc' },
       select: { createdAt: true },
     });
-    return last?.createdAt instanceof Date ? last.createdAt.toISOString().slice(0, 10) : 'never';
+    if (last?.createdAt instanceof Date) return last.createdAt.toISOString().slice(0, 10);
+    if (!(await workspaceFirstSuccessAt(this.prisma, organizationId))) return 'never';
+    const days = invocationRetentionDays();
+    return this.deployment.isCloud() && days > 0 ? `more than ${days} days ago` : 'not in the call history';
   }
 
   /**
@@ -141,7 +188,9 @@ export class SupportIdentityService {
    */
   private async connectorIssues(
     organizationId: string,
-    connectors: Array<{ id: string; name: string; authStatus: string | null; authStatusMessage: string | null }>,
+    connectors: Array<
+      { id: string; name: string; authStatus: string | null; authStatusMessage: string | null } & AppKeysInput
+    >,
   ): Promise<string> {
     if (connectors.length === 0) return '';
     const since = new Date(Date.now() - ERROR_WINDOW_MS);
@@ -157,6 +206,10 @@ export class SupportIdentityService {
     for (const c of connectors) {
       if (lines.length >= MAX_ISSUES) break;
       const parts: string[] = [];
+      const missingKeys = missingOAuthAppKeys(c);
+      if (missingKeys.length) {
+        parts.push(`app keys not saved: ${missingKeys.join(', ')} (Authorize cannot start)`);
+      }
       if (c.authStatus) {
         parts.push(`auth ${c.authStatus}${c.authStatusMessage ? ` (${compactError(c.authStatusMessage, 80)})` : ''}`);
       }
@@ -177,11 +230,78 @@ export class SupportIdentityService {
   }
 }
 
+export interface AppKeysInput {
+  type?: string | null;
+  authType?: string | null;
+  config?: unknown;
+  /** Decrypted by the Prisma extension; only presence is looked at. */
+  envVars?: unknown;
+}
+
+/**
+ * The labels of a catalog OAuth2 connector's app keys that are still empty
+ * (Etsy: "Keystring", "Shared Secret"). Without them "Authorize with
+ * Provider" cannot start, and the customer sees nothing happen on the
+ * connector page (desk #290, Nov 2026). Looks at the catalog adapter's
+ * client id/secret placeholders and whether the connector's variables fill
+ * them; values are never returned. MCP bridges register a client on their
+ * own and machine grants have no browser step, so both are left out.
+ */
+export function missingOAuthAppKeys(connector: AppKeysInput): string[] {
+  if (connector.authType !== 'OAUTH2' || connector.type === 'MCP') return [];
+  const slug = (connector.config as { adapterSlug?: unknown } | null | undefined)?.adapterSlug;
+  if (typeof slug !== 'string' || !slug) return [];
+  const adapter = getAdapter(slug);
+  const auth = adapter?.connector.authConfig;
+  if (!adapter || adapter.connector.type === 'MCP' || !auth || isMachineGrant(auth.grant)) return [];
+  const names = findUnresolvedPlaceholders([auth.clientId, auth.clientSecret]);
+  const vars = (connector.envVars && typeof connector.envVars === 'object' ? connector.envVars : {}) as Record<
+    string,
+    unknown
+  >;
+  return names
+    .filter((name) => {
+      const value = vars[name];
+      if (value === undefined || value === null) return true;
+      const text = String(value).trim();
+      return text === '' || findUnresolvedPlaceholders(text).length > 0 || /^PASTE_/i.test(text);
+    })
+    .map((name) => (adapter.envVarMeta?.[name]?.label || name).slice(0, 40));
+}
+
 /** The installed connectors' names, bounded. */
 export function connectorNames(connectors: Array<{ name: string }>): string {
   const names = connectors.slice(0, MAX_NAMES).map((c) => c.name.slice(0, 60));
   const more = connectors.length - names.length;
   return names.join(', ') + (more > 0 ? ` and ${more} more` : '');
+}
+
+/**
+ * "Name: URL" per installed connector, bounded. A catalog connector links to
+ * its guided setup for that connector (credentials, provider sign-in); one
+ * made by hand to its connector page. Empty without a dashboard URL.
+ */
+export function connectorLinks(
+  connectors: Array<{ id: string; name: string; config?: unknown }>,
+  frontendUrl: string | undefined,
+): string {
+  const base = (frontendUrl || '').trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//.test(base)) return '';
+  const lines: string[] = [];
+  let length = 0;
+  for (const c of connectors.slice(0, MAX_NAMES)) {
+    const slug = (c.config as { adapterSlug?: unknown } | null | undefined)?.adapterSlug;
+    const id = encodeURIComponent(c.id);
+    const url =
+      typeof slug === 'string' && slug
+        ? `${base}/connectors/setup/${encodeURIComponent(slug)}?connector=${id}`
+        : `${base}/connectors/${id}`;
+    const line = `${c.name.slice(0, 60)}: ${url}`;
+    if (length + line.length + 3 > LINKS_MAX_CHARS) break;
+    lines.push(line);
+    length += line.length + 3;
+  }
+  return lines.join(' | ');
 }
 
 export function splitName(name: string | null | undefined, email: string): { first: string; last: string } {
@@ -191,4 +311,19 @@ export function splitName(name: string | null | undefined, email: string): { fir
     return { first: first.slice(0, 128), last: rest.join(' ').slice(0, 128) };
   }
   return { first: (email.split('@')[0] || 'User').slice(0, 128), last: '' };
+}
+
+/**
+ * "Name: URL" per active MCP server of the workspace, bounded: the address
+ * an AI client connects to (<SERVER_URL>/mcp/<id>). Empty without a public
+ * server URL.
+ */
+export function mcpServerUrls(servers: Array<{ id: string; name: string }>, serverUrl: string | undefined): string {
+  const base = (serverUrl || '').trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//.test(base)) return '';
+  const lines = servers
+    .slice(0, MAX_SERVERS)
+    .map((s) => `${s.name.slice(0, 60)}: ${base}/mcp/${encodeURIComponent(s.id)}`);
+  const more = servers.length - lines.length;
+  return lines.join(' | ') + (more > 0 ? ' and more on the MCP Servers page' : '');
 }

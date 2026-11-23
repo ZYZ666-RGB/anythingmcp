@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from '../common/prisma.service';
+import type { Prisma } from '../generated/prisma/client';
 import { McpServerService } from '../mcp-server/mcp-server.service';
 import { encrypt } from '../common/crypto/encryption.util';
 import { ConfigService } from '@nestjs/config';
@@ -19,7 +20,20 @@ import {
 import { pickProbe, probeResultFailure } from './probe.util';
 import { resolveDerivedEnvVars, withDerivedValues } from './derived-settings';
 import { shopeeNeedsAuthorization } from '../connectors/engines/shopee-token.service';
-import { odooCheckAdvice } from './odoo-database-hint';
+import { tiktokShopNeedsAuthorization } from '../connectors/engines/tiktok-shop-token.service';
+import { iopNeedsAuthorization } from '../connectors/engines/iop-token.service';
+import { sheinNeedsAuthorization } from '../connectors/engines/shein-token.service';
+import { metaLoginNeedsAuthorization } from '../connectors/engines/meta-login.util';
+import { isOdooAdapter, odooCheckAdvice, odooDatabaseForEmptyField } from './odoo-database-hint';
+import {
+  discoverWooCommerce,
+  EgressContext,
+  WOOCOMMERCE_SLUG,
+  WOOCOMMERCE_URL_VAR,
+  wooCommerceCheckAdvice,
+  WooCommerceDiscovery,
+  wooCommerceSiteOf,
+} from './woocommerce-setup';
 import { checkAdapterEnvValues, describeFieldProblems, normalizeAdapterEnvValues } from './env-var-checks';
 import { outboundRequest } from '../common/outbound-http';
 import { interpolateString } from '../common/env-interpolation.util';
@@ -35,6 +49,7 @@ import {
 import { INSTALL_RANKING_CACHE_MS, INSTALL_RANKING_MIN_WORKSPACES } from './install-ranking';
 import { ConnectorsService } from '../connectors/connectors.service';
 import { classifyToolExecutionError } from '../connectors/connector-error.util';
+import { egressIps, ipRefusalHint, looksLikeIpRefusal } from '../connectors/egress';
 import { applyResponseTransform } from '../connectors/response-transform.util';
 import {
   carriedSetupValues,
@@ -50,7 +65,8 @@ import { setupEffort } from './setup-guide';
 import { fileSearchSetupPath } from './file-search-setup';
 import { describeDiscoveredTools, mergeDiscoveredMcpTools } from './mcp-adapter.util';
 import { deriveToolAnnotations } from '../mcp-server/tool-annotations';
-import { mcpToolPrefixOf } from '../connectors/mcp-connector-config.util';
+import { codeHint, providerErrorCode } from '../mcp-server/error-hints';
+import { mcpFixedArgumentsOf, mcpToolPrefixOf } from '../connectors/mcp-connector-config.util';
 import { matchCatalogUrl, UrlMatch, UrlMatchCandidate } from './catalog-url-match';
 import { APP_APPROVAL_ADAPTERS } from './app-approval-watch';
 import { describeHtmlAnswer, looksLikeHtml } from './html-excerpt';
@@ -136,13 +152,33 @@ export class AdaptersService {
   describe(slug: string): AdapterDefinition & {
     envVars: EnvVarDescriptor[];
     setupKind: SetupKind;
+    egressIps: string[];
   } {
     const adapter = this.getBySlug(slug);
     return {
       ...adapter,
       envVars: describeAdapterEnvVars(adapter),
       setupKind: setupKind(adapter),
+      // Shown on the setup page, for servers that only accept approved addresses.
+      egressIps: egressIps(),
     };
+  }
+
+  /** Cloud or self-hosted, and the addresses calls leave from: how a firewall hint names them. */
+  private egressContext(): EgressContext {
+    return {
+      cloud: this.configService.get<string>('DEPLOYMENT_MODE') === 'cloud',
+      egressIps: egressIps(),
+    };
+  }
+
+  /**
+   * What a WooCommerce address says about itself, without a key (see
+   * woocommerce-setup.ts), for a chat install, where only the address is
+   * known. Undefined when it says nothing.
+   */
+  inspectWooCommerceAddress(url: string): Promise<WooCommerceDiscovery | undefined> {
+    return discoverWooCommerce(url, this.egressContext()).catch(() => undefined);
   }
 
   getBySlug(slug: string): AdapterDefinition {
@@ -163,8 +199,8 @@ export class AdaptersService {
    * `installed` marks the ones the workspace already has, so the page can
    * show them as done instead of offering a duplicate.
    */
-  async starterPack(organizationId: string): Promise<StarterPackItem[]> {
-    const installed = await this.installedAdapterSlugs(organizationId);
+  async starterPack(organizationId: string, visible: Prisma.ConnectorWhereInput = {}): Promise<StarterPackItem[]> {
+    const installed = await this.installedAdapterSlugs(organizationId, visible);
     const items: StarterPackItem[] = [];
     for (const entry of STARTER_PACK) {
       const adapter = getAdapter(entry.slug);
@@ -191,10 +227,13 @@ export class AdaptersService {
    * ./popular-connectors.ts), each with what its setup asks for and whether
    * this workspace already has it.
    */
-  async popularConnectors(organizationId: string): Promise<PopularConnectorItem[]> {
+  async popularConnectors(
+    organizationId: string,
+    visible: Prisma.ConnectorWhereInput = {},
+  ): Promise<PopularConnectorItem[]> {
     const [ranked, installed] = await Promise.all([
       this.rankedPopularSlugs(),
-      this.installedAdapterSlugs(organizationId),
+      this.installedAdapterSlugs(organizationId, visible),
     ]);
     const items: PopularConnectorItem[] = [];
     for (const slug of [...ranked, ...POPULAR_FALLBACK]) {
@@ -294,10 +333,26 @@ export class AdaptersService {
     }
   }
 
-  /** Catalog slugs this workspace already has a connector for. */
-  async installedAdapterSlugs(organizationId: string): Promise<Set<string>> {
+  /** The owner of a connector of this workspace, or null when there is none. */
+  async connectorOwnerId(organizationId: string, connectorId: string): Promise<string | null> {
+    const row = await this.prisma.connector.findFirst({
+      where: { id: connectorId, organizationId },
+      select: { userId: true },
+    });
+    return row?.userId ?? null;
+  }
+
+  /**
+   * Catalog slugs this workspace already has a connector for. `visible`
+   * (member visibility's `connectorWhere`) narrows it to the connectors the
+   * caller may see, so "installed" never reveals a connector hidden from them.
+   */
+  async installedAdapterSlugs(
+    organizationId: string,
+    visible: Prisma.ConnectorWhereInput = {},
+  ): Promise<Set<string>> {
     const rows = await this.prisma.connector.findMany({
-      where: { organizationId },
+      where: Object.keys(visible).length ? { AND: [{ organizationId }, visible] } : { organizationId },
       select: { config: true },
     });
     const slugs = new Set<string>();
@@ -348,6 +403,24 @@ export class AdaptersService {
       ...(catalogEntry?.requiredEnvVars ?? []),
       ...(catalogEntry?.optionalEnvVars ?? []),
     ]);
+
+    // An optional variable the caller left out is stored empty, as the setup
+    // form stores it: empty is its meaning (MSSQL_DOMAIN: a SQL login). Left
+    // out, it stayed a literal {{MSSQL_DOMAIN}}, so an import by API showed
+    // "Still empty: MSSQL_DOMAIN" and its tools were kept off MCP (#1774).
+    // A value that was sent, or that the operator provides, is kept; an import
+    // without credentials stores nothing, as before.
+    if (input && Object.keys(input).length > 0) {
+      const omitted = [
+        ...new Set([...(adapter.optionalEnvVars ?? []), ...(catalogEntry?.optionalEnvVars ?? [])]),
+      ].filter((name) => !(name in (credentials ?? {})));
+      if (omitted.length > 0) {
+        credentials = {
+          ...Object.fromEntries(omitted.map((name) => [name, ''])),
+          ...credentials,
+        };
+      }
+    }
 
     // Credentials arrive from the UI verbatim — a stray leading/trailing
     // space (easy to pick up when pasting) would otherwise be encrypted into
@@ -450,6 +523,85 @@ export class AdaptersService {
     /** Finishing an existing connector: a field left empty uses what it stores (masked secrets come back empty). */
     existingConnectorId?: string,
   ): Promise<VerifyResult> {
+    // Odoo: a database name left empty is found from the address, and the
+    // check tries it; the page then puts it in the field and saves it.
+    const lookup = await this.odooDatabaseForSetup(slug, organizationId, credentials, existingConnectorId);
+    if (lookup?.several) {
+      const message = `This Odoo has several databases: ${lookup.several
+        .slice(0, 5)
+        .map((name) => `"${name}"`)
+        .join(', ')}. Enter the one you use as the database name.`;
+      return { ok: false, kind: 'invalid_input', fields: { ODOO_DB: message }, message };
+    }
+    if (lookup?.database) {
+      const found = lookup.database;
+      const checked = withoutRetryHint(
+        await this.checkCredentials(slug, organizationId, { ...(credentials ?? {}), ODOO_DB: found }, existingConnectorId),
+      );
+      const note = `Your Odoo's database is called "${found}": it is filled in for you.`;
+      if (checked.ok === null) return checked;
+      if (checked.ok === false && checked.kind !== 'auth_failed') return { ...checked, corrected: { ODOO_DB: found } };
+      return checked.ok === false
+        ? { ...checked, corrected: { ODOO_DB: found }, message: `${note} ${checked.message}` }
+        : { ...checked, corrected: { ODOO_DB: found }, note };
+    }
+    const first = await this.checkCredentials(slug, organizationId, credentials, existingConnectorId);
+    if (first.ok !== false || !first.odooDatabase) return withoutRetryHint(first);
+    // Odoo: the database name is wrong and the address serves one database.
+    // 19 of the Odoo setups stuck on 9 Nov 2026 had been told its name and
+    // never typed it in, so the check tries it. When Odoo accepts it, or only
+    // the key is refused now, the page puts the name in the field and saves it.
+    const database = first.odooDatabase;
+    const retry = await this.checkCredentials(
+      slug,
+      organizationId,
+      { ...(credentials ?? {}), ODOO_DB: database },
+      existingConnectorId,
+    );
+    const note = `Your Odoo's database is called "${database}": it is filled in for you.`;
+    if (retry.ok === true) return { ...retry, corrected: { ODOO_DB: database }, note };
+    if (retry.ok === false && retry.kind === 'auth_failed' && !retry.odooDatabase) {
+      return { ...retry, corrected: { ODOO_DB: database }, message: `${note} ${retry.message}` };
+    }
+    return withoutRetryHint(first);
+  }
+
+  /**
+   * Odoo: what to use for a database name left empty (the form no longer
+   * requires it), from the address typed or stored; undefined when a name is
+   * there, or there is no address to ask. Of 32 people who opened the Odoo
+   * setup on 15-16 Nov 2026, 6 were stopped by that empty field, and the name
+   * is one Odoo rarely shows.
+   */
+  private async odooDatabaseForSetup(
+    slug: string,
+    organizationId: string,
+    credentials: Record<string, string> | undefined,
+    existingConnectorId: string | undefined,
+  ): Promise<{ database?: string; several?: string[] } | undefined> {
+    if (!isOdooAdapter(slug)) return undefined;
+    let url = credentials?.ODOO_URL?.trim() ?? '';
+    let database = credentials?.ODOO_DB?.trim() ?? '';
+    if (existingConnectorId && (!url || !database)) {
+      const stored = await this.prisma.connector.findFirst({
+        where: { id: existingConnectorId, organizationId },
+        select: { envVars: true },
+      });
+      const env = (stored?.envVars ?? {}) as Record<string, unknown>;
+      if (!url && typeof env.ODOO_URL === 'string') url = env.ODOO_URL.trim();
+      if (!database && typeof env.ODOO_DB === 'string') database = env.ODOO_DB.trim();
+    }
+    if (database || !/^https?:\/\/[^\s/]+/i.test(url)) return undefined;
+    return odooDatabaseForEmptyField(url);
+  }
+
+  /** One setup check, as described on verifyCredentials. */
+  private async checkCredentials(
+    slug: string,
+    organizationId: string,
+    credentials?: Record<string, string>,
+    existingConnectorId?: string,
+  ): Promise<CheckResult> {
     const adapter = this.getBySlug(slug);
     if (existingConnectorId) {
       const stored = await this.prisma.connector.findFirst({
@@ -514,6 +666,39 @@ export class AdaptersService {
         fields: derived.fields,
         message: describeFieldProblems(derived.fields),
       };
+    }
+    // WooCommerce: the site is asked, without the key, what it is (its own
+    // address, WooCommerce present, Plain permalinks, a firewall). Its own
+    // address replaces the one typed; a site the key cannot reach either
+    // (no such host, no valid https, Plain permalinks) is told without
+    // sending the key.
+    let woo: WooCommerceDiscovery | undefined;
+    let wooCorrected: Record<string, string> | undefined;
+    const typedSite = prepared.credentials?.[WOOCOMMERCE_URL_VAR];
+    if (slug === WOOCOMMERCE_SLUG && typedSite) {
+      woo = await discoverWooCommerce(typedSite, this.egressContext()).catch(() => undefined);
+      if (woo?.corrected && woo.corrected !== typedSite) {
+        try {
+          const next = this.prepareConnector(adapter, { ...(credentials ?? {}), [WOOCOMMERCE_URL_VAR]: woo.corrected });
+          if (Object.keys(checkAdapterEnvValues(adapter, next.credentials ?? {}, [WOOCOMMERCE_URL_VAR])).length === 0) {
+            prepared = next;
+            credentials = { ...(credentials ?? {}), [WOOCOMMERCE_URL_VAR]: woo.corrected };
+            wooCorrected = { [WOOCOMMERCE_URL_VAR]: woo.corrected };
+          }
+        } catch {
+          // The site's own address does not fit the adapter: keep the one typed.
+        }
+      }
+      if (woo?.final && woo.message) {
+        return {
+          ok: false,
+          kind: woo.problem === 'plain_permalinks' ? 'not_found' : 'unreachable',
+          status: null,
+          message: woo.message,
+          fields: { [WOOCOMMERCE_URL_VAR]: woo.message },
+          ...(wooCorrected ? { corrected: wooCorrected } : {}),
+        };
+      }
     }
     const state = computeSetupState({
       authType: adapter.connector.authType,
@@ -590,6 +775,7 @@ export class AdaptersService {
         toolName,
         durationMs: Date.now() - started,
         sample: truncateSample(shaped),
+        ...(wooCorrected ? { corrected: wooCorrected, ...(woo?.message ? { note: woo.message } : {}) } : {}),
       };
     } catch (err: any) {
       const status = errorStatus(err);
@@ -601,8 +787,24 @@ export class AdaptersService {
       });
       // The adapter knows its own failures better than the shared classifier:
       // an Odoo 404 means "older than 19", not "check the tool path".
-      const own = adapter.verifyHints?.[String(status)] ?? adapter.verifyHints?.[classified.kind];
-      const hint = typeof own === 'string' ? own : own?.hint ?? classified.hint;
+      // A provider that answers every refusal with the same status says which
+      // one in its body (Shopify's token request: 400 with `app_not_installed`,
+      // `shop_not_permitted`…): a hint filed under that code comes first.
+      const own =
+        codeHint(adapter.verifyHints, providerErrorCode(`${upstream}\n${rawResponseText(err)}`)) ??
+        adapter.verifyHints?.[String(status)] ??
+        adapter.verifyHints?.[classified.kind];
+      // A server that only accepts approved addresses answers with a page or
+      // a refusal that says nothing about the keys: name the address to allow.
+      const ipRefusal =
+        !own && looksLikeIpRefusal({ status: status ?? undefined, text: `${upstream}\n${rawResponseText(err)}` })
+          ? ipRefusalHint({
+              ips: egressIps(),
+              cloud: this.configService.get<string>('DEPLOYMENT_MODE') === 'cloud',
+              usedProxy: tool!.useProxy === true,
+            })
+          : undefined;
+      const hint = typeof own === 'string' ? own : own?.hint ?? ipRefusal ?? classified.hint;
       const message = hint ? `${hint} (${upstream.replace(/[.\s]+$/, '')})` : upstream;
       // Odoo: a JSON-2 404 is told apart by asking Odoo its version (older
       // than 19, a wrong database name, no database at this address), and a
@@ -618,6 +820,19 @@ export class AdaptersService {
         baseUrl: prepared.resolvedBaseUrl,
         enteredDatabase: credentials?.ODOO_DB,
       });
+      // WooCommerce: a refused key told apart by its code, or what the site
+      // said about itself before the key was tried.
+      const wooAdvice = await wooCommerceCheckAdvice({
+        adapterSlug: adapter.slug,
+        status,
+        text: `${upstream}\n${rawResponseText(err)}`,
+        siteUrl: prepared.credentials?.[WOOCOMMERCE_URL_VAR],
+        ctx: this.egressContext(),
+        // Asked once already, before the key was sent.
+        discovery: woo ?? { url: '' },
+      });
+      const wooMessage = wooAdvice ? `${wooAdvice} (${upstream.replace(/[.\s]+$/, '')})` : undefined;
+      const correctedNote = wooCorrected && woo?.message ? `${woo.message} ` : '';
       const suggest = odoo
         ? odoo.suggest
         : typeof own === 'object' && own?.suggest
@@ -635,7 +850,9 @@ export class AdaptersService {
         toolName,
         status: status ?? null,
         // The hint is what the user acts on; the provider's own words follow.
-        message: odoo ? odoo.message : message,
+        message: correctedNote + (odoo ? odoo.message : (wooMessage ?? message)),
+        ...(odoo?.database ? { odooDatabase: odoo.database } : {}),
+        ...(wooCorrected ? { corrected: wooCorrected } : {}),
         ...(field ? { fields: { [field]: message } } : {}),
         ...(suggest ? { suggest, suggestName: target?.name ?? suggest } : {}),
         ...(target
@@ -945,6 +1162,7 @@ export class AdaptersService {
           adapter.tools,
           discovered,
           mcpToolPrefixOf(adapter.connector.config),
+          mcpFixedArgumentsOf(adapter.connector.config),
         );
         mcpProbe = {
           ok: true,
@@ -1074,6 +1292,12 @@ export class AdaptersService {
     }
     // Same for a Shopee shop, authorized with "Authorize shop" after install.
     if (shopeeNeedsAuthorization(adapter.connector.authType, auth)) return null;
+    // And for a TikTok shop, authorized from the connector page too.
+    if (tiktokShopNeedsAuthorization(adapter.connector.authType, auth)) return null;
+    // And for a seller at an IOP gateway (Lazada, Miravia, AliExpress seller).
+    if (iopNeedsAuthorization(adapter.connector.authType, auth)) return null;
+    // And for a SHEIN shop, authorized through SHEIN's store authorization.
+    if (sheinNeedsAuthorization(adapter.connector.authType, auth)) return null;
     const call = pickProbe(adapter);
     if (!call) return null;
     const started = Date.now();
@@ -1085,6 +1309,9 @@ export class AdaptersService {
         include: { tools: { where: { name: call.toolName } } },
       });
       envVars = (connector?.envVars as Record<string, string> | null) ?? {};
+      // An Instagram connector installed to sign in with Facebook or
+      // Instagram right after: no token yet, nothing to probe.
+      if (metaLoginNeedsAuthorization(adapter.slug, envVars)) return null;
       baseUrl = connector ? interpolateString(connector.baseUrl, envVars) : undefined;
       const tool = connector?.tools[0];
       if (!connector || !tool) return null;
@@ -1125,13 +1352,22 @@ export class AdaptersService {
         baseUrl,
         enteredDatabase: envVars.ODOO_DB,
       });
+      // WooCommerce: the refused key told apart, or what the site says about
+      // itself (no WooCommerce, Plain permalinks, a firewall), asked now.
+      const woo = await wooCommerceCheckAdvice({
+        adapterSlug: adapter.slug,
+        status,
+        text: `${upstream}\n${rawResponseText(err)}`,
+        siteUrl: wooCommerceSiteOf(envVars, baseUrl),
+        ctx: this.egressContext(),
+      }).catch(() => undefined);
       return {
         ok: false,
         toolName: call.toolName,
         durationMs: Date.now() - started,
         status: status ?? null,
         // The hint is what the user acts on; the provider's own words follow.
-        message: odoo ? odoo.message : message,
+        message: odoo ? odoo.message : woo ? `${woo} (${upstream.replace(/[.\s]+$/, '')})` : message,
       };
     }
   }
@@ -1260,11 +1496,25 @@ export interface StarterPackItem {
 }
 
 export type VerifyResult =
-  | { ok: true; toolName: string; durationMs: number; sample: string }
+  | {
+      ok: true;
+      toolName: string;
+      durationMs: number;
+      sample: string;
+      /**
+       * Values the check changed to get through (an Odoo database name the
+       * address names itself): the page fills them in and saves them.
+       */
+      corrected?: Record<string, string>;
+      /** What was changed, in a sentence for the page. */
+      note?: string;
+    }
   | {
       ok: false;
       kind: string;
       message: string;
+      /** As on success: values to fill in although the check still failed (an Odoo database name, then a refused key). */
+      corrected?: Record<string, string>;
       missing?: string[];
       /** Values refused field by field (a placeholder, a pattern miss, a key pasted twice). */
       fields?: Record<string, string>;
@@ -1287,6 +1537,15 @@ export type VerifyResult =
       appPending?: boolean;
     }
   | { ok: null; skipped: 'authorization' | 'no_probe' };
+
+/** A single check: a failure may carry the one Odoo database to try instead (never sent to the page). */
+type CheckResult = VerifyResult & { odooDatabase?: string };
+
+function withoutRetryHint(result: CheckResult): VerifyResult {
+  if (!('odooDatabase' in result)) return result;
+  const { odooDatabase: _unused, ...rest } = result;
+  return rest as VerifyResult;
+}
 
 export type ExerciseResult =
   | { tool: string; outcome: 'ok'; durationMs: number; shape: string }
@@ -1360,6 +1619,32 @@ function describeShape(value: unknown): string {
  * status code 500" told one ShipStation user on 10 Oct 2026 nothing; the body
  * holds the provider's own reason and the request id its support asks for.
  */
+/** The raw response body of a failed call, as text (empty when there is none). */
+function rawResponseText(err: any): string {
+  const data = err?.response?.data;
+  if (data === undefined || data === null) return '';
+  try {
+    return (typeof data === 'string' ? data : JSON.stringify(data)).slice(0, 4000);
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * `text` without its trailing dots and whitespace: what `/[.\s]+$/` removes,
+ * in one pass from the end. The regex retries every run of spaces in the
+ * middle of a long message, which is quadratic in its length.
+ */
+export function trimTrailingDotsAndSpace(text: string): string {
+  let end = text.length;
+  while (end > 0) {
+    const ch = text[end - 1];
+    if (ch !== '.' && !/\s/.test(ch)) break;
+    end--;
+  }
+  return text.slice(0, end);
+}
+
 function withResponseExcerpt(message: string, err: any, max = 200): string {
   const data = err?.response?.data;
   if (data === undefined || data === null || message.includes('body=')) return message;
@@ -1370,10 +1655,10 @@ function withResponseExcerpt(message: string, err: any, max = 200): string {
     return message;
   }
   // A web page instead of API data: its readable words, never its markup.
-  if (looksLikeHtml(body)) return `${message.replace(/[.\s]+$/, '')}: ${describeHtmlAnswer(body, max)}`;
+  if (looksLikeHtml(body)) return `${trimTrailingDotsAndSpace(message)}: ${describeHtmlAnswer(body, max)}`;
   body = body.replace(/\s+/g, ' ').trim();
   if (!body || body === '{}' || body === '""' || message.includes(body)) return message;
-  return `${message.replace(/[.\s]+$/, '')}: ${body.length > max ? `${body.slice(0, max)}…` : body}`;
+  return `${trimTrailingDotsAndSpace(message)}: ${body.length > max ? `${body.slice(0, max)}…` : body}`;
 }
 
 function truncateSample(value: unknown, max = 600): string {

@@ -19,14 +19,22 @@ export const FLAGS: readonly FlagSpec[] = [
   { name: 'args', value: 'JSON, @file.json or -', description: 'Tool arguments as a JSON object' },
   { name: 'yes', description: 'Run a destructive tool without asking' },
   { name: 'timeout', value: 'seconds', description: 'Tool call timeout in seconds' },
+  { name: 'data', value: 'JSON, @file.json or -', description: 'Request body for amcp api' },
+  { name: 'management', description: 'Log in with a management-scoped key for amcp api' },
+  { name: 'list', description: 'List the management API operations amcp api can call' },
+  { name: 'browser', description: 'Log in through the browser and mint a management key' },
+  { name: 'scope', value: 'read|admin', description: 'Scope for a browser-minted management key' },
+  { name: 'to', value: 'email address', description: 'Send each invoice to this address (amcp invoices email)' },
+  { name: 'billing-contact', description: 'Send invoices to the billing contact again (amcp invoices email)' },
   { name: 'json', description: 'Machine-readable output' },
   { name: 'help', short: 'h', description: 'Show usage' },
+  { name: 'version', short: 'v', description: 'Show the CLI version' },
 ];
 
-const GLOBAL_FLAGS = ['json', 'help'];
+const GLOBAL_FLAGS = ['json', 'help', 'version'];
 
 export const COMMANDS: readonly CommandSpec[] = [
-  { name: 'login', description: 'Verify an API key and save a profile', flags: ['url', 'server', 'key-stdin', 'profile'] },
+  { name: 'login', description: 'Verify an API key and save a profile', flags: ['url', 'server', 'management', 'browser', 'scope', 'key-stdin', 'profile'] },
   { name: 'logout', description: 'Remove a saved profile', flags: ['profile'] },
   { name: 'whoami', description: 'Show the saved profile', flags: ['profile'] },
   {
@@ -34,6 +42,12 @@ export const COMMANDS: readonly CommandSpec[] = [
       { name: 'ls', description: 'List tools', flags: ['filter', 'profile', 'url', 'server'] },
       { name: 'describe', description: 'Show a tool description and input schema', flags: ['profile', 'url', 'server'] },
       { name: 'call', description: 'Call a tool', flags: ['args', 'yes', 'timeout', 'profile', 'url', 'server'] },
+    ],
+  },
+  { name: 'api', description: 'Call the management API (/api/*) with a management key', flags: ['url', 'data', 'key-stdin', 'yes', 'list', 'profile'] },
+  {
+    name: 'invoices', description: 'Invoices of your AnythingMCP Cloud workspace', subcommands: [
+      { name: 'email', description: 'Show or change emailing each paid invoice as a PDF', flags: ['to', 'billing-contact', 'yes', 'url', 'key-stdin', 'profile'] },
     ],
   },
   {

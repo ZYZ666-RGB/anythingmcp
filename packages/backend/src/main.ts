@@ -20,17 +20,20 @@ startTracing();
 import { NestFactory } from '@nestjs/core';
 import { APP_VERSION, APP_COMMIT, APP_BUILD_DATE } from './common/app-version';
 import { Logger, ValidationPipe } from '@nestjs/common';
-import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
+import { SwaggerModule } from '@nestjs/swagger';
+import { buildOpenApiConfig } from './common/openapi';
 import { ConfigService } from '@nestjs/config';
 import { Logger as PinoLogger } from 'nestjs-pino';
 import cookieParser from 'cookie-parser';
 import { json, urlencoded } from 'express';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
+import { WOOCOMMERCE_CALLBACK_PATH, wooCommerceCallbackBodyParser } from './connectors/woocommerce-auth.controller';
 import { mcpStrategy } from './mcp-server/mcp-strategy';
 import { McpAuthExceptionFilter } from './auth/mcp-auth-exception.filter';
 import { McpEmailVerificationFilter } from './auth/mcp-email-verification';
 import { validateRequiredSecretsAtStartup } from './common/secrets.util';
+import { cookieSecrets } from './common/cookie-secrets.util';
 import { startMetricsServer, stopMetricsServer } from './common/metrics';
 
 async function bootstrap() {
@@ -48,6 +51,11 @@ async function bootstrap() {
   const expressApp = app.getHttpAdapter().getInstance();
   expressApp.set('trust proxy', true);
 
+  // The WooCommerce key callback is unauthenticated and receives five short
+  // fields: its own parser caps the body at 4 KB before the global one runs
+  // (woocommerce-auth.controller.ts).
+  app.use(WOOCOMMERCE_CALLBACK_PATH, wooCommerceCallbackBodyParser());
+
   // Increase body size limit for large API spec imports (Postman, OpenAPI, etc.)
   // `application/scim+json` is what Entra ID sends to the SCIM endpoint.
   // body-parser's default `type` matches only application/json, so without
@@ -55,8 +63,15 @@ async function bootstrap() {
   // that look nothing like a content-type problem.
   // `verify` keeps the raw bytes of signed webhooks, whose HMAC must be
   // computed over the body exactly as sent.
+  // Agent file uploads stream their raw body themselves (up to 200 MB, see
+  // FileUploadService.receive): no parser may consume it first, whatever
+  // Content-Type curl sends (`--data-binary` defaults to form-urlencoded).
+  const skipUploads =
+    (parser: ReturnType<typeof json>) =>
+    (req: any, res: any, next: (err?: unknown) => void) =>
+      req.url?.startsWith('/api/uploads/u/') ? next() : parser(req, res, next);
   app.use(
-    json({
+    skipUploads(json({
       limit: '10mb',
       type: ['application/json', 'application/scim+json'],
       verify: (req: any, _res, buf) => {
@@ -64,36 +79,29 @@ async function bootstrap() {
           req.rawBody = buf;
         }
       },
-    }),
+    })),
   );
-  app.use(urlencoded({ extended: true, limit: '10mb' }));
+  app.use(skipUploads(urlencoded({ extended: true, limit: '10mb' })));
 
   const configService = app.get(ConfigService);
   const port = configService.get<number>('PORT') || 4000;
   const isProduction = configService.get<string>('NODE_ENV') === 'production';
 
-  // Cookie parser with HMAC secret so we can use signed cookies for the
-  // OAuth callback flow. Falls back to JWT_SECRET to avoid forcing every
-  // self-hoster to add a new env var; logs a startup warning when the
-  // fallback is used in production.
-  const cookieSecret =
-    configService.get<string>('COOKIE_SECRET') ||
-    configService.get<string>('JWT_SECRET');
-  if (!cookieSecret) {
-    throw new Error(
-      'COOKIE_SECRET (or fallback JWT_SECRET) must be set for signed cookies',
-    );
-  }
-  if (
-    isProduction &&
-    !configService.get<string>('COOKIE_SECRET')
-  ) {
+  // Cookie parser with HMAC secrets for the signed cookies of the OAuth and
+  // connect flows. Falls back to JWT_SECRET to avoid forcing every self-hoster
+  // to add a new env var; logs a startup warning when the fallback is used in
+  // production. See cookieSecrets for adding COOKIE_SECRET to a running server.
+  if (isProduction && !configService.get<string>('COOKIE_SECRET')?.trim()) {
     Logger.warn(
       'COOKIE_SECRET not set in production — falling back to JWT_SECRET. Set COOKIE_SECRET to a separate value for defense-in-depth.',
       'Bootstrap',
     );
   }
-  app.use(cookieParser(cookieSecret));
+  const cookieSecretList = cookieSecrets({
+    COOKIE_SECRET: configService.get<string>('COOKIE_SECRET'),
+    JWT_SECRET: configService.get<string>('JWT_SECRET'),
+  });
+  app.use(cookieParser(cookieSecretList));
 
   // Security headers (CSP relaxed because Swagger UI ships inline scripts/styles)
   app.use(
@@ -124,6 +132,22 @@ async function bootstrap() {
   // CORS_ORIGIN list is required. In development a sensible localhost default
   // is used when CORS_ORIGIN is not set.
   const corsOrigin = resolveCorsOrigin(configService, isProduction);
+  // One-time upload links are called from the upload box an AI app shows in
+  // its chat (an MCP App iframe on the app's own sandbox origin). The token is
+  // the credential and no cookie is involved, so any origin may call them;
+  // answered here, before the credentialed CORS policy below.
+  app.use('/api/uploads/u/', (req: any, res: any, next: () => void) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Max-Age', '600');
+    if (req.method === 'OPTIONS') {
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+    next();
+  });
   app.enableCors({
     origin: corsOrigin,
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
@@ -132,26 +156,8 @@ async function bootstrap() {
     exposedHeaders: ['Content-Disposition', 'X-Secrets-Included'],
   });
 
-  // Swagger documentation
-  const swaggerConfig = new DocumentBuilder()
-    .setTitle('AnythingMCP API')
-    .setDescription(
-      'Backend API for AnythingMCP — convert any API into an MCP server. ' +
-        'Manage connectors, configure MCP tools, and monitor usage.',
-    )
-    .setVersion('0.1.0')
-    .addBearerAuth()
-    .addApiKey(
-      { type: 'apiKey', name: 'X-API-Key', in: 'header' },
-      'api-key',
-    )
-    .addTag('Auth', 'Authentication and user management')
-    .addTag('Connectors', 'Manage API connectors')
-    .addTag('Tools', 'MCP tool configuration')
-    .addTag('AI', 'AI-assisted configuration')
-    .addTag('MCP', 'MCP server management')
-    .addTag('Health', 'Health checks')
-    .build();
+  // Swagger documentation (metadata, tags and auth schemes: common/openapi.ts)
+  const swaggerConfig = buildOpenApiConfig(APP_VERSION);
 
   const document = SwaggerModule.createDocument(app, swaggerConfig);
   SwaggerModule.setup('api/docs', app, document, {

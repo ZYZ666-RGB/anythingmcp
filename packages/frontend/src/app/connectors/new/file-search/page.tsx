@@ -10,6 +10,7 @@ import { Card } from '@/components/ui/card';
 import { useAuth } from '@/lib/auth-context';
 import {
   ApiError,
+  connectors,
   fileSearch,
   license,
   mcpServers,
@@ -23,6 +24,8 @@ import {
 } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { FILE_SEARCH_ENTRY_POINTS, fileCountBucket, isFileSearchSlug } from '@/lib/file-search-catalog';
+import { isPrivateHost, isQuickConnect } from '@/lib/private-host';
+import { NasReachabilityHelp, type NasReachabilityReason } from '@/components/file-search/nas-reachability-help';
 import {
   BudgetBar,
   FolderTree,
@@ -173,6 +176,9 @@ const TYPE_FILTERS: Array<{ id: string; exts: string[] }> = [
   },
 ];
 
+/** Finishes the paused authorization of the File Search plugin (login.controller.ts). */
+const AUTHORIZE_CONTINUE_PATH = '/auth/file-search/continue';
+
 export default function FileSearchWizardPage() {
   return (
     <Suspense fallback={null}>
@@ -228,6 +234,14 @@ function Wizard() {
     via: (FILE_SEARCH_ENTRY_POINTS as readonly string[]).includes(params.get('from') ?? '') ? params.get('from')! : undefined,
     resumed: !!params.get('id'),
   });
+  // Opened from the File Search plugin's authorization page (?return=authorize):
+  // after activating, the wizard goes back there to finish connecting the AI
+  // client, and the servers that connection was granted are preselected. Read
+  // once; the URL keeps both across reloads.
+  const [returnToAuthorize] = useState(() => params.get('return') === 'authorize');
+  const [grantedServers] = useState(() =>
+    (params.get('servers') ?? '').split(',').filter((id) => /^[a-z0-9]{20,40}$/i.test(id)),
+  );
   const reported = useRef(new Set<string>());
   /** Scans started on this page: a resumed draft's old scan is not reported again. */
   const startedScans = useRef(new Set<string>());
@@ -274,16 +288,28 @@ function Wizard() {
     void loadCaps();
   }, [loadCaps]);
 
+  // Cloud: the addresses it connects from, for the NAS firewall tip.
+  const [egressIps, setEgressIps] = useState<string[]>([]);
+  useEffect(() => {
+    if (!token || !caps?.cloud) return;
+    connectors
+      .proxyAvailability(token)
+      .then((r) => setEgressIps(Array.isArray(r.egressIps) ? r.egressIps : []))
+      .catch(() => undefined);
+  }, [token, caps?.cloud]);
+
   useEffect(() => {
     if (!token) return;
     mcpServers
       .list(token)
       .then((list) => {
         setServers(list);
-        if (list.length === 1) setServerIds(new Set([list[0].id]));
+        const granted = list.filter((s) => grantedServers.includes(s.id)).map((s) => s.id);
+        if (granted.length) setServerIds(new Set(granted));
+        else if (list.length === 1) setServerIds(new Set([list[0].id]));
       })
       .catch(() => undefined);
-  }, [token]);
+  }, [token, grantedServers]);
 
   // Keep the step and draft in the URL.
   useEffect(() => {
@@ -291,6 +317,11 @@ function Wizard() {
     if (draftId) q.set('id', draftId);
     q.set('step', String(step));
     if (!draftId) q.set('protocol', form.protocol);
+    // Kept across reloads: the way back to the authorization and its servers.
+    if (returnToAuthorize) {
+      q.set('return', 'authorize');
+      if (grantedServers.length) q.set('servers', grantedServers.join(','));
+    }
     router.replace(`/connectors/new/file-search?${q.toString()}`, { scroll: false });
     headingRef.current?.focus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -402,6 +433,35 @@ function Wizard() {
   };
 
   const needsFingerprint = !!testResult?.fingerprint && testResult.errorKind === 'fingerprint_unconfirmed';
+
+  // Cloud: a NAS address that only works inside the user's network, as typed
+  // (step 1), or a test that could not get through to the server (step 2).
+  const typedAddress = form.protocol === 'webdav' ? form.url : form.host;
+  const addressReason: NasReachabilityReason | null =
+    !caps?.cloud || form.protocol === 'local' || form.protocol === 's3'
+      ? null
+      : isQuickConnect(typedAddress)
+        ? 'quickconnect'
+        : isPrivateHost(typedAddress)
+          ? 'private'
+          : null;
+  const testReason: NasReachabilityReason | null =
+    !caps?.cloud || !testResult || testResult.ok
+      ? null
+      : addressReason ??
+        (testResult.errorKind === 'private_address'
+          ? 'private'
+          : testResult.errorKind === 'unreachable' || testResult.errorKind === 'timeout'
+            ? 'unreachable'
+            : null);
+  const switchToWebdav =
+    form.protocol !== 'webdav' && caps?.protocols.includes('webdav')
+      ? () => {
+          setForm((f) => ({ ...f, protocol: 'webdav', port: '', hostKeySha256: '', tlsFingerprintSha256: '' }));
+          setTestResult(null);
+          setStep(1);
+        }
+      : undefined;
   const testPassed = !!testResult?.ok && !needsFingerprint;
 
   const saveDraft = async () => {
@@ -511,7 +571,11 @@ function Wizard() {
         token,
       );
       trackOnce('activated', 'file_search_activated', { files: fileCountBucket(budget?.files ?? scan?.totals?.files ?? 0) });
-      router.push(`/connectors/${draftId}?tab=files`);
+      // A full navigation: the backend finishes the paused authorization and
+      // sends the browser back to the AI client.
+      // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- a backend route (/auth/*), not a Next.js page
+      if (returnToAuthorize) window.location.assign(AUTHORIZE_CONTINUE_PATH);
+      else router.push(`/connectors/${draftId}?tab=files`);
     } catch (e) {
       setError(errMessage(e));
     } finally {
@@ -588,6 +652,15 @@ function Wizard() {
   return (
     <AppShell backTo={{ label: t('back'), href: '/connectors/new' }} title={t('title')} subtitle={t('subtitle')} maxWidth={920}>
       <div className="mx-auto w-full max-w-[920px] space-y-5">
+        {returnToAuthorize && (
+          <Card className="flex flex-col gap-2 border-[var(--brand)] bg-[var(--brand-tint)] p-4 text-[13px] leading-[1.55] text-[var(--text)] sm:flex-row sm:items-center sm:justify-between">
+            <span>{t('authorize.banner')}</span>
+            <a href={AUTHORIZE_CONTINUE_PATH} className="shrink-0 font-semibold text-[var(--brand)] underline-offset-2 hover:underline">
+              {t('authorize.skip')}
+            </a>
+          </Card>
+        )}
+
         {!caps && !capsError && <p className="text-[13px] text-[var(--text-3)]">{t('loading')}</p>}
         {capsError && <p className="text-[13px] text-[var(--danger)]">{capsError}</p>}
 
@@ -851,6 +924,8 @@ function Wizard() {
                   )}
                 </div>
 
+                {addressReason && <NasReachabilityHelp reason={addressReason} ips={egressIps} onUseWebdav={switchToWebdav} />}
+
                 <div className="flex flex-col-reverse gap-2 border-t border-[var(--border)] pt-4 sm:flex-row sm:justify-end">
                   <Link href="/connectors/new" className="inline-flex h-9 items-center justify-center rounded-[9px] px-3.5 text-[13px] text-[var(--text-2)] hover:text-[var(--text)]">
                     {t('cancel')}
@@ -898,6 +973,7 @@ function Wizard() {
                         </Button>
                       </div>
                     )}
+                    {testReason && <NasReachabilityHelp reason={testReason} ips={egressIps} onUseWebdav={switchToWebdav} />}
                   </div>
                 )}
                 <div className="flex flex-col-reverse gap-2 border-t border-[var(--border)] pt-4 sm:flex-row sm:justify-between">

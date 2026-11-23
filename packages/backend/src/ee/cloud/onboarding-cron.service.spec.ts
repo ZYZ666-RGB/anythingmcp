@@ -257,7 +257,15 @@ describe('OnboardingCronService — trial status transition', () => {
 describe('OnboardingCronService — trial lifecycle emails', () => {
   const HOUR = 60 * 60 * 1000;
   const NOW = new Date('2026-10-14T09:17:00Z').getTime();
-  const out = () => ({ examined: 0, trialWarn3: 0, trialWarn1: 0, trialExpired: 0, trialEmailsWithheld: 0, skipped: 0 });
+  const out = () => ({
+    examined: 0,
+    trialWarn3: 0,
+    trialWarn1: 0,
+    trialExpired: 0,
+    trialEmailsWithheld: 0,
+    trialEmailsOptedOut: 0,
+    skipped: 0,
+  });
 
   /** Free trials ending `endsInHours` from NOW, one per workspace. */
   function makeService(opts: {
@@ -444,14 +452,14 @@ describe('OnboardingCronService — trial lifecycle emails', () => {
       expect(o.trialExpired).toBe(1);
     });
 
-    it('sends today\'s notice to an admin who opted out of marketing, the personal one to the others', async () => {
+    it('sends the personal email to the admins who did not opt out, and nothing to those who did', async () => {
       const { run, email } = makeService({
         trials: [ended('org-1', { admins: ['boss@acme.io', 'it@acme.io'] })],
         optedOut: ['it@acme.io'],
       });
       await run();
       expect(email.sendTrialEndedBusinessEmail.mock.calls.map((c: any[]) => c[0])).toEqual(['boss@acme.io']);
-      expect(email.sendTrialLifecycleEmail.mock.calls.map((c: any[]) => c[0])).toEqual(['it@acme.io']);
+      expect(email.sendTrialLifecycleEmail).not.toHaveBeenCalled();
     });
 
     it('leaves consumer workspaces and the earlier stages unchanged', async () => {
@@ -464,6 +472,38 @@ describe('OnboardingCronService — trial lifecycle emails', () => {
       expect(email.sendTrialEndedBusinessEmail).not.toHaveBeenCalled();
       expect(codes.winbackCode).not.toHaveBeenCalled();
     });
+  });
+
+  // 11 Nov 2026: an admin who had unsubscribed (and been told so) still got
+  // "Last day of your trial", and would have got "has ended" the next day.
+  it('mails only the admins who did not opt out of marketing', async () => {
+    const { run, email, flagged } = makeService({
+      trials: [{ organizationId: 'org-1', endsInHours: 20, admins: ['in@acme.io', 'out@acme.io'] }],
+      optedOut: ['out@acme.io'],
+    });
+    const o = await run();
+    expect(email.sendTrialLifecycleEmail.mock.calls.map((c: any[]) => c[0])).toEqual(['in@acme.io']);
+    expect(flagged()).toEqual([['org-1', 'trial_email_warn1']]);
+    expect(o).toMatchObject({ trialWarn1: 1, trialEmailsOptedOut: 0 });
+  });
+
+  it('sends nothing when every admin opted out, and closes the stage so it is not decided again', async () => {
+    const { run, email, flagged, stored } = makeService({
+      trials: [
+        { organizationId: 'org-warn', endsInHours: 20, admins: ['out@acme.io'] },
+        { organizationId: 'org-ended', endsInHours: -1, admins: ['out@acme.io'] },
+      ],
+      optedOut: ['out@acme.io'],
+    });
+    const o = await run();
+    expect(email.sendTrialLifecycleEmail).not.toHaveBeenCalled();
+    expect(email.sendTrialEndedBusinessEmail).not.toHaveBeenCalled();
+    expect(flagged()).toEqual([
+      ['org-warn', 'trial_email_warn1'],
+      ['org-ended', 'trial_email_expired'],
+    ]);
+    expect(stored().trial_email_warn1).toMatch(/^opted_out /);
+    expect(o).toMatchObject({ trialWarn1: 0, trialExpired: 0, trialEmailsOptedOut: 2, trialExpiredBusiness: 0 });
   });
 
   it('postpones a workspace the licence site could not answer for: no email, no flag', async () => {
@@ -593,7 +633,7 @@ describe('OnboardingCronService — onboarding pass', () => {
   it('nudges a user with no AI client an hour after sign-up, without naming one', async () => {
     const { service, email } = makeService({ candidates: [user({})] });
     await service.run();
-    expect(email.sendOnboardingReminderEmail).toHaveBeenCalledWith('u1@example.com', 'Ada', 1, undefined);
+    expect(email.sendOnboardingReminderEmail).toHaveBeenCalledWith('u1@example.com', 'Ada', 1, { quickSetups: expect.any(Array) });
   });
 
   it('asks the database only for users who signed up at least an hour ago', async () => {
@@ -613,7 +653,7 @@ describe('OnboardingCronService — onboarding pass', () => {
       ],
     });
     await service.run();
-    expect(email.sendOnboardingReminderEmail).toHaveBeenCalledWith('u1@example.com', 'Ada', 1, undefined);
+    expect(email.sendOnboardingReminderEmail).toHaveBeenCalledWith('u1@example.com', 'Ada', 1, { quickSetups: expect.any(Array) });
   });
 
   it('counts a teammate\'s connector: no reminder, completion stamped', async () => {
@@ -631,17 +671,17 @@ describe('OnboardingCronService — onboarding pass', () => {
   describe('reminder 1 test arms', () => {
     const events = (prisma: any) => prisma.productEvent.create.mock.calls.map((c: any[]) => c[0].data);
 
-    it('arm A: today\'s email, recorded with its arm', async () => {
+    it('a user once in arm A now gets the one-click chats too, recorded as arm B', async () => {
       const { service, email, prisma } = makeService({ candidates: [user({ id: 'u3' })] });
       const out = await service.run();
-      expect(email.sendOnboardingReminderEmail).toHaveBeenCalledWith('u1@example.com', 'Ada', 1, undefined);
+      expect(email.sendOnboardingReminderEmail.mock.calls[0][3].quickSetups).toHaveLength(3);
       expect(out.firstReminders).toBe(1);
       expect(events(prisma)).toEqual([
         {
           event: 'onboarding_reminder_sent',
           userId: 'u3',
           organizationId: 'org-1',
-          metadata: { reminder: 1, arm: 'A', kind: 'generic' },
+          metadata: { reminder: 1, arm: 'B', kind: 'generic' },
         },
       ]);
     });
@@ -653,7 +693,7 @@ describe('OnboardingCronService — onboarding pass', () => {
       expect(opts.quickSetups).toEqual([
         { label: 'Telegram bot', url: 'https://claude.ai/new?q=Connect%20my%20Telegram%20bot%20to%20AnythingMCP' },
         { label: 'Odoo', url: 'https://claude.ai/new?q=Connect%20my%20Odoo%20to%20AnythingMCP' },
-        { label: 'Shopify store', url: 'https://claude.ai/new?q=Connect%20my%20Shopify%20store%20to%20AnythingMCP' },
+        { label: 'WooCommerce store', url: 'https://claude.ai/new?q=Connect%20my%20WooCommerce%20store%20to%20AnythingMCP' },
       ]);
       expect(events(prisma)[0].metadata).toEqual({ reminder: 1, arm: 'B', kind: 'generic' });
     });
@@ -703,7 +743,7 @@ describe('OnboardingCronService — onboarding pass', () => {
       const out = await service.run();
       expect(out.firstReminderHoldout).toBe(0);
       expect(out.firstReminders).toBe(1);
-      expect(email.sendOnboardingReminderEmail).toHaveBeenCalledWith('u3@example.com', 'Ada', 1, undefined);
+      expect(email.sendOnboardingReminderEmail).toHaveBeenCalledWith('u3@example.com', 'Ada', 1, { quickSetups: expect.any(Array) });
       expect(events(prisma).map((e: any) => e.userId)).toEqual(['u3']);
     });
 
@@ -755,7 +795,7 @@ describe('OnboardingCronService — onboarding pass', () => {
       );
       expect(prisma.productEvent.create.mock.calls[0][0].data.metadata).toEqual({
         reminder: 2,
-        arm: 'A',
+        arm: 'B',
         kind: 'generic',
       });
     });
@@ -851,20 +891,25 @@ describe('OnboardingCronService — trial win-back', () => {
       { email: 'admin@example.com', name: 'Ada', optedOut: !!opts.optedOut },
     ];
     const licences = [{ plan: 'trial', status: 'expired' }, ...(opts.otherLicences ?? [])];
+    const settingKeys = [...(opts.flagged ?? []), ...Object.keys(opts.stored ?? {})];
     const prisma = {
       license: {
-        findMany: jest.fn().mockResolvedValue([
-          { organizationId, expiresAt: new Date(NOW - opts.endedDaysAgo * DAY) },
-        ]),
-        count: jest.fn(async ({ where }: any) =>
-          licences.filter(
-            (l) =>
-              (where.plan?.not === undefined || l.plan !== where.plan.not) &&
-              (where.status === undefined || l.status === where.status),
-          ).length,
+        // The trials of the pass (plan 'trial'), then the workspace's other
+        // licences (plan not 'trial').
+        findMany: jest.fn(async ({ where }: any) =>
+          where.plan === 'trial'
+            ? [{ organizationId, expiresAt: new Date(NOW - opts.endedDaysAgo * DAY) }]
+            : where.organizationId.in.includes(organizationId)
+              ? licences.filter((l) => l.plan !== where.plan.not).map(() => ({ organizationId }))
+              : [],
         ),
       },
       orgSettings: {
+        findMany: jest.fn(async ({ where }: any) =>
+          where.organizationId.in.includes(organizationId)
+            ? settingKeys.filter((key) => where.key.in.includes(key)).map((key) => ({ organizationId, key }))
+            : [],
+        ),
         findUnique: jest.fn(async ({ where }: any) => {
           const key = where.organizationId_key.key;
           if (opts.stored && key in opts.stored) return { id: 's', value: opts.stored[key] };
@@ -1224,12 +1269,17 @@ describe('OnboardingCronService — win-back holdout', () => {
   }) {
     const prisma = {
       license: {
-        findMany: jest.fn().mockResolvedValue([
-          { organizationId: opts.organizationId, expiresAt: new Date(NOW - 2 * DAY) },
-        ]),
-        count: jest.fn().mockResolvedValue(0),
+        // The trials of the pass; no licence besides the free trial.
+        findMany: jest.fn(async ({ where }: any) =>
+          where.plan === 'trial' ? [{ organizationId: opts.organizationId, expiresAt: new Date(NOW - 2 * DAY) }] : [],
+        ),
       },
       orgSettings: {
+        findMany: jest.fn(async ({ where }: any) =>
+          Object.keys(opts.stored ?? {})
+            .filter((key) => where.key.in.includes(key) && where.organizationId.in.includes(opts.organizationId))
+            .map((key) => ({ organizationId: opts.organizationId, key })),
+        ),
         findUnique: jest.fn(async ({ where }: any) => {
           const key = where.organizationId_key.key;
           return opts.stored && key in opts.stored ? { id: 's', value: opts.stored[key] } : null;
@@ -1332,6 +1382,8 @@ describe('OnboardingCronService — blocked-call email', () => {
     recentWinbackEmail?: boolean;
     sendOk?: boolean;
     codesUnavailable?: boolean;
+    /** Members' first-success stamps (users.first_successful_invocation_at). */
+    memberFirstSuccess?: Array<{ joinedAt: Date; at: Date }>;
   } = {}) {
     const organizationId = opts.organizationId ?? ORG;
     const events = opts.events ?? [
@@ -1346,14 +1398,24 @@ describe('OnboardingCronService — blocked-call email', () => {
         findMany: jest.fn().mockResolvedValue(events.map((metadata) => ({ metadata }))),
       },
       license: {
-        count: jest.fn().mockResolvedValue(opts.otherLicences ?? 0),
-        findFirst: jest.fn().mockResolvedValue(
-          opts.trialEndedHoursAgo === null
-            ? null
-            : { expiresAt: new Date(NOW - (opts.trialEndedHoursAgo ?? 72) * HOUR) },
-        ),
+        // The workspace's latest free trial (plan 'trial'), or its other
+        // licences (plan not 'trial').
+        findMany: jest.fn(async ({ where }: any) => {
+          if (!where.organizationId.in.includes(organizationId)) return [];
+          if (where.plan === 'trial') {
+            return opts.trialEndedHoursAgo === null
+              ? []
+              : [{ organizationId, expiresAt: new Date(NOW - (opts.trialEndedHoursAgo ?? 72) * HOUR) }];
+          }
+          return Array.from({ length: opts.otherLicences ?? 0 }, () => ({ organizationId }));
+        }),
       },
       orgSettings: {
+        findMany: jest.fn(async ({ where }: any) =>
+          [...(opts.flagged ?? []), ...Object.keys(opts.stored ?? {})]
+            .filter((key) => where.key.in.includes(key) && where.organizationId.in.includes(organizationId))
+            .map((key) => ({ organizationId, key })),
+        ),
         findUnique: jest.fn(async ({ where }: any) => {
           const key = where.organizationId_key.key;
           if (opts.stored && key in opts.stored) return { id: 's', value: opts.stored[key] };
@@ -1363,8 +1425,14 @@ describe('OnboardingCronService — blocked-call email', () => {
         upsert: jest.fn().mockResolvedValue({}),
       },
       organizationMember: {
-        findMany: jest.fn().mockResolvedValue(
-          admins.map((a) => ({ user: { email: a.email, name: a.name ?? null, emailMarketingOptOut: !!a.optedOut } })),
+        // The admins, or (filtered on the user's stamp) the members' first successes.
+        findMany: jest.fn(async ({ where }: any) =>
+          where.user
+            ? (opts.memberFirstSuccess ?? []).map((m) => ({
+                joinedAt: m.joinedAt,
+                user: { firstSuccessfulInvocationAt: m.at },
+              }))
+            : admins.map((a) => ({ user: { email: a.email, name: a.name ?? null, emailMarketingOptOut: !!a.optedOut } })),
         ),
       },
       toolInvocation: { count: jest.fn().mockResolvedValue(opts.calls ?? 8) },
@@ -1434,7 +1502,7 @@ describe('OnboardingCronService — blocked-call email', () => {
     const { run, email, prisma } = makeService({ events: [{ adapterSlug: 'etsy' }], eventCount: 1 });
     const o = await run();
     expect(email.sendTrialBlockedCallsEmail).not.toHaveBeenCalled();
-    expect(prisma.license.count).not.toHaveBeenCalled();
+    expect(prisma.license.findMany).not.toHaveBeenCalled();
     expect(o.examined).toBe(0);
   });
 
@@ -1487,6 +1555,43 @@ describe('OnboardingCronService — blocked-call email', () => {
     expect(email.sendTrialBlockedCallsEmail.mock.calls[0][2]).toMatchObject({ neverUsed: true, offer: PERSONAL });
     expect(o.blockedCallEmails).toBe(1);
     expect(stored()).toMatchObject({ winback_holdout: 'unused:treatment', winback_offer: 'unused:personal:blocked_calls' });
+  });
+
+  it('treats a workspace with no SUCCESS row left but a stored first success as used', async () => {
+    // Back months after its trial: the retention deleted its calls.
+    const { run, email, stored, prisma } = makeService({
+      calls: 0,
+      admins: [{ email: 'boss@acme.io', name: 'Boss' }],
+      stored: { first_successful_call_at: '2026-06-01T10:00:00.000Z' },
+    });
+    const o = await run();
+    expect(email.sendTrialBlockedCallsEmail.mock.calls[0][2]).toMatchObject({ neverUsed: false, offer: LOCKED });
+    expect(o.blockedCallEmails).toBe(1);
+    expect(stored()).toMatchObject({ winback_holdout: 'business:treatment', winback_offer: 'business:locked:blocked_calls' });
+    // Read in the batched settings query, with the workspace filter.
+    const where = prisma.orgSettings.findMany.mock.calls[0][0].where;
+    expect(where.key.in).toEqual(['trial_email_blocked_calls', 'first_successful_call_at']);
+    expect(where.organizationId.in).toEqual([ORG]);
+  });
+
+  it("treats a workspace with no SUCCESS row left as used when a member's stamp says so", async () => {
+    const { run, email, prisma } = makeService({
+      calls: 0,
+      memberFirstSuccess: [{ joinedAt: new Date('2026-06-01T00:00:00Z'), at: new Date('2026-06-02T00:00:00Z') }],
+    });
+    await run();
+    expect(email.sendTrialBlockedCallsEmail.mock.calls[0][2]).toMatchObject({ neverUsed: false, offer: PERSONAL });
+    const memberQuery = prisma.organizationMember.findMany.mock.calls.find((c: any[]) => c[0].where.user)[0];
+    expect(memberQuery.where.organizationId).toBe(ORG);
+  });
+
+  it('stays unused when a member was stamped before joining (a call made in another workspace)', async () => {
+    const { run, email } = makeService({
+      calls: 0,
+      memberFirstSuccess: [{ joinedAt: new Date('2026-09-01T00:00:00Z'), at: new Date('2026-06-02T00:00:00Z') }],
+    });
+    await run();
+    expect(email.sendTrialBlockedCallsEmail.mock.calls[0][2]).toMatchObject({ neverUsed: true, offer: PERSONAL });
   });
 
   it('holds out unused workspaces in the 20% band', async () => {
@@ -1566,5 +1671,287 @@ describe('OnboardingCronService — blocked-call email', () => {
     const out = await svc.run();
     expect(order).toEqual(['license', 'license', 'blocked']);
     expect(out).toMatchObject({ blockedCallEmails: 0, blockedCallHoldout: 0, winbackHoldout: 0 });
+  });
+});
+
+/**
+ * The win-back and blocked-call passes load what their loops check first in a
+ * few batched queries (Nov 2026: one hourly run took 7 minutes with about
+ * 4,700 workspaces in a win-back window, two queries each). These tests run
+ * them over an in-memory database that answers both the batched queries and
+ * the per-workspace ones the passes still make.
+ */
+describe('OnboardingCronService — batched win-back lookups', () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const NOW = new Date('2026-11-20T10:00:00Z').getTime();
+
+  type Licence = { organizationId: string; plan: string; status: string; expiresAt: Date | null; createdAt: Date };
+  type Setting = { organizationId: string; key: string; value: string; updatedAt: Date };
+  type Db = {
+    licences: Licence[];
+    settings: Setting[];
+    admins: Record<string, string[]>;
+    calls: Record<string, number>;
+    blockedEvents: string[];
+    paid: string[];
+    unknown: string[];
+  };
+
+  const emptyDb = (): Db => ({ licences: [], settings: [], admins: {}, calls: {}, blockedEvents: [], paid: [], unknown: [] });
+  const trial = (organizationId: string, endedDaysAgo: number, createdDaysAgo = endedDaysAgo + 14): Licence => ({
+    organizationId,
+    plan: 'trial',
+    status: 'expired',
+    expiresAt: new Date(NOW - endedDaysAgo * DAY),
+    createdAt: new Date(NOW - createdDaysAgo * DAY),
+  });
+  const setting = (organizationId: string, key: string): Setting => ({
+    organizationId,
+    key,
+    value: '2026-10-01T00:00:00.000Z',
+    updatedAt: new Date('2026-10-01T00:00:00Z'),
+  });
+
+  function makePrisma(db: Db) {
+    const orgMatches = (w: any, org: string) =>
+      w.organizationId === undefined ||
+      (typeof w.organizationId === 'string'
+        ? w.organizationId === org
+        : w.organizationId.in
+          ? w.organizationId.in.includes(org)
+          : true); // { not: null }
+    const licences = (w: any) =>
+      db.licences.filter(
+        (l) =>
+          orgMatches(w, l.organizationId) &&
+          (w.plan === undefined || (typeof w.plan === 'string' ? l.plan === w.plan : l.plan !== w.plan.not)) &&
+          (w.status === undefined || (typeof w.status === 'string' ? l.status === w.status : w.status.in.includes(l.status))) &&
+          (w.expiresAt === undefined ||
+            (l.expiresAt !== null &&
+              (!w.expiresAt.gte || l.expiresAt >= w.expiresAt.gte) &&
+              (!w.expiresAt.lte || l.expiresAt <= w.expiresAt.lte))),
+      );
+    const newestFirst = (rows: Licence[]) => [...rows].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    const find = (organizationId: string, key: string) =>
+      db.settings.find((s) => s.organizationId === organizationId && s.key === key);
+    return {
+      license: {
+        findMany: jest.fn(async ({ where, orderBy }: any) =>
+          (orderBy ? newestFirst(licences(where)) : licences(where)).map((l) => ({
+            organizationId: l.organizationId,
+            expiresAt: l.expiresAt,
+          })),
+        ),
+        count: jest.fn(async ({ where }: any) => licences(where).length),
+        findFirst: jest.fn(async ({ where }: any) => {
+          const [l] = newestFirst(licences(where));
+          return l ? { expiresAt: l.expiresAt } : null;
+        }),
+      },
+      orgSettings: {
+        findMany: jest.fn(async ({ where }: any) =>
+          db.settings
+            .filter((s) => where.organizationId.in.includes(s.organizationId) && where.key.in.includes(s.key))
+            .map((s) => ({ organizationId: s.organizationId, key: s.key })),
+        ),
+        findUnique: jest.fn(async ({ where }: any) => {
+          const s = find(where.organizationId_key.organizationId, where.organizationId_key.key);
+          return s ? { id: s.key, value: s.value } : null;
+        }),
+        findFirst: jest.fn(async ({ where }: any) => {
+          const s = db.settings.find(
+            (r) => r.organizationId === where.organizationId && where.key.in.includes(r.key) && r.updatedAt > where.updatedAt.gt,
+          );
+          return s ? { id: s.key } : null;
+        }),
+        upsert: jest.fn(async ({ where, create, update }: any) => {
+          const { organizationId, key } = where.organizationId_key;
+          const s = find(organizationId, key);
+          if (s) Object.assign(s, { value: update.value, updatedAt: new Date(NOW) });
+          else db.settings.push({ organizationId, key, value: create.value, updatedAt: new Date(NOW) });
+          return {};
+        }),
+      },
+      organizationMember: {
+        findMany: jest.fn(async ({ where }: any) =>
+          (db.admins[where.organizationId] ?? []).map((email) => ({
+            user: { email, name: null, emailMarketingOptOut: false },
+          })),
+        ),
+      },
+      toolInvocation: { count: jest.fn(async ({ where }: any) => db.calls[where.organizationId] ?? 0) },
+      connector: { findMany: jest.fn().mockResolvedValue([]) },
+      productEvent: {
+        groupBy: jest.fn(async () => {
+          const counts = new Map<string, number>();
+          for (const org of db.blockedEvents) counts.set(org, (counts.get(org) ?? 0) + 1);
+          return [...counts].map(([organizationId, n]) => ({ organizationId, _count: { _all: n } }));
+        }),
+        findMany: jest.fn(async ({ where }: any) =>
+          db.blockedEvents.filter((org) => org === where.organizationId).map(() => ({ metadata: {} })),
+        ),
+      },
+    } as any;
+  }
+
+  function makeService(db: Db) {
+    const prisma = makePrisma(db);
+    const email = {
+      sendTrialWinbackEmail: jest.fn().mockResolvedValue(true),
+      sendTrialBlockedCallsEmail: jest.fn().mockResolvedValue(true),
+    } as any;
+    const license = makeLicense();
+    license.workspacesWithPaidPlan = jest.fn(async (workspaces: Array<{ organizationId: string }>) => ({
+      paid: new Set(workspaces.map((w) => w.organizationId).filter((id) => db.paid.includes(id))),
+      unknown: new Set(workspaces.map((w) => w.organizationId).filter((id) => db.unknown.includes(id))),
+    }));
+    const service = new OnboardingCronService(prisma, email, license, makeRelease(), undefined, makeCodes());
+    const winback = async () => {
+      const o = { examined: 0, winbackOffers: 0, winbackHelp: 0, winbackHoldout: 0, skipped: 0 };
+      await (service as any).runWinbackPass(NOW, o);
+      return o;
+    };
+    const blocked = async () => {
+      const o = { examined: 0, blockedCallEmails: 0, blockedCallHoldout: 0, skipped: 0 };
+      await (service as any).runBlockedCallPass(NOW, o);
+      return o;
+    };
+    const keysOf = (org: string) => db.settings.filter((s) => s.organizationId === org).map((s) => s.key).sort();
+    return { prisma, email, winback, blocked, keysOf };
+  }
+
+  /** Database reads made per workspace, which the batched lookups replaced. */
+  const perWorkspaceReads = (prisma: any) =>
+    prisma.orgSettings.findUnique.mock.calls.length +
+    prisma.license.count.mock.calls.length +
+    prisma.license.findFirst.mock.calls.length;
+
+  it('win-back: a mixed set of workspaces gets the same outcome as with one lookup per workspace', async () => {
+    const db = emptyDb();
+    // org-1 and org-help: due, used / never used. org-dup: never used, with two
+    // trial licences in the first window.
+    db.licences.push(trial('org-1', 2), trial('org-help', 3), trial('org-dup', 2), trial('org-dup', 4, 30));
+    db.calls['org-1'] = 5;
+    // Already sent: the first stage, and the final one a month after.
+    db.licences.push(trial('org-flagged', 2), trial('org-final', 31));
+    db.settings.push(setting('org-flagged', 'trial_email_winback7'), setting('org-final', 'trial_email_winback30'));
+    // A customer here (a revoked card trial), a subscription on the licence
+    // site, no answer from the licence site, and a trial outside any window.
+    db.licences.push(trial('org-customer', 2), { ...trial('org-customer', 2), plan: 'starter', status: 'revoked' });
+    db.licences.push(trial('org-paid', 2), trial('org-unknown', 2), trial('org-between', 20));
+    db.paid.push('org-paid');
+    db.unknown.push('org-unknown');
+    for (const org of ['org-1', 'org-help', 'org-dup', 'org-flagged', 'org-final', 'org-customer', 'org-paid', 'org-unknown', 'org-between']) {
+      db.admins[org] = [`${org}@gmail.com`];
+    }
+
+    const { email, winback, keysOf, prisma } = makeService(db);
+    const o = await winback();
+
+    expect(email.sendTrialWinbackEmail.mock.calls.map((c: any[]) => [c[0], c[2].kind])).toEqual([
+      ['org-1@gmail.com', 'offer'],
+      ['org-help@gmail.com', 'help'],
+      ['org-dup@gmail.com', 'help'], // once, not once per licence
+    ]);
+    expect(o).toEqual({ examined: 9, winbackOffers: 1, winbackHelp: 2, winbackHoldout: 0, skipped: 6 });
+    expect(keysOf('org-1')).toEqual(['trial_email_winback7', 'winback_holdout', 'winback_offer']);
+    expect(keysOf('org-help')).toEqual(['trial_email_winback7', 'winback_offer']);
+    expect(keysOf('org-dup')).toEqual(['trial_email_winback7', 'winback_offer']);
+    expect(keysOf('org-flagged')).toEqual(['trial_email_winback7']);
+    expect(keysOf('org-final')).toEqual(['trial_email_winback30']);
+    expect(keysOf('org-customer')).toEqual(['trial_email_winback7']);
+    expect(keysOf('org-paid')).toEqual(['trial_email_winback7']);
+    expect(keysOf('org-unknown')).toEqual([]);
+    expect(keysOf('org-between')).toEqual([]);
+    // The stage flags and the other licences come from the batched queries.
+    expect(prisma.license.count).not.toHaveBeenCalled();
+    expect(prisma.orgSettings.findMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('blocked-call: a mixed set of workspaces gets the same outcome as with one lookup per workspace', async () => {
+    const db = emptyDb();
+    const orgs = ['org-1', 'org-sent', 'org-customer', 'org-extended', 'org-notrial', 'org-once'];
+    for (const org of orgs) db.admins[org] = [`${org}@gmail.com`];
+    // Two events each, but one for org-once (below the minimum).
+    db.blockedEvents.push(...orgs.flatMap((org) => (org === 'org-once' ? [org] : [org, org])));
+    db.licences.push(trial('org-1', 3), trial('org-sent', 3), trial('org-customer', 3), trial('org-once', 3));
+    db.settings.push(setting('org-sent', 'trial_email_blocked_calls'));
+    db.licences.push({ ...trial('org-customer', 3), plan: 'starter', status: 'active' });
+    // An older ended trial, and the latest one, reissued, still running.
+    db.licences.push(trial('org-extended', 10, 20), { ...trial('org-extended', -2, 1), status: 'active' });
+
+    const { email, blocked, keysOf, prisma } = makeService(db);
+    const o = await blocked();
+
+    expect(email.sendTrialBlockedCallsEmail.mock.calls.map((c: any[]) => c[0])).toEqual(['org-1@gmail.com']);
+    expect(o).toEqual({ examined: 5, blockedCallEmails: 1, blockedCallHoldout: 0, skipped: 4 });
+    expect(keysOf('org-1')).toEqual(['trial_email_blocked_calls', 'trial_email_winback7', 'winback_holdout', 'winback_offer']);
+    expect(keysOf('org-sent')).toEqual(['trial_email_blocked_calls']);
+    expect(keysOf('org-customer')).toEqual(['trial_email_blocked_calls']);
+    expect(keysOf('org-extended')).toEqual([]);
+    expect(keysOf('org-notrial')).toEqual([]);
+    expect(keysOf('org-once')).toEqual([]);
+    expect(prisma.license.count).not.toHaveBeenCalled();
+    expect(prisma.license.findFirst).not.toHaveBeenCalled();
+  });
+
+  it('reads the database a fixed number of times, however many workspaces are already done', async () => {
+    const reads = async (n: number) => {
+      const db = emptyDb();
+      for (let i = 0; i < n; i++) {
+        const org = `org-x${i}`;
+        db.licences.push(trial(org, 2));
+        db.blockedEvents.push(org, org);
+        // Every other workspace was already mailed, the rest are customers.
+        if (i % 2) db.settings.push(setting(org, 'trial_email_winback7'), setting(org, 'trial_email_blocked_calls'));
+        else db.licences.push({ ...trial(org, 2), plan: 'starter', status: 'active' });
+      }
+      const { prisma, winback, blocked, email } = makeService(db);
+      const w = await winback();
+      const b = await blocked();
+      expect(w.examined).toBe(n);
+      expect(b.examined).toBe(n);
+      expect(email.sendTrialWinbackEmail).not.toHaveBeenCalled();
+      expect(email.sendTrialBlockedCallsEmail).not.toHaveBeenCalled();
+      return {
+        licenceFindMany: prisma.license.findMany.mock.calls.length,
+        settingsFindMany: prisma.orgSettings.findMany.mock.calls.length,
+        perWorkspace: perWorkspaceReads(prisma),
+      };
+    };
+    const few = await reads(3);
+    // Win-back: its trials and the other licences; blocked-call: the other
+    // licences and the latest trials. One settings query per pass.
+    expect(few).toEqual({ licenceFindMany: 4, settingsFindMany: 2, perWorkspace: 0 });
+    expect(await reads(30)).toEqual(few);
+  });
+
+  it('asks for at most 1,000 workspaces per query, each query scoped to its workspaces', async () => {
+    const db = emptyDb();
+    for (let i = 0; i < 2500; i++) {
+      db.licences.push(trial(`org-y${i}`, 2));
+      db.settings.push(setting(`org-y${i}`, 'trial_email_winback7'));
+    }
+    const { prisma, winback } = makeService(db);
+    const o = await winback();
+    expect(o).toMatchObject({ examined: 2500, skipped: 2500 });
+    const sizes = prisma.orgSettings.findMany.mock.calls.map((c: any[]) => c[0].where.organizationId.in.length);
+    expect(sizes).toEqual([1000, 1000, 500]);
+    const licenceBatches = prisma.license.findMany.mock.calls.slice(1).map((c: any[]) => c[0].where);
+    expect(licenceBatches.map((w: any) => w.organizationId.in.length)).toEqual([1000, 1000, 500]);
+    for (const w of licenceBatches) expect(w.plan).toEqual({ not: 'trial' });
+    expect(perWorkspaceReads(prisma)).toBe(0);
+  });
+
+  it('makes no batched query when no workspace is in a window or has enough events', async () => {
+    const db = emptyDb();
+    db.licences.push(trial('org-between', 20));
+    db.blockedEvents.push('org-once');
+    const { prisma, winback, blocked } = makeService(db);
+    await winback();
+    await blocked();
+    expect(prisma.orgSettings.findMany).not.toHaveBeenCalled();
+    // Only the win-back pass's own trial query.
+    expect(prisma.license.findMany).toHaveBeenCalledTimes(1);
   });
 });

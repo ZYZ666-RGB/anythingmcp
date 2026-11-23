@@ -26,6 +26,8 @@ function buildController(overrides: {
   deployment?: any;
   mcpOAuthService?: any;
   serverUrl?: string;
+  webhookEvents?: any;
+  catalogResync?: any;
 } = {}) {
   const connectorsService = overrides.connectorsService ?? {
     create: jest.fn().mockResolvedValue({ id: 'c1', type: 'REST' }),
@@ -42,6 +44,7 @@ function buildController(overrides: {
   };
   const licenseGuard = overrides.licenseGuard ?? {
     checkCanCreateConnector: jest.fn().mockResolvedValue(undefined),
+    checkCanEnableWebhook: jest.fn().mockResolvedValue(undefined),
   };
   const configService = {
     get: jest.fn((key: string) =>
@@ -54,6 +57,9 @@ function buildController(overrides: {
       .mockResolvedValue({ id: 's1', name: 'Default' }),
   };
   const deployment = overrides.deployment ?? { isCloud: () => true };
+  const webhookEvents = overrides.webhookEvents ?? {
+    recentEvents: jest.fn().mockResolvedValue([]),
+  };
 
   const controller = new ConnectorsController(
     connectorsService as any,
@@ -65,13 +71,14 @@ function buildController(overrides: {
     {} as any, // harParser
     {} as any, // mcpClientEngine
     (overrides.mcpOAuthService ?? {}) as any, // mcpOAuthService
-    {} as any, // catalogResync
+    (overrides.catalogResync ?? {}) as any, // catalogResync
     prisma as any,
     mcpServer as any,
     configService as any,
     licenseGuard as any,
     mcpServers as any,
     deployment as any,
+    webhookEvents as any,
   );
 
   return {
@@ -82,6 +89,7 @@ function buildController(overrides: {
     licenseGuard,
     mcpServers,
     deployment,
+    webhookEvents,
   };
 }
 
@@ -1099,7 +1107,7 @@ describe('POST :id/oauth/authorize (REST)', () => {
     expect(url.origin + url.pathname).toBe('https://www.etsy.com/oauth/connect');
     expect(url.searchParams.get('client_id')).toBe('keystring');
     expect(url.searchParams.get('redirect_uri')).toBe(`${SERVER}/api/mcp-oauth/callback`);
-    expect(url.searchParams.get('scope')).toBe('email_r shops_r listings_r listings_w transactions_r transactions_w');
+    expect(url.searchParams.get('scope')).toBe('email_r shops_r listings_r listings_w listings_d transactions_r transactions_w');
     expect(url.searchParams.get('code_challenge_method')).toBe('S256');
 
     const [state, flow] = store.mock.calls[0];
@@ -1116,7 +1124,7 @@ describe('POST :id/oauth/authorize (REST)', () => {
       tokenAuthMethod: undefined,
       persistAuthConfig: {
         authorizationUrl: 'https://www.etsy.com/oauth/connect',
-        scopes: 'email_r shops_r listings_r listings_w transactions_r transactions_w',
+        scopes: 'email_r shops_r listings_r listings_w listings_d transactions_r transactions_w',
       },
     });
   });
@@ -1466,6 +1474,54 @@ describe('Connector secrets are never returned', () => {
     expect(JSON.stringify(result)).not.toContain(TOKEN);
   });
 
+  describe('the catalog diff of a base URL that holds a password', () => {
+    const STORED = 'postgresql://ops:s3cret@pw@db.example.com:5432/shop';
+    const diff = {
+      slug: 'whatsapp',
+      isUpToDate: false,
+      baseUrl: { from: STORED, to: 'postgresql://db.example.org:5432/shop', provenance: 'user-edited' },
+    };
+    const MASKED = {
+      from: 'postgresql://ops:********@db.example.com:5432/shop',
+      to: 'postgresql://db.example.org:5432/shop',
+      provenance: 'user-edited',
+    };
+    const owner = { user: { sub: 'owner', organizationId: 'org1', role: 'EDITOR' } };
+
+    it('GET :id/catalog-diff masks it, as GET :id masks the connector\'s', async () => {
+      const { controller } = build(catalogConnector({ baseUrl: STORED }), {
+        catalogResync: { computeDiff: jest.fn().mockResolvedValue(diff) },
+      });
+
+      const result: any = await controller.catalogDiff(owner, 'c1');
+
+      expect(result).toEqual({ catalogManaged: true, slug: 'whatsapp', isUpToDate: false, baseUrl: MASKED });
+      expect(JSON.stringify(result)).not.toContain('s3cret');
+    });
+
+    it('POST :id/resync-catalog masks it in the diff it returns', async () => {
+      const resync = jest.fn().mockResolvedValue({ applied: true, diff, snapshot: null });
+      const { controller, mcpServer } = build(catalogConnector({ baseUrl: STORED }), {
+        catalogResync: { resync },
+      });
+
+      const result: any = await controller.resyncCatalog(owner, 'c1', 'true');
+
+      expect(resync).toHaveBeenCalledWith('c1', 'full', { applyBaseUrl: true });
+      expect(mcpServer.reloadConnectorTools).toHaveBeenCalledWith('c1');
+      expect(result.baseUrl).toEqual(MASKED);
+      expect(JSON.stringify(result)).not.toContain('s3cret');
+    });
+
+    it('GET :id/catalog-diff still answers for a connector that is not from the catalog', async () => {
+      const { controller } = build(catalogConnector(), {
+        catalogResync: { computeDiff: jest.fn().mockResolvedValue(null) },
+      });
+
+      await expect(controller.catalogDiff(owner, 'c1')).resolves.toEqual({ catalogManaged: false });
+    });
+  });
+
   describe('GET export-all', () => {
     const buildExport = () =>
       buildController({
@@ -1497,6 +1553,28 @@ describe('Connector secrets are never returned', () => {
       expect(JSON.stringify(result)).not.toContain('test-header-key');
     });
 
+    it('leaves them out for an admin using a read-only management key', async () => {
+      const { controller } = buildExport();
+      const result: any = await controller.exportAll({
+        ...req('ADMIN'),
+        mcpKeyScope: 'MANAGEMENT_READ',
+      });
+      expect(result.secretsIncluded).toBe(false);
+      expect(result.connectors[0].maskedEnvVars).toEqual(['WHATSAPP_ACCESS_TOKEN']);
+      expect(JSON.stringify(result)).not.toContain(TOKEN);
+      expect(JSON.stringify(result)).not.toContain('test-header-key');
+    });
+
+    it('keeps them for an admin using an admin management key', async () => {
+      const { controller } = buildExport();
+      const result: any = await controller.exportAll({
+        ...req('ADMIN'),
+        mcpKeyScope: 'MANAGEMENT_ADMIN',
+      });
+      expect(result.secretsIncluded).toBe(true);
+      expect(result.connectors[0].envVars.WHATSAPP_ACCESS_TOKEN).toBe(TOKEN);
+    });
+
     it('never exports authConfig', async () => {
       const { controller } = buildController({
         prisma: {
@@ -1509,6 +1587,33 @@ describe('Connector secrets are never returned', () => {
       });
       const result: any = await controller.exportAll(req('ADMIN'));
       expect(result.connectors[0]).not.toHaveProperty('authConfig');
+    });
+
+    describe('DATABASE connection string with a password (#1245)', () => {
+      const STORED = 'postgresql://app:s3cret@db.example.com:5432/shop';
+      const buildDbExport = () =>
+        buildController({
+          prisma: {
+            connector: {
+              findMany: jest.fn().mockResolvedValue([
+                catalogConnector({ type: 'DATABASE', baseUrl: STORED, headers: null, config: null, envVars: null }),
+              ]),
+            },
+          },
+        });
+
+      it.each(['VIEWER', 'EDITOR'])('masks the password for %s', async (role) => {
+        const { controller } = buildDbExport();
+        const result: any = await controller.exportAll(req(role));
+        expect(result.connectors[0].baseUrl).toBe('postgresql://app:********@db.example.com:5432/shop');
+        expect(JSON.stringify(result)).not.toContain('s3cret');
+      });
+
+      it('keeps the stored URL for an admin backup', async () => {
+        const { controller } = buildDbExport();
+        const result: any = await controller.exportAll(req('ADMIN'));
+        expect(result.connectors[0].baseUrl).toBe(STORED);
+      });
     });
   });
 
@@ -1576,6 +1681,49 @@ describe('Connector secrets are never returned', () => {
       const { controller } = build(catalogConnector({ userId: 'u1' }));
       const result: any = await controller.update(req('ADMIN'), 'c1', { name: 'x' });
       expect(JSON.stringify(result)).not.toContain(TOKEN);
+    });
+
+    describe('DATABASE connection string with a password (#1245)', () => {
+      const STORED = 'postgresql://app:s3cret@db.example.com:5432/shop';
+      const MASKED = 'postgresql://app:********@db.example.com:5432/shop';
+      const dbConnector = () =>
+        catalogConnector({ userId: 'u1', type: 'DATABASE', baseUrl: STORED, headers: null, config: null, envVars: null });
+
+      it('GET :id masks the password', async () => {
+        const { controller } = build(dbConnector());
+        const result: any = await controller.findOne(req('VIEWER'), 'c1');
+        expect(result.baseUrl).toBe(MASKED);
+        expect(JSON.stringify(result)).not.toContain('s3cret');
+      });
+
+      it('keeps the stored URL when the masked one is sent back', async () => {
+        const { controller, connectorsService } = build(dbConnector());
+        const result: any = await controller.update(req('EDITOR'), 'c1', { name: 'x', baseUrl: MASKED });
+        expect(connectorsService.update).toHaveBeenCalledWith('c1', { name: 'x', baseUrl: STORED });
+        expect(JSON.stringify(result)).not.toContain('s3cret');
+      });
+
+      it('keeps the stored password when the rest of the masked URL is edited', async () => {
+        const { controller, connectorsService } = build(dbConnector());
+        await controller.update(req('EDITOR'), 'c1', {
+          baseUrl: 'postgresql://app:********@db2.example.com:5432/shop',
+        });
+        expect(connectorsService.update).toHaveBeenCalledWith('c1', {
+          baseUrl: 'postgresql://app:s3cret@db2.example.com:5432/shop',
+        });
+      });
+
+      it('drops a stale masked password once the stored one has moved to authConfig', async () => {
+        // Another tab saved first, so the stored URL no longer holds the password.
+        const { controller, connectorsService } = build(
+          catalogConnector({ userId: 'u1', type: 'DATABASE', baseUrl: 'postgresql://db.example.com:5432/shop', headers: null, config: null, envVars: null }),
+        );
+        await controller.update(req('EDITOR'), 'c1', { name: 'x', baseUrl: MASKED });
+        expect(connectorsService.update).toHaveBeenCalledWith('c1', {
+          name: 'x',
+          baseUrl: 'postgresql://db.example.com:5432/shop',
+        });
+      });
     });
   });
 
@@ -1963,6 +2111,200 @@ describe('PUT :id — webhookEnabled toggled on update', () => {
 
     expect(prisma.mcpTool.create).not.toHaveBeenCalled();
     expect(prisma.mcpTool.deleteMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET :id/webhook/url and :id/webhook/events', () => {
+  const baseConnector = {
+    id: 'c1',
+    userId: 'u1',
+    organizationId: 'org1',
+    name: 'Stripe Billing',
+  };
+
+  describe('webhookUrl', () => {
+    it('builds the URL from SERVER_URL for the connector owner', async () => {
+      const { controller } = buildController({
+        connectorsService: { findById: jest.fn().mockResolvedValue(baseConnector) },
+        serverUrl: 'https://amcp.example.com',
+      });
+      const result = await controller.webhookUrl(req('MEMBER'), 'c1');
+      expect(result).toEqual({ url: 'https://amcp.example.com/api/webhooks/c1' });
+    });
+
+    it('falls back to localhost:4000 when SERVER_URL is unset, like oauthRedirectUri', async () => {
+      const { controller } = buildController({
+        connectorsService: { findById: jest.fn().mockResolvedValue(baseConnector) },
+      });
+      const result = await controller.webhookUrl(req('ADMIN'), 'c1');
+      expect(result).toEqual({ url: 'http://localhost:4000/api/webhooks/c1' });
+    });
+
+    it('rejects a viewer, like any other connector setting', async () => {
+      const { controller } = buildController({
+        connectorsService: { findById: jest.fn().mockResolvedValue(baseConnector) },
+      });
+      await expect(controller.webhookUrl(req('VIEWER'), 'c1')).rejects.toThrow(ForbiddenException);
+    });
+
+    it('rejects a non-owner, non-admin member', async () => {
+      const { controller } = buildController({
+        connectorsService: { findById: jest.fn().mockResolvedValue(baseConnector) },
+      });
+      const otherMember = { user: { sub: 'u2', organizationId: 'org1', role: 'MEMBER' } };
+      await expect(controller.webhookUrl(otherMember, 'c1')).rejects.toThrow(ForbiddenException);
+    });
+
+    it('rejects a caller from a different organization', async () => {
+      const { controller } = buildController({
+        connectorsService: { findById: jest.fn().mockResolvedValue(baseConnector) },
+      });
+      const otherOrg = { user: { sub: 'u1', organizationId: 'org2', role: 'ADMIN' } };
+      await expect(controller.webhookUrl(otherOrg, 'c1')).rejects.toThrow(ForbiddenException);
+    });
+  });
+
+  describe('webhookEventsList', () => {
+    it('reads through to the service, scoped by connector and organization', async () => {
+      const receivedAt = new Date('2026-01-01T00:00:00Z');
+      const recentEvents = jest.fn().mockResolvedValue([
+        {
+          id: 'evt_1',
+          provider: 'stripe',
+          eventType: 'payment_intent.succeeded',
+          externalId: 'evt_ext_1',
+          payload: { customer: { name: 'Jane Doe', email: 'jane@example.com' } },
+          receivedAt,
+        },
+      ]);
+      const { controller } = buildController({
+        connectorsService: { findById: jest.fn().mockResolvedValue(baseConnector) },
+        webhookEvents: { recentEvents },
+      });
+      const result = await controller.webhookEventsList(req('ADMIN'), 'c1', '10', '2026-01-01T00:00:00Z');
+      expect(recentEvents).toHaveBeenCalledWith('c1', 'org1', { limit: 10, since: '2026-01-01T00:00:00Z' });
+      expect(result).toEqual({
+        events: [{ id: 'evt_1', provider: 'stripe', eventType: 'payment_intent.succeeded', externalId: 'evt_ext_1', receivedAt }],
+      });
+    });
+
+    it('never returns payload, unlike the MCP tool reading the same table', async () => {
+      const recentEvents = jest.fn().mockResolvedValue([
+        {
+          id: 'evt_1',
+          provider: 'stripe',
+          eventType: 'payment_intent.succeeded',
+          externalId: 'evt_ext_1',
+          payload: { customer: { name: 'Jane Doe', email: 'jane@example.com' } },
+          receivedAt: new Date('2026-01-01T00:00:00Z'),
+        },
+      ]);
+      const { controller } = buildController({
+        connectorsService: { findById: jest.fn().mockResolvedValue(baseConnector) },
+        webhookEvents: { recentEvents },
+      });
+      const result = await controller.webhookEventsList(req('ADMIN'), 'c1');
+      expect(result.events[0]).not.toHaveProperty('payload');
+      expect(JSON.stringify(result)).not.toContain('Jane Doe');
+    });
+
+    it('passes limit/since through as undefined when not given, leaving the service default', async () => {
+      const recentEvents = jest.fn().mockResolvedValue([]);
+      const { controller } = buildController({
+        connectorsService: { findById: jest.fn().mockResolvedValue(baseConnector) },
+        webhookEvents: { recentEvents },
+      });
+      await controller.webhookEventsList(req('ADMIN'), 'c1');
+      expect(recentEvents).toHaveBeenCalledWith('c1', 'org1', { limit: undefined, since: undefined });
+    });
+
+    it('rejects a viewer', async () => {
+      const { controller } = buildController({
+        connectorsService: { findById: jest.fn().mockResolvedValue(baseConnector) },
+      });
+      await expect(controller.webhookEventsList(req('VIEWER'), 'c1')).rejects.toThrow(ForbiddenException);
+    });
+
+    it('rejects a non-owner, non-admin member', async () => {
+      const { controller } = buildController({
+        connectorsService: { findById: jest.fn().mockResolvedValue(baseConnector) },
+      });
+      const otherMember = { user: { sub: 'u2', organizationId: 'org1', role: 'MEMBER' } };
+      await expect(controller.webhookEventsList(otherMember, 'c1')).rejects.toThrow(ForbiddenException);
+    });
+  });
+});
+
+describe('PUT :id and POST — the webhook plan cap (#1393)', () => {
+  const baseConnector = {
+    id: 'c1',
+    type: 'REST',
+    userId: 'u1',
+    organizationId: 'org1',
+    name: 'Stripe Billing',
+    baseUrl: 'https://api.example.test',
+    authType: 'NONE',
+    config: null,
+    envVars: null,
+    headers: null,
+    webhookEnabled: false,
+    isActive: true,
+    tools: [] as Array<{ id: string; endpointMapping: unknown }>,
+  };
+  const prisma = () => ({
+    connector: { create: jest.fn(), findFirst: jest.fn().mockResolvedValue(null) },
+    mcpTool: { create: jest.fn(), deleteMany: jest.fn() },
+  });
+
+  it('checks the cap when webhooks go from off to on, before anything is saved', async () => {
+    const update = jest.fn().mockResolvedValue({ ...baseConnector, webhookEnabled: true });
+    const { controller, licenseGuard } = buildController({
+      connectorsService: { findById: jest.fn().mockResolvedValue(baseConnector), update },
+      prisma: prisma(),
+    });
+    await controller.update(req('ADMIN'), 'c1', { webhookEnabled: true } as any);
+    expect(licenseGuard.checkCanEnableWebhook).toHaveBeenCalledWith('org1');
+    expect(licenseGuard.checkCanEnableWebhook.mock.invocationCallOrder[0]).toBeLessThan(update.mock.invocationCallOrder[0]);
+  });
+
+  it('saves nothing when the cap refuses', async () => {
+    const update = jest.fn();
+    const refusal = new Error('Your plan includes inbound webhooks on 1 connector.');
+    const { controller } = buildController({
+      connectorsService: { findById: jest.fn().mockResolvedValue(baseConnector), update },
+      prisma: prisma(),
+      licenseGuard: {
+        checkCanCreateConnector: jest.fn(),
+        checkCanEnableWebhook: jest.fn().mockRejectedValue(refusal),
+      },
+    });
+    await expect(controller.update(req('ADMIN'), 'c1', { webhookEnabled: true } as any)).rejects.toBe(refusal);
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it('never checks when webhooks stay on or are turned off', async () => {
+    const on = { ...baseConnector, webhookEnabled: true };
+    for (const dto of [{ webhookEnabled: true }, { webhookEnabled: false }, { name: 'Renamed' }]) {
+      const { controller, licenseGuard } = buildController({
+        connectorsService: {
+          findById: jest.fn().mockResolvedValue(on),
+          update: jest.fn().mockResolvedValue({ ...on, ...dto }),
+        },
+        prisma: prisma(),
+      });
+      await controller.update(req('ADMIN'), 'c1', dto as any);
+      expect(licenseGuard.checkCanEnableWebhook).not.toHaveBeenCalled();
+    }
+  });
+
+  it('checks the cap when a connector is created with webhooks on, and only then', async () => {
+    const withWebhook = buildController();
+    await withWebhook.controller.create(req('ADMIN'), { name: 'Stripe', type: 'REST', baseUrl: 'https://api.example.test', webhookEnabled: true } as any);
+    expect(withWebhook.licenseGuard.checkCanEnableWebhook).toHaveBeenCalledWith('org1');
+
+    const without = buildController();
+    await without.controller.create(req('ADMIN'), { name: 'Plain', type: 'REST', baseUrl: 'https://api.example.test' } as any);
+    expect(without.licenseGuard.checkCanEnableWebhook).not.toHaveBeenCalled();
   });
 });
 

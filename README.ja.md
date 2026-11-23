@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/badges/banner.ja.png" alt="AnythingMCP は Claude、ChatGPT、Copilot、Gemini を ERP、E コマース、REST、SOAP、SQL の各システムと社内のファイルサーバーにつなぎます。694 のコネクターに加え、社内メモリ、AI スキル、ファイル検索も備えています。" width="100%" />
+  <img src="https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/badges/banner.ja.png" alt="AnythingMCP は Claude、ChatGPT、Copilot、Gemini を ERP、E コマース、REST、SOAP、SQL の各システムと社内のファイルサーバーにつなぎます。958 のコネクターに加え、社内メモリ、AI スキル、ファイル検索も備えています。" width="100%" />
 </p>
 
 <h1 align="center">AnythingMCP：企業の頭脳になるオープンソースの MCP ゲートウェイ</h1>
@@ -11,6 +11,7 @@
       <img src="https://api.star-history.com/badge?repo=HelpCode-ai/anythingmcp&type=trending" alt="GitHub Trending Repository of the Day" height="64" />
     </picture>
   </a>
+  <a href="https://www.producthunt.com/products/anythingmcp?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-anythingmcp" target="_blank" rel="noopener noreferrer"><img alt="AnythingMCP - Open-source MCP gateway and company brain | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1321607&amp;theme=light&amp;t=1795006241059"></a>
 </p>
 
 <p align="center">
@@ -20,11 +21,12 @@
 <p align="center">
   <strong>AnythingMCP は、オープンソースのセルフホスト型 MCP ゲートウェイです。MCP サーバーを書かずに、Claude、ChatGPT、Copilot、Gemini を、自社で使っているソフトウェアやファイルサーバー上の文書につなぎます。</strong><br/>
   ゲートウェイの上には企業の頭脳を保持します。システム同士のつながりを表すナレッジグラフ、AI スキル、社内メモリです。すべての AI クライアントで共有され、ユーザーごとのロールで範囲が制限されます。<br/>
-  SAP、Odoo、weclapp、Amazon Seller などを含む 694 種類の既製アダプターで 12,000 以上のツールを提供しており、うち 35 は API キー不要です。
+  SAP、Odoo、weclapp、Amazon Seller などを含む 958 種類の既製アダプターで 12,000 以上のツールを提供しており、うち 51 は API キー不要です。
 </p>
 
 <p align="center">
   <a href="https://claude.ai/directory/anythingmcp"><img src="https://img.shields.io/badge/Claude-%E5%85%AC%E5%BC%8F%E3%83%87%E3%82%A3%E3%83%AC%E3%82%AF%E3%83%88%E3%83%AA%E6%8E%B2%E8%BC%89-D97757?logo=claude&logoColor=white&labelColor=0b1220" alt="Claude 公式ディレクトリに掲載"></a>
+  <a href="https://chatgpt.com/plugins/plugin_asdk_app_6ade03541ce08191b35bbad1dc5b4121"><img src="https://img.shields.io/badge/ChatGPT-%E3%83%97%E3%83%A9%E3%82%B0%E3%82%A4%E3%83%B3%E3%83%87%E3%82%A3%E3%83%AC%E3%82%AF%E3%83%88%E3%83%AA%E6%8E%B2%E8%BC%89-10A37F?logo=openai&logoColor=white&labelColor=0b1220" alt="ChatGPT プラグインディレクトリ掲載"></a>
   <a href="https://github.com/HelpCode-ai/anythingmcp/stargazers"><img src="https://img.shields.io/github/stars/HelpCode-ai/anythingmcp?style=flat&logo=github&logoColor=white&color=2563eb&labelColor=0b1220" alt="GitHub Stars"></a>
   <a href="https://github.com/HelpCode-ai/anythingmcp/releases"><img src="https://img.shields.io/github/v/release/HelpCode-ai/anythingmcp?include_prereleases&color=2563eb&labelColor=0b1220" alt="Release"></a>
   <a href="https://github.com/HelpCode-ai/anythingmcp/blob/main/LICENSE"><img src="https://img.shields.io/badge/open%20source-AGPL--3.0-2563eb?labelColor=0b1220" alt="Open source, AGPL-3.0"></a>
@@ -36,7 +38,7 @@
 </p>
 
 <p align="center">
-  <a href="https://cloud.anythingmcp.com/login?mode=register"><strong>クラウド版を 7 日間無料で試す</strong></a> · <a href="https://claude.ai/directory/anythingmcp">Claude に追加</a> · <a href="#run-it-yourself">自分で動かす</a> · <a href="docs/guides.md">ドキュメント</a> · <a href="https://anythingmcp.com/ja/guides">コネクターガイド</a> · <a href="https://github.com/HelpCode-ai/anythingmcp/discussions">Discussions</a>
+  <a href="https://cloud.anythingmcp.com/login?mode=register"><strong>クラウド版を 7 日間無料で試す</strong></a> · <a href="https://claude.ai/directory/anythingmcp">Claude に追加</a> · <a href="https://chatgpt.com/plugins/plugin_asdk_app_6ade03541ce08191b35bbad1dc5b4121">ChatGPT に追加</a> · <a href="#run-it-yourself">自分で動かす</a> · <a href="docs/guides.md">ドキュメント</a> · <a href="https://anythingmcp.com/ja/guides">コネクターガイド</a> · <a href="https://github.com/HelpCode-ai/anythingmcp/discussions">Discussions</a>
 </p>
 
 **Claude への 1 つの質問に、Etsy、SAP、物流 API のデータで答えます。**
@@ -53,7 +55,7 @@ https://github.com/user-attachments/assets/cc8c9ef3-11cf-4eab-aa4d-98472dc554b3
 
 | | 内容 | エディション |
 |---|---|---|
-| **すべてのシステムを 1 つのエンドポイントで** | 692 のカタログコネクター、または独自の REST/OpenAPI、SOAP、GraphQL、OData、SQL、IMAP/SMTP、MCP のソース。ツールは実行時に登録されます。[コネクター](#connect-any-api-soap-service-or-database) | すべて |
+| **すべてのシステムを 1 つのエンドポイントで** | 696 のカタログコネクター、または独自の REST/OpenAPI、SOAP、GraphQL、OData、SQL、IMAP/SMTP、MCP のソース。ツールは実行時に登録されます。[コネクター](#connect-any-api-soap-service-or-database) | すべて |
 | **File Search（ファイル検索）** | SFTP、FTP/FTPS、WebDAV（Nextcloud、NAS）、S3、ネットワーク共有をインデックス化します。PDF の全ページ、列名付きの Excel の行、Word、PowerPoint、添付ファイル付きの Outlook メールが対象です。AI はファイル、ページ、日付を示して回答します。[File Search](docs/connectors/file-search.md) | Cloud、セルフホストは Enterprise |
 | **File Share（ファイル共有）** | フォルダー内のファイルや AI が書き出したファイル（CSV エクスポート、レポート）の一時的なダウンロードリンク。社内向けにも公開にもでき、有効期限と取り消しに対応します。[File Share](docs/connectors/file-search.md) | Cloud、セルフホストは Enterprise |
 | **社内メモリ** | ある AI クライアントで保存した事実や好みを、別のクライアントでも見つけられます。Claude で一度伝えたことを Copilot が使います。個人用と会社用の範囲があり、フォルダーとロールで制限できます。[メモリ](docs/memory.md) | Enterprise |
@@ -138,7 +140,7 @@ amd64 ではイメージの取得に約 30 秒、その 24 秒後に API が利�
 
 ## コネクターカタログ
 
-694 個のアダプターで 12,000 以上のツールを提供しています。どのアダプターにも [anythingmcp.com/ja/guides](https://anythingmcp.com/ja/guides) に 7 言語の設定ガイドがあります。
+958 個のアダプターで 12,000 以上のツールを提供しています。どのアダプターにも [anythingmcp.com/ja/guides](https://anythingmcp.com/ja/guides) に 7 言語の設定ガイドがあります。
 
 | カテゴリー | 例 |
 |---|---|
@@ -250,8 +252,8 @@ amd64 ではイメージの取得に約 30 秒、その 24 秒後に API が利�
 
 同じ MCP サーバーが MCP 対応のあらゆるクライアントで動くため、コネクターは一度作るだけで済みます。
 
-- **Claude。** *Customize → Connectors* でサーバーの URL を**カスタムコネクター**として追加すると、Claude.ai、Claude Desktop、Claude Code で使えます。OAuth 2.0 に標準対応しています。AnythingMCP Cloud なら [Claude ディレクトリ](https://claude.ai/directory/anythingmcp)からワンクリックで追加することもできます。[Claude の設定](docs/integrations/claude.md)
-- **ChatGPT。** ChatGPT のアプリは MCP の上に作られています。ChatGPT の *Plugins* でサーバーを追加するか（*+ → Add custom MCP server*）、Apps SDK アプリのツール層として使います。[ChatGPT の設定](docs/integrations/chatgpt.md)
+- **Claude。** **Plugins**（一部のプランではまだ **Customize**）→ **Connectors** でサーバーの URL を**カスタムコネクター**として追加すると、Claude.ai、Claude Desktop、Claude Code で使えます。OAuth 2.0 に標準対応しています。AnythingMCP Cloud なら [Claude ディレクトリ](https://claude.ai/directory/anythingmcp)からワンクリックで追加することもできます。[Claude の設定](docs/integrations/claude.md)
+- **ChatGPT。** ChatGPT のアプリは MCP の上に作られています。ChatGPT の *Plugins* でサーバーを追加するか（*Add → Add custom MCP server*）、Apps SDK アプリのツール層として使います。[ChatGPT の設定](docs/integrations/chatgpt.md)
 - **Meta Muse。** Muse で *Settings → Connectors → Add custom connector* を開き、サーバーの URL を貼り付けて AnythingMCP にサインインします。[Muse の設定](docs/integrations/muse.md)
 - **Copilot、Gemini、Cursor** などの MCP クライアント：[クライアント設定ガイド](docs/guides.md)。
 

@@ -87,6 +87,38 @@ describe('ConnectorAuthStatusService', () => {
     );
   });
 
+  it('records without an email when asked not to notify, also on a later mark', async () => {
+    const quiet = { status: 'needs_reauth' as const, code: 'credential_refused', message: 'Refused 5 times.' };
+    await service.mark('conn-1', quiet, { notify: false });
+    await flush();
+    await service.mark('conn-1', { ...quiet, message: 'Refused 100 times.' }, { notify: false });
+    await flush();
+    expect(row).toMatchObject({ authStatus: 'needs_reauth', authStatusCode: 'credential_refused', authStatusMessage: 'Refused 100 times.' });
+    // Counted as told: a later mark of the same incident sends nothing either.
+    expect(row.authNotifiedAt).toBeInstanceOf(Date);
+    await service.mark('conn-1', { ...quiet, message: 'Refused again.' });
+    await flush();
+    expect(email.sendConnectorAuthEmail).not.toHaveBeenCalled();
+  });
+
+  it('emails about a refused key in its own words, and about a sign-in as before', async () => {
+    const refused = { status: 'needs_reauth' as const, code: 'credential_refused', message: 'Refused 3 times.' };
+    await service.mark('conn-1', refused, { notify: true });
+    await flush();
+    expect(email.sendConnectorAuthEmail).toHaveBeenCalledTimes(1);
+    expect(email.sendConnectorAuthEmail.mock.calls[0][1]).toMatchObject({
+      kind: 'credentials',
+      message: 'Refused 3 times.',
+      connectorPath: '/connectors/conn-1',
+    });
+    expect(row.authNotifiedAt).toBeInstanceOf(Date);
+
+    await service.clear('conn-1');
+    await service.mark('conn-1', issue);
+    await flush();
+    expect(email.sendConnectorAuthEmail.mock.calls[1][1]).toMatchObject({ kind: 'sign_in' });
+  });
+
   it('does not email about a warning', async () => {
     await service.mark('conn-1', { ...issue, status: 'expiring', code: 'meta_expiring' });
     expect(row.authStatus).toBe('expiring');

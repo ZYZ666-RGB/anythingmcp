@@ -349,6 +349,14 @@ export const mcpConnections = {
  * the token expires.
  */
 /** Whose credential a connector's calls carry: the connector's own, or each user's. */
+/** An Instagram professional account a Meta sign-in reaches (meta-auth.controller.ts). */
+export interface MetaInstagramAccount {
+  id: string;
+  username?: string;
+  /** The Facebook Page it is linked to (Facebook Login only). */
+  pageName?: string;
+}
+
 export type CredentialScope = 'SHARED' | 'USER';
 
 export interface MyConnectorCredential {
@@ -361,6 +369,15 @@ export interface MyConnectorCredential {
 }
 
 export type OAuthGrant = 'authorization_code' | 'client_credentials' | 'password';
+
+/** GET :id/webhook/events' shape — metadata only; the controller leaves `payload` out. */
+export interface RecentWebhookEvent {
+  id: string;
+  provider: string;
+  eventType: string | null;
+  externalId: string | null;
+  receivedAt: string;
+}
 
 /** True for the grants that need no sign-in at the provider. */
 export function isMachineGrant(grant: string | undefined): boolean {
@@ -460,6 +477,8 @@ export interface Connector {
   icon?: string | null;
   setupStatus?: string;
   missingVariables?: string[];
+  /** 'iop': the seller authorizes at an Alibaba IOP gateway (Lazada, Miravia, AliExpress seller); 'shein': SHEIN's store authorization. */
+  tokenProvider?: string;
   /** Credential health: 'needs_reauth' (calls fail until fixed) or 'expiring'. */
   authStatus?: string | null;
   authStatusCode?: string | null;
@@ -468,6 +487,8 @@ export interface Connector {
   tokenExpiresAt?: string | null;
   createdAt?: string;
   updatedAt?: string;
+  webhookEnabled?: boolean;
+  webhookProvider?: string | null;
   [key: string]: unknown;
 }
 
@@ -475,7 +496,7 @@ export const connectors = {
   list: (token: string) =>
     request<Connector[]>('/api/connectors', { token }),
   proxyAvailability: (token: string) =>
-    request<{ available: boolean }>('/api/connectors/proxy-availability', { token }),
+    request<{ available: boolean; egressIps?: string[] }>('/api/connectors/proxy-availability', { token }),
   /**
    * `attachedToServer` is the MCP server the backend put the connector on, or
    * null when the workspace has none yet. Attaching used to be a separate step
@@ -543,6 +564,53 @@ export const connectors = {
     token: string,
   ) =>
     request<{ message: string }>(`/api/connectors/${id}/oauth-config`, {
+      method: 'PATCH',
+      body: data,
+      token,
+    }),
+  /**
+   * The Login → Token settings, without the secrets: username and password
+   * only as `hasUsername` / `hasPassword`, a login header holding a stored
+   * secret empty and named in `maskedLoginHeaders`, a login body with a
+   * literal secret left out (`loginBodyHidden`). '' = whole-body token.
+   */
+  getLoginTokenConfig: (id: string, token: string) =>
+    request<{
+      loginUrl: string;
+      loginMethod: string;
+      loginBody?: unknown;
+      loginBodyHidden: boolean;
+      hasLoginBodyTemplate: boolean;
+      hasUsername: boolean;
+      hasPassword: boolean;
+      tokenJsonPath: string | string[];
+      tokenSource: 'body' | 'cookie' | 'header';
+      tokenTTLSeconds?: number;
+      refreshOn401: boolean;
+      loginHeaders: Record<string, string>;
+      maskedLoginHeaders: string[];
+    }>(`/api/connectors/${id}/login-token-config`, { token }),
+  /**
+   * Partial update of the Login → Token settings. Merges server-side, so the
+   * settings the form does not show (header name, extra headers, token
+   * source …) and fields left out keep their stored value.
+   */
+  updateLoginTokenConfig: (
+    id: string,
+    data: {
+      loginUrl?: string;
+      loginMethod?: string;
+      loginBody?: unknown;
+      username?: string | null;
+      password?: string | null;
+      tokenJsonPath?: string | string[];
+      tokenTTLSeconds?: number | null;
+      refreshOn401?: boolean;
+      loginHeaders?: Record<string, string> | null;
+    },
+    token: string,
+  ) =>
+    request<{ message: string }>(`/api/connectors/${id}/login-token-config`, {
       method: 'PATCH',
       body: data,
       token,
@@ -642,6 +710,106 @@ export const connectors = {
       '/api/shopee/complete',
       { method: 'POST', token, body: { state, code, shopId } },
     ),
+  /** "Authorize with Provider" for a TikTok shop: the seller authorization link. */
+  tiktokShopAuthorize: (id: string, token: string, returnTo?: string) =>
+    request<{ authorizationUrl?: string; redirectUrl?: string; error?: string }>(
+      `/api/tiktok-shop/connectors/${id}/authorize`,
+      { method: 'POST', token, body: returnTo ? { returnTo } : undefined },
+    ),
+  /** Second half of a TikTok Shop authorization: exchange the code TikTok sent back. */
+  tiktokShopComplete: (state: string, code: string, token: string) =>
+    request<{ connectorId: string; toolsImported: number; returnTo?: string }>(
+      '/api/tiktok-shop/complete',
+      { method: 'POST', token, body: { state, code } },
+    ),
+  /** "Authorize with Provider" for a seller at an IOP gateway (Lazada, Miravia, AliExpress seller). */
+  iopAuthorize: (id: string, token: string, returnTo?: string) =>
+    request<{ authorizationUrl?: string; redirectUrl?: string; error?: string }>(
+      `/api/iop-auth/connectors/${id}/authorize`,
+      { method: 'POST', token, body: returnTo ? { returnTo } : undefined },
+    ),
+  /** Second half of an IOP seller authorization: exchange the code the gateway sent back. */
+  iopComplete: (state: string, code: string, token: string) =>
+    request<{ connectorId: string; toolsImported: number; returnTo?: string }>(
+      '/api/iop-auth/complete',
+      { method: 'POST', token, body: { state, code } },
+    ),
+  /** The callback URL to register on a Lazada, Miravia or AliExpress seller app. */
+  iopRedirectUri: (token: string) => request<{ redirectUri: string }>('/api/iop-auth/redirect-uri', { token }),
+  /** "Authorize with Provider" for a SHEIN shop (SHEIN's store authorization). */
+  sheinAuthorize: (id: string, token: string, returnTo?: string) =>
+    request<{ authorizationUrl?: string; redirectUrl?: string; error?: string }>(
+      `/api/shein-auth/connectors/${id}/authorize`,
+      { method: 'POST', token, body: returnTo ? { returnTo } : undefined },
+    ),
+  /** Second half of a SHEIN store authorization: exchange the tempToken SHEIN sent back. */
+  sheinComplete: (state: string, tempToken: string, token: string) =>
+    request<{ connectorId: string; toolsImported: number; returnTo?: string }>(
+      '/api/shein-auth/complete',
+      { method: 'POST', token, body: { state, tempToken } },
+    ),
+  /** The redirect URL of a SHEIN store authorization. */
+  sheinRedirectUri: (token: string) => request<{ redirectUri: string }>('/api/shein-auth/redirect-uri', { token }),
+  /** Whether this server has its own TikTok Shop app, and the Redirect URL for a seller's own app. */
+  tiktokShopPlatform: (token: string) =>
+    request<{ available: boolean; redirectUrl: string }>('/api/tiktok-shop/platform', { token }),
+  /** A TikTok Shop App Store install: add (or reuse) the connector and authorize it with the server's app. */
+  tiktokShopInstall: (state: string, token: string) =>
+    request<{ connectorId: string; toolsImported: number; created: boolean; returnTo?: string }>(
+      '/api/tiktok-shop/install',
+      { method: 'POST', token, body: { state } },
+    ),
+  /** Whether this server offers the WooCommerce one-click key (WOOCOMMERCE_ONE_CLICK and a public https server). */
+  woocommerceOneClick: (token: string) =>
+    request<{ available: boolean }>('/api/woocommerce/one-click', { token }),
+  /** The shop's authorize link for a WooCommerce one-click key on a connector whose shop address is saved. */
+  woocommerceAuthorize: (id: string, scope: 'read' | 'read_write', token: string, from?: string) =>
+    request<{ authorizationUrl: string }>(`/api/woocommerce/connectors/${id}/authorize`, {
+      method: 'POST',
+      token,
+      body: { scope, ...(from ? { from } : {}) },
+    }),
+  /** How a WooCommerce one-click key ended; `state` is the `user_id` WooCommerce adds to the return address. */
+  woocommerceOneClickStatus: (id: string, state: string, token: string) =>
+    request<{ status: 'pending' | 'working' | 'ready' | 'failed' | 'unknown'; message?: string }>(
+      `/api/woocommerce/connectors/${id}/one-click-status?state=${encodeURIComponent(state)}`,
+      { token },
+    ),
+  /** "Authorize with Facebook / Instagram" for an Instagram connector: the Meta login dialog. */
+  metaAuthorize: (id: string, token: string, returnTo?: string) =>
+    request<{ authorizationUrl?: string; redirectUrl?: string; error?: string }>(
+      `/api/meta/connectors/${id}/authorize`,
+      { method: 'POST', token, body: returnTo ? { returnTo } : undefined },
+    ),
+  /** Second half of a Meta sign-in; `accounts` when the user has to pick an Instagram account. */
+  metaComplete: (state: string, code: string, token: string) =>
+    request<{
+      connectorId: string;
+      toolsImported: number;
+      returnTo?: string;
+      account?: MetaInstagramAccount;
+      accounts?: MetaInstagramAccount[];
+      noAccount?: boolean;
+      reason?: 'no_assets';
+    }>('/api/meta/complete', { method: 'POST', token, body: { state, code } }),
+  /** Store the Instagram account a Facebook sign-in should use. */
+  /** The Instagram accounts an Instagram connector's Meta sign-in reaches, and the one in use. */
+  metaAccounts: (id: string, token: string) =>
+    request<{ connectorId: string; current?: string; accounts: MetaInstagramAccount[] }>(
+      `/api/meta/connectors/${id}/accounts`,
+      { token },
+    ),
+  metaChooseAccount: (id: string, accountId: string, token: string) =>
+    request<{ connectorId: string; account: MetaInstagramAccount }>(`/api/meta/connectors/${id}/account`, {
+      method: 'POST',
+      token,
+      body: { accountId },
+    }),
+  /** Whether this server has its own Meta apps, and the redirect URI for an app of your own. */
+  metaPlatform: (token: string) =>
+    request<{ facebook: boolean; unified?: boolean; instagram: boolean; redirectUrl: string }>('/api/meta/platform', {
+      token,
+    }),
   oauthRedirectUri: (token: string) =>
     request<{ redirectUri: string }>('/api/connectors/oauth/redirect-uri', { token }),
   discoverTools: (id: string, token: string) =>
@@ -649,6 +817,19 @@ export const connectors = {
       `/api/connectors/${id}/discover-tools`,
       { method: 'POST', token },
     ),
+  /** The URL to paste into the provider's webhook settings; built server-side from SERVER_URL. */
+  webhookUrl: (id: string, token: string) =>
+    request<{ url: string }>(`/api/connectors/${encodeURIComponent(id)}/webhook/url`, { token }),
+  webhookEvents: (id: string, token: string, opts?: { limit?: number; since?: string }) => {
+    const query = new URLSearchParams();
+    if (opts?.limit) query.set('limit', String(opts.limit));
+    if (opts?.since) query.set('since', opts.since);
+    const qs = query.toString();
+    return request<{ events: RecentWebhookEvent[] }>(
+      `/api/connectors/${encodeURIComponent(id)}/webhook/events${qs ? `?${qs}` : ''}`,
+      { token },
+    );
+  },
 };
 
 /** One-time links an AI client hands out to finish a connector's setup. */
@@ -706,8 +887,30 @@ export const setupLinks = {
     }),
 };
 
+/**
+ * The File Search plugin's folder setup, opened from its authorization page
+ * (login.controller.ts): the backend checks the sign-in just made there and
+ * returns a dashboard session on the granted workspace plus the wizard path.
+ */
+export const fileSearchSetup = {
+  openFromAuthorize: (csrf: string, option: string) =>
+    request<{ ok: true; redirect: string; session: SetupLinkSession }>('/auth/file-search/session', {
+      method: 'POST',
+      headers: DASHBOARD_HEADER,
+      body: { csrf, option },
+    }),
+};
+
 // Adapters (built-in connector recipes)
 export type SetupKind = 'none' | 'credentials' | 'oauth_browser';
+
+/** One choice of a variable that takes one of a fixed list of values. */
+export interface EnvVarOption {
+  /** What is stored and sent. */
+  value: string;
+  /** What the user picks. */
+  label: string;
+}
 
 export interface EnvVarDescriptor {
   name: string;
@@ -722,6 +925,10 @@ export interface EnvVarDescriptor {
   patternMessage?: string;
   link?: string;
   advanced?: boolean;
+  /** A fixed list of choices: the form shows a select, and only these values are accepted. */
+  options?: EnvVarOption[];
+  /** Required, but found by the setup check when left empty (an Odoo database name). */
+  lookedUp?: boolean;
 }
 
 export interface AdapterSetupInfo {
@@ -731,13 +938,24 @@ export interface AdapterSetupInfo {
   instructions?: string;
   icon: string;
   docsUrl?: string;
-  connector: { name: string; type: string; baseUrl: string; authType: string };
+  connector: {
+    name: string;
+    type: string;
+    baseUrl: string;
+    authType: string;
+    /** The adapter's template (no secrets): `tokenProvider` says how a shop is authorized. */
+    authConfig?: { tokenProvider?: string };
+  };
   envVars: EnvVarDescriptor[];
   setupKind: SetupKind;
   /** What is needed before starting (Markdown), shown above the form. */
   prerequisites?: string;
   /** A step-by-step setup, shown instead of the form (see backend setup-guide.ts). */
   setupGuide?: SetupGuide;
+  /** The provider refuses calls from addresses not registered with it. */
+  requiresIpAllowlist?: boolean;
+  /** The addresses this instance calls APIs from (EGRESS_IPS); empty when not configured. */
+  egressIps?: string[];
 }
 
 export type SetupEffortKind = 'none' | 'one_click' | 'api_key' | 'own_app' | 'admin_needed';
@@ -773,11 +991,25 @@ export interface SetupGuide extends SetupEffort {
 }
 
 export type VerifyResult =
-  | { ok: true; toolName: string; durationMs: number; sample: string }
+  | {
+      ok: true;
+      toolName: string;
+      durationMs: number;
+      sample: string;
+      /**
+       * Values the check changed to get through (an Odoo database name the
+       * address names itself): filled into the form and saved.
+       */
+      corrected?: Record<string, string>;
+      /** What was changed, in a sentence. */
+      note?: string;
+    }
   | {
       ok: false;
       kind: string;
       message: string;
+      /** As on success: values to fill in although the check still failed (then a refused key). */
+      corrected?: Record<string, string>;
       missing?: string[];
       fields?: Record<string, string>;
       status?: number | null;
@@ -830,11 +1062,12 @@ export const adapters = {
   describe: (slug: string, token: string) =>
     request<AdapterSetupInfo>(`/api/adapters/${slug}`, { token }),
   /** Try credentials before saving: nothing is stored. */
-  verify: (slug: string, token: string, credentials: Record<string, string>, connectorId?: string) =>
+  /** `source`: where the setup was opened from (setup page `?source=`), kept on a failed check's event. */
+  verify: (slug: string, token: string, credentials: Record<string, string>, connectorId?: string, source?: string) =>
     request<VerifyResult>(`/api/adapters/${slug}/verify`, {
       method: 'POST',
       token,
-      body: { credentials, ...(connectorId ? { connectorId } : {}) },
+      body: { credentials, ...(connectorId ? { connectorId } : {}), ...(source ? { source } : {}) },
     }),
   /** Catalog connectors for the API at a base URL, best first. */
   matchUrl: (url: string, token: string) =>
@@ -852,6 +1085,18 @@ export const adapters = {
       server: { id: string; name: string } | null;
     }>('/api/adapters/starter-pack/install', { method: 'POST', token, body: { slugs } }),
 };
+
+/** Invoices by email for the workspace's subscription (Cloud). */
+export interface InvoiceEmailSettings {
+  /** False when there is no subscription to send invoices for. */
+  available: boolean;
+  enabled: boolean;
+  /** The Stripe customer's email: where invoices go unless another address is set. */
+  billingContact: string | null;
+  recipient: { kind: 'billing' | 'custom'; address: string | null };
+  /** The last invoice emailed; `to` is masked. */
+  lastSent: { number: string; at: string; to: string } | null;
+}
 
 /** A paid Cloud licence's Stripe subscription, as the server last saw it. */
 export interface LicenseBilling {
@@ -1097,7 +1342,45 @@ export const audit = {
     }>(`/api/audit/analytics?days=${days}`, { token }),
   breakdowns: (token: string, days = 30) =>
     request<AuditBreakdowns>(`/api/audit/breakdowns?days=${days}`, { token }),
+  toolPerformance: (token: string, params: ToolPerformanceQuery = {}) => {
+    const query = new URLSearchParams({
+      hours: String(params.hours ?? 24),
+      limit: String(params.limit ?? 25),
+      offset: String(params.offset ?? 0),
+    });
+    if (params.connectorId) query.set('connectorId', params.connectorId);
+    if (params.mcpServerId) query.set('mcpServerId', params.mcpServerId);
+    return request<{ items: ToolPerformance[]; hasMore: boolean }>(
+      `/api/audit/tool-performance?${query}`, { token },
+    );
+  },
 };
+
+export interface ToolPerformanceQuery {
+  hours?: number;
+  limit?: number;
+  offset?: number;
+  connectorId?: string;
+  mcpServerId?: string;
+}
+
+export interface ToolPerformance {
+  toolId: string;
+  toolName: string;
+  connectorId: string;
+  connectorName: string;
+  mcpServerId: string | null;
+  mcpServerName: string | null;
+  calls: number;
+  errors: number;
+  errorRate: number;
+  latencySampleCount: number;
+  p50Ms: number | null;
+  p95Ms: number | null;
+  p99Ms: number | null;
+  lastError: string | null;
+  lastErrorAt: string | null;
+}
 
 export interface BreakdownRow {
   id: string | null;
@@ -1151,6 +1434,8 @@ export interface KgSettings {
   enabled: boolean;
   llmEnabled: boolean;
   llmAvailable: boolean;
+  /** The scheduled job behind `autoExtend` runs on this instance. */
+  scheduledAvailable?: boolean;
   captureIntent: boolean;
   autoExtend: boolean;
   skillAutoApply: boolean;
@@ -1363,7 +1648,7 @@ export interface KgSkill {
   kind?: string;
   /** For a `code` proposal: the candidate code tool an admin approves. */
   payload?: KgCodeProposalPayload | null;
-  /** manual | llm | finder | agent */
+  /** manual | llm | finder | agent | learning */
   source?: string;
   /** Optional full procedure (markdown), served on demand by skill_get. */
   body?: string | null;
@@ -1373,7 +1658,173 @@ export interface KgSkill {
   folderId?: string | null;
   /** For a merge proposal: the active skills applying it deactivates. */
   replaces?: string[];
+  /** Free labels; a learned skill carries `learned` and its project's labels. */
+  tags?: string[];
+  /** Set on a learning project's draft: only this member's AI is served it. */
+  audienceUserId?: string | null;
+  learningProjectId?: string | null;
 }
+
+// ── Learning projects (#1695) ──────────────────────────────────────────────
+
+export type LearningProjectStatus = 'draft' | 'active' | 'paused' | 'ended';
+export type LearningLessonStatus = 'draft' | 'confirmed' | 'rejected' | 'superseded';
+
+/** What the workspace's plan includes, and how many projects are open. */
+export interface LearningAllowance {
+  /** null = no limit; 0 = not in this plan. */
+  max: number | null;
+  /** The Enterprise parts are included. */
+  full: boolean;
+  plan: string;
+  used: number;
+}
+
+export interface LearningLessonCounts {
+  draft: number;
+  confirmed: number;
+  rejected: number;
+}
+
+export interface LearningProject {
+  id: string;
+  name: string;
+  status: LearningProjectStatus;
+  /** Open, but past the number the plan includes: nothing is captured. */
+  overPlan: boolean;
+  publishMode: 'manual' | 'confirmed';
+  tags: string[];
+  showExpertName: boolean;
+  /** Null for viewers who may not see who the project learns from. */
+  expert: { id: string; name: string | null; email?: string } | null;
+  mcpServer: { id: string; name: string } | null;
+  folder: { id: string; name: string } | null;
+  startsAt: string | null;
+  endsAt: string | null;
+  consentAt: string | null;
+  createdAt: string;
+  topics: number;
+  lessons: LearningLessonCounts;
+}
+
+export interface LearningTopic {
+  id: string;
+  title: string;
+  whenToUse: string;
+  /** Where the topic's skills are filed; null: the project's folder. */
+  folder: { id: string; name: string } | null;
+  draftSkillId: string | null;
+  publishedSkillId: string | null;
+  publishedAt: string | null;
+  lessons: LearningLessonCounts;
+  /** Confirmed lessons changed since the last publication. */
+  unpublished: boolean;
+}
+
+export type LearningProjectDetail = Omit<LearningProject, 'topics'> & { topics: LearningTopic[] };
+
+export interface LearningLesson {
+  id: string;
+  projectId: string;
+  topicId: string;
+  kind: 'rule' | 'fact' | 'correction' | 'example';
+  text: string;
+  detail: { before?: string; after?: string; reason?: string; tool?: string; needsReason?: boolean } | null;
+  status: LearningLessonStatus;
+  source: 'model' | 'diff' | 'interview' | 'manual';
+  seenCount: number;
+  confirmedAt: string | null;
+  createdAt: string;
+  topic?: { title: string };
+}
+
+/** One of the caller's own learning projects (profile page). */
+export interface MyLearningProject {
+  id: string;
+  name: string;
+  status: LearningProjectStatus;
+  mcpServer: { id: string; name: string } | null;
+  consentAt: string | null;
+  endsAt: string | null;
+  showExpertName: boolean;
+}
+
+/** A topic an admin sets on a project. */
+export interface LearningTopicInput {
+  title: string;
+  whenToUse?: string;
+  folderId?: string | null;
+}
+
+export interface LearningProjectInput {
+  name: string;
+  userId: string;
+  mcpServerId: string;
+  folderId?: string | null;
+  endsAt?: string | null;
+  tags?: string[];
+  publishMode?: 'manual' | 'confirmed';
+  showExpertName?: boolean;
+  topics?: LearningTopicInput[];
+}
+
+export const learning = {
+  allowance: (token: string) => request<LearningAllowance>('/api/learning/allowance', { token }),
+  list: (token: string) =>
+    request<{ allowance: LearningAllowance; projects: LearningProject[] }>('/api/learning/projects', { token }),
+  get: (token: string, id: string) => request<LearningProjectDetail>(`/api/learning/projects/${id}`, { token }),
+  create: (token: string, body: LearningProjectInput) =>
+    request<{ id: string }>('/api/learning/projects', { token, method: 'POST', body }),
+  update: (token: string, id: string, body: Partial<Omit<LearningProjectInput, 'userId' | 'mcpServerId'>>) =>
+    request<{ id: string }>(`/api/learning/projects/${id}`, { token, method: 'PATCH', body }),
+  setStatus: (token: string, id: string, action: 'pause' | 'resume' | 'end') =>
+    request<{ id: string; status: LearningProjectStatus }>(`/api/learning/projects/${id}/${action}`, {
+      token,
+      method: 'POST',
+    }),
+  remove: (token: string, id: string) =>
+    request<{ ok: boolean; lessons: number }>(`/api/learning/projects/${id}`, { token, method: 'DELETE' }),
+  lessons: (
+    token: string,
+    id: string,
+    params: { status?: LearningLessonStatus; topicId?: string; take?: number; skip?: number } = {},
+  ) => {
+    const qs = new URLSearchParams();
+    if (params.status) qs.set('status', params.status);
+    if (params.topicId) qs.set('topicId', params.topicId);
+    if (params.take != null) qs.set('take', String(params.take));
+    if (params.skip != null) qs.set('skip', String(params.skip));
+    return request<{ items: LearningLesson[]; total: number; take: number; skip: number }>(
+      `/api/learning/projects/${id}/lessons?${qs.toString()}`,
+      { token },
+    );
+  },
+  setLesson: (token: string, lessonId: string, body: { status?: 'draft' | 'confirmed' | 'rejected'; text?: string }) =>
+    request<LearningLesson>(`/api/learning/lessons/${lessonId}`, { token, method: 'PATCH', body }),
+  addTopic: (token: string, projectId: string, body: LearningTopicInput) =>
+    request<{ id: string }>(`/api/learning/projects/${projectId}/topics`, { token, method: 'POST', body }),
+  updateTopic: (token: string, topicId: string, body: Partial<LearningTopicInput>) =>
+    request<{ id: string }>(`/api/learning/topics/${topicId}`, { token, method: 'PATCH', body }),
+  preview: (token: string, topicId: string) =>
+    request<{ topic: { id: string; title: string }; instruction: string; body: string | null; included: number; dropped: number }>(
+      `/api/learning/topics/${topicId}/preview`,
+      { token },
+    ),
+  publish: (token: string, topicId: string) =>
+    request<{ skillId: string; lessons: number; dropped: number }>(`/api/learning/topics/${topicId}/publish`, {
+      token,
+      method: 'POST',
+    }),
+  mine: (token: string) => request<MyLearningProject[]>('/api/learning/me', { token }),
+  consent: (token: string, id: string, notice: string) =>
+    request<{ id: string }>(`/api/learning/projects/${id}/consent`, { token, method: 'POST', body: { notice } }),
+  withdraw: (token: string, id: string, erase: boolean) =>
+    request<{ ok: boolean; erased: number }>(`/api/learning/projects/${id}/withdraw`, {
+      token,
+      method: 'POST',
+      body: { erase },
+    }),
+};
 
 export interface KnowledgeFolder {
   id: string;
@@ -1539,6 +1990,69 @@ export interface PublicStats {
   updatedAt: string | null;
 }
 
+/**
+ * The no-login reactivation page (/reactivate/<token>): the link an AI client
+ * shows when a tool call is refused because the workspace's trial ended. The
+ * token is the credential; no session is sent.
+ */
+export interface ReactivationView {
+  state: 'trial-ended' | 'active' | 'payment-failed' | 'no-license';
+  workspaceName: string;
+  trialEndedAt: string | null;
+  /** The AI client whose chat showed the link (else the first one connected). */
+  client: 'Claude' | 'ChatGPT' | 'Cursor' | 'Copilot' | null;
+  usage: { connectors: number; mcpServers: number; users: number };
+  /**
+   * What the workspace keeps and loses on each plan, with no connector or
+   * server names (ids like `pause-0`, empty names): the page opens without a
+   * sign-in, so it gives counts only. Null or missing when it could not be read.
+   */
+  planFit?: Record<FitPlanId, PlanFit> | null;
+  /** The Telegram price test's arm, for a Telegram-only workspace that can buy; else null. */
+  offerArm?: 'personal' | 'list' | null;
+  /** The 'personal' arm's discounted Starter monthly price; null otherwise. */
+  offer?: { plan: 'starter'; billingPeriod: 'monthly'; monthlyEur: number; months: number } | null;
+}
+
+export const reactivation = {
+  get: (linkToken: string) =>
+    request<ReactivationView>(`/api/license/reactivate/${encodeURIComponent(linkToken)}`),
+  checkout: (linkToken: string, body: { plan: 'starter' | 'team'; billingPeriod: 'monthly' | 'yearly' }) =>
+    request<{ url: string }>(`/api/license/reactivate/${encodeURIComponent(linkToken)}/checkout`, {
+      method: 'POST',
+      body,
+    }),
+  /**
+   * Back from Stripe: binds the licence just bought to the workspace and
+   * answers its state. Safe to repeat; the backend asks the licence site at
+   * most once every few seconds.
+   */
+  claim: (linkToken: string) =>
+    request<{ state: ReactivationView['state'] }>(`/api/license/reactivate/${encodeURIComponent(linkToken)}/claim`, {
+      method: 'POST',
+    }),
+  /** A click on the page (paywall_action). Fire and forget; survives the page closing. */
+  track: (
+    linkToken: string,
+    body: {
+      action: string;
+      plan?: 'starter' | 'team';
+      period?: 'monthly' | 'yearly';
+      device?: 'mobile' | 'desktop';
+      offer?: 'personal' | 'list';
+    },
+  ) => {
+    try {
+      void fetch(`${API_BASE}/api/license/reactivate/${encodeURIComponent(linkToken)}/event`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        keepalive: true,
+      }).catch(() => {});
+    } catch {}
+  },
+};
+
 export const publicStats = {
   get: () => request<PublicStats>('/api/public/stats'),
 };
@@ -1550,6 +2064,26 @@ export const siteSettings = {
   /** The signed-in member's workspace links (instance-wide ones as fallback). */
   workspaceFooterLinks: (token: string) =>
     request<Array<{ label: string; url: string }>>('/api/settings/footer-links', { token }),
+};
+
+export type MemberVisibilityMode = 'open' | 'restricted';
+
+/**
+ * What members who are not admins see in the dashboard. `restrictedForMe` is
+ * true when the mode is `restricted` and the caller is not an admin.
+ */
+export interface MemberVisibilityState {
+  mode: MemberVisibilityMode;
+  restrictedForMe: boolean;
+}
+
+export const memberVisibility = {
+  /** Any member: the workspace's mode and whether it narrows the caller's view. */
+  get: (token: string) =>
+    request<MemberVisibilityState>('/api/settings/member-visibility', { token }),
+  /** Admin only. */
+  set: (mode: MemberVisibilityMode, token: string) =>
+    request<MemberVisibilityState>('/api/admin/settings/member-visibility', { method: 'PUT', body: { mode }, token }),
 };
 
 export const versionApi = {
@@ -1888,18 +2422,74 @@ export const roles = {
     request<any[]>(`/api/roles/${id}/tools`, { token }),
   setToolAccess: (id: string, toolIds: string[], token: string) =>
     request(`/api/roles/${id}/tools`, { method: 'PUT', body: { toolIds }, token }),
-  assignToUser: (userId: string, roleId: string | null, token: string) =>
-    request(`/api/roles/assign/${userId}`, { method: 'PUT', body: { roleId }, token }),
+  /** Per-tool limits on an existing grant; null clears a window (unlimited). */
+  setToolRateLimits: (
+    id: string,
+    toolId: string,
+    limits: { callsPerMinute: number | null; callsPerHour: number | null },
+    token: string,
+  ) => request(`/api/roles/${id}/tools/${toolId}/rate-limit`, { method: 'PUT', body: limits, token }),
+  /** Every member with every MCP role they hold in this workspace. */
+  members: (token: string) =>
+    request<MemberRoles[]>('/api/roles/members', { token }),
+  /** Replaces the member's MANUAL roles; roles from single sign-on groups stay. */
+  setUserRoles: (userId: string, roleIds: string[], token: string) =>
+    request<{ message: string; roleIds: string[] }>(`/api/roles/assignments/${userId}`, {
+      method: 'PUT',
+      body: { roleIds },
+      token,
+    }),
 };
 
+/** One MCP role assignment of a member (`GET /api/roles/members`). */
+export interface MemberRoleAssignment {
+  roleId: string;
+  roleName: string;
+  /** 'manual' = set by an admin; anything else comes from a single sign-on group sync. */
+  source: string;
+  /** A grant with no workspace: it applies in every workspace. */
+  global: boolean;
+}
+
+export interface MemberRoles {
+  id: string;
+  email: string;
+  name: string | null;
+  /** Workspace role (ADMIN, EDITOR, VIEWER). */
+  role: string;
+  active: boolean;
+  roles: MemberRoleAssignment[];
+  /** Connectors the member's roles reach; null when roles do not limit the member. */
+  connectors: Array<{ id: string; name: string }> | null;
+}
+
 // MCP API Keys
+/**
+ * Key scope. `MCP` keys call MCP tools on `/mcp` only (the default, and what
+ * the per-server key UI mints). `MANAGEMENT_READ` / `MANAGEMENT_ADMIN` keys
+ * drive the management API (`/api/*`) for the `amcp` CLI, read-only or full,
+ * always still capped by the owner's role (see jwt-or-management-key.guard).
+ */
+export type McpApiKeyScope = 'MCP' | 'MANAGEMENT_READ' | 'MANAGEMENT_ADMIN';
+
+export interface McpApiKeyInfo {
+  id: string;
+  name: string;
+  scope: McpApiKeyScope;
+  isActive: boolean;
+  mcpServerId?: string | null;
+  mcpServer?: { id: string; name: string } | null;
+  lastUsedAt?: string | null;
+  createdAt?: string;
+}
+
 export const mcpKeys = {
   list: (token: string) =>
-    request<any[]>('/api/mcp-keys', { token }),
-  generate: (name: string, token: string, mcpServerId?: string) =>
-    request<{ id: string; key: string; name: string; mcpServerId?: string }>('/api/mcp-keys', {
+    request<McpApiKeyInfo[]>('/api/mcp-keys', { token }),
+  generate: (name: string, token: string, mcpServerId?: string, scope?: McpApiKeyScope) =>
+    request<{ id: string; key: string; name: string; mcpServerId?: string; scope: McpApiKeyScope }>('/api/mcp-keys', {
       method: 'POST',
-      body: { name, ...(mcpServerId ? { mcpServerId } : {}) },
+      body: { name, ...(mcpServerId ? { mcpServerId } : {}), ...(scope && scope !== 'MCP' ? { scope } : {}) },
       token,
     }),
   revoke: (id: string, token: string) =>
@@ -1940,6 +2530,106 @@ export const support = {
       skipAutoLogout: true,
     }),
 };
+
+// ── Plan fit (Cloud) ───────────────────────────────────────────────────────
+// Mirrors packages/backend/src/license/plan-fit.ts.
+
+export type FitPlanId = 'starter' | 'team';
+
+export interface FitAxis {
+  current: number;
+  /** null = unlimited on that plan. */
+  max: number | null;
+  over: boolean;
+}
+
+export interface FitItem {
+  id: string;
+  name: string;
+  calls30d: number;
+}
+
+export interface FitRanked extends FitAxis {
+  /** Stay active on that plan, most used first. */
+  keep: FitItem[];
+  /** Would be paused (never deleted), least used last. */
+  pause: FitItem[];
+}
+
+/** What this workspace, as it is today, keeps and loses on a plan. */
+export interface PlanFit {
+  plan: FitPlanId;
+  /** Everything the workspace uses today fits the plan. */
+  fits: boolean;
+  connectors: FitRanked;
+  mcpServers: FitRanked;
+  users: FitAxis;
+  fileSearch: {
+    connectors: FitRanked;
+    files: FitAxis;
+    bytes: FitAxis;
+    fileShare: boolean;
+  };
+  code: {
+    tools: FitAxis;
+    inlineInUse: boolean;
+    inlineIncluded: boolean;
+    runsThisMonth: FitAxis;
+  };
+}
+
+export type PlanFits = Partial<Record<FitPlanId, PlanFit>>;
+
+/**
+ * A refusal because a plan limit is used up (HTTP 403, `code: 'PLAN_LIMIT'`):
+ * active connectors, MCP servers or File Search folders (activating or
+ * creating one more needs one paused first, or a bigger plan), or users (an
+ * invitation beyond the plan).
+ */
+export type PlanLimitAxis = 'connectors' | 'mcpServers' | 'users' | 'fileSearchConnectors';
+const PLAN_LIMIT_AXES: readonly string[] = ['connectors', 'mcpServers', 'users', 'fileSearchConnectors'];
+
+export interface PlanLimitError {
+  code: 'PLAN_LIMIT';
+  axis: PlanLimitAxis;
+  max: number;
+  current: number;
+  message: string;
+}
+
+/** The PLAN_LIMIT details of a refused request, or null for any other error. */
+export function planLimitOf(err: unknown): PlanLimitError | null {
+  if (!(err instanceof ApiError) || err.status !== 403) return null;
+  const b = err.body as Partial<PlanLimitError> | null | undefined;
+  if (!b || b.code !== 'PLAN_LIMIT') return null;
+  if (typeof b.axis !== 'string' || !PLAN_LIMIT_AXES.includes(b.axis)) return null;
+  return {
+    code: 'PLAN_LIMIT',
+    axis: b.axis as PlanLimitAxis,
+    max: typeof b.max === 'number' ? b.max : 0,
+    current: typeof b.current === 'number' ? b.current : 0,
+    message: typeof b.message === 'string' && b.message ? b.message : err.message,
+  };
+}
+
+export function isPlanLimitError(err: unknown): boolean {
+  return planLimitOf(err) !== null;
+}
+
+/** GET /api/license/usage. */
+export interface LicenseUsage {
+  plan: string | null;
+  connectors: { current: number; max: number | null; isOver: boolean };
+  mcpServers: { current: number; max: number | null; isOver: boolean };
+  users: { current: number; max: number | null; isOver: boolean };
+  isOverAny: boolean;
+  /**
+   * Cloud: the connectors (File Search folders included) and MCP servers the
+   * last automatic downgrade paused, still paused. Missing on servers that do
+   * not pause by plan.
+   */
+  pausedByPlan?: { connectors: string[]; mcpServers: string[] };
+}
 
 // License
 export const license = {
@@ -1988,6 +2678,21 @@ export const license = {
       method: 'POST',
       token,
     }),
+  /** Cloud only (ADMIN, paid plans): a one-hour link to accept the DPA on the licence site. */
+  dpaLink: (token: string, locale?: string) =>
+    request<{ url: string }>('/api/license/dpa-link', {
+      method: 'POST',
+      body: { ...(locale && { locale }) },
+      token,
+    }),
+  /** Cloud only (ADMIN): whether each paid invoice is emailed as a PDF, and to which address. */
+  invoiceEmail: (token: string) => request<InvoiceEmailSettings>('/api/license/invoice-email', { token }),
+  /**
+   * Cloud only (ADMIN): switch invoices by email on or off. `to`: an address,
+   * null for the billing contact, or leave it out to keep the current one.
+   */
+  setInvoiceEmail: (token: string, change: { enabled: boolean; to?: string | null }) =>
+    request<InvoiceEmailSettings>('/api/license/invoice-email', { method: 'PUT', body: change, token }),
   /** 'cancel' opens Stripe's cancellation page, 'payment_method_update' the page to add a card. */
   billingPortal: (token: string, returnUrl?: string, flow?: 'cancel' | 'payment_method_update') =>
     request<{ url: string }>('/api/license/billing-portal', {
@@ -2042,16 +2747,24 @@ export const license = {
       '/api/license/card-trial-offer',
       { token },
     ),
+  /**
+   * Cloud: the ended-trial wall of an admin: its variant ('trust', or the
+   * earlier 'control' wall for about 10% of workspaces) and the workspace's
+   * own numbers, null when it never made a successful call. `wall` is null
+   * for everyone else.
+   */
+  wall: (token: string) =>
+    request<{ wall: LicenseWallView | null }>('/api/license/wall', { token }),
   getInstanceId: () =>
     request<{ instanceId: string }>('/api/license/instance-id'),
   getUsage: (token?: string) =>
-    request<{
-      plan: string | null;
-      connectors: { current: number; max: number | null; isOver: boolean };
-      mcpServers: { current: number; max: number | null; isOver: boolean };
-      users: { current: number; max: number | null; isOver: boolean };
-      isOverAny: boolean;
-    }>('/api/license/usage', { token }),
+    request<LicenseUsage>('/api/license/usage', { token }),
+  /**
+   * Cloud: what this workspace keeps and loses on Starter and Team (or on
+   * `plan` only). 404 on self-hosted, where these limits do not apply.
+   */
+  getPlanFit: (token: string, plan?: FitPlanId) =>
+    request<{ plans?: PlanFits }>(`/api/license/plan-fit${plan ? `?plan=${plan}` : ''}`, { token }),
 };
 
 export interface McpServer {
@@ -2330,6 +3043,36 @@ export const fileSearch = {
     request(`/api/file-search/connectors/${id}/access-rules`, { method: 'PUT', body: { rules }, token }),
 };
 
+/** One-time upload links an AI client hands to the user (file_upload_link). The token is the credential. */
+export const fileUploads = {
+  status: (uploadToken: string) =>
+    request<{ filename: string; max_bytes: number; state: 'waiting' | 'uploading' | 'uploaded' | 'expired'; link_expires_at: string; bytes: number | null }>(
+      `/api/uploads/u/${encodeURIComponent(uploadToken)}`,
+    ),
+  /** PUT with progress; resolves with the stored size. */
+  upload: (uploadToken: string, file: File, onProgress?: (pct: number) => void) =>
+    new Promise<{ bytes: number }>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', `${API_BASE}/api/uploads/u/${encodeURIComponent(uploadToken)}`);
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.upload.onprogress = (ev) => {
+        if (ev.lengthComputable && onProgress) onProgress(Math.round((100 * ev.loaded) / ev.total));
+      };
+      xhr.onload = () => {
+        let body: any = null;
+        try {
+          body = JSON.parse(xhr.responseText);
+        } catch {
+          /* not JSON */
+        }
+        if (xhr.status >= 200 && xhr.status < 300) resolve({ bytes: body?.bytes ?? file.size });
+        else reject(new ApiError(body?.message || `Upload failed (${xhr.status})`, xhr.status, body));
+      };
+      xhr.onerror = () => reject(new ApiError('network', 0, null));
+      xhr.send(file);
+    }),
+};
+
 export const fileShare = {
   list: (token: string, opts: { page?: number; pageSize?: number; q?: string; access?: 'public' | 'internal'; mine?: boolean } = {}) => {
     const qs = new URLSearchParams();
@@ -2361,3 +3104,14 @@ export const fileShare = {
       { method: 'POST', token: authToken ?? undefined, skipAutoLogout: true },
     ),
 };
+
+/** GET /api/license/wall (see the backend's license-wall.service.ts). */
+export interface LicenseWallView {
+  variant: 'trust' | 'control';
+  recap: {
+    successfulCalls: number;
+    connectors: string[];
+    client: string | null;
+    blockedSinceEnd: boolean;
+  } | null;
+}

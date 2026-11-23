@@ -150,13 +150,93 @@ describe('POST /api/product-events — File Search wizard', () => {
   });
 });
 
+describe('POST /api/product-events — guided connector setup', () => {
+  // The setup page sent `step` and `index` from its first day, and the
+  // allow-list dropped both: every step event said only which adapter. These
+  // go through the real service, so a field outside the list fails here.
+  it('keeps which step was shown, left and opened at the provider', async () => {
+    const { controller, req, stored } = build();
+    for (const event of ['setup_step_viewed', 'setup_step_completed', 'setup_step_action_opened']) {
+      await controller.record(req, { event, metadata: { adapterSlug: 'etsy', step: 'create-app', index: 1 } });
+    }
+    expect(stored().map((e: any) => [e.event, e.metadata])).toEqual([
+      ['setup_step_viewed', { adapterSlug: 'etsy', step: 'create-app', index: 1 }],
+      ['setup_step_completed', { adapterSlug: 'etsy', step: 'create-app', index: 1 }],
+      ['setup_step_action_opened', { adapterSlug: 'etsy', step: 'create-app', index: 1 }],
+    ]);
+  });
+
+  it('drops a step that is not a step id and an index that is not a position', async () => {
+    const { controller, req, stored } = build();
+    const view = (metadata: Record<string, unknown>) => controller.record(req, { event: 'setup_step_viewed', metadata });
+    await view({ adapterSlug: 'etsy', step: 'Keys: abcdefghijklmnopqrstuvwx', index: 2 });
+    await view({ adapterSlug: 'etsy', step: 'keys', index: '2' });
+    await view({ adapterSlug: 'etsy', step: 'keys', index: 51 });
+    await view({ adapterSlug: 'etsy', step: 'keys', index: 1.5 });
+    expect(stored().map((e: any) => e.metadata)).toEqual([
+      { adapterSlug: 'etsy', index: 2 },
+      { adapterSlug: 'etsy', step: 'keys' },
+      { adapterSlug: 'etsy', step: 'keys' },
+      { adapterSlug: 'etsy', step: 'keys' },
+    ]);
+  });
+
+  it('keeps the names of the fields the page refused, never a value', async () => {
+    const { controller, req, stored } = build();
+    const refused = (metadata: Record<string, unknown>) => controller.record(req, { event: 'setup_fields_refused', metadata });
+    await refused({ adapterSlug: 'etsy', step: 'keys', index: 2, kind: 'format', field: 'ETSY_CLIENT_ID,ETSY_CLIENT_SECRET' });
+    await refused({ adapterSlug: 'etsy', kind: 'required', field: 'ETSY_CLIENT_SECRET' });
+    // What was typed into the field instead of its name.
+    await refused({ adapterSlug: 'etsy', kind: 'format', field: 'abcdefghijklmnopqrstuvwx:1a2b3c4d5e' });
+    await refused({ adapterSlug: 'etsy', kind: 'format', field: 'etsy_client_id' });
+    expect(stored().map((e: any) => e.metadata)).toEqual([
+      { adapterSlug: 'etsy', step: 'keys', index: 2, kind: 'format', field: 'ETSY_CLIENT_ID,ETSY_CLIENT_SECRET' },
+      { adapterSlug: 'etsy', kind: 'required', field: 'ETSY_CLIENT_SECRET' },
+      { adapterSlug: 'etsy', kind: 'format' },
+      { adapterSlug: 'etsy', kind: 'format' },
+    ]);
+  });
+
+  it('keeps a coarse device on the opening of a setup', async () => {
+    const { controller, req, stored } = build();
+    await controller.record(req, { event: 'setup_started', metadata: { adapterSlug: 'etsy', kind: 'oauth_browser', device: 'mobile' } });
+    await controller.record(req, { event: 'setup_started', metadata: { adapterSlug: 'etsy', kind: 'oauth_browser', device: 'iPhone' } });
+    expect(stored().map((e: any) => e.metadata)).toEqual([
+      { adapterSlug: 'etsy', kind: 'oauth_browser', device: 'mobile' },
+      { adapterSlug: 'etsy', kind: 'oauth_browser' },
+    ]);
+  });
+
+  it('records the connector page asking to finish a setup', async () => {
+    const { controller, req, stored } = build();
+    await controller.record(req, {
+      event: 'setup_finish_prompt_viewed',
+      metadata: { adapterSlug: 'etsy', connectorId: 'c1', kind: 'needs_input' },
+    });
+    expect(stored()).toEqual([
+      expect.objectContaining({
+        event: 'setup_finish_prompt_viewed',
+        userId: 'u1',
+        organizationId: 'org-1',
+        metadata: { adapterSlug: 'etsy', connectorId: 'c1', kind: 'needs_input' },
+      }),
+    ]);
+  });
+});
+
 describe('scrubProviderMessage', () => {
   it('drops query strings, masks given secrets and token-like runs, caps the length', () => {
     expect(scrubProviderMessage('GET https://x.example/api?appid=abc failed', [])).toBe('GET https://x.example/api failed');
     expect(scrubProviderMessage('bad key s3cr3t-value', ['s3cr3t-value'])).toBe('bad key ***');
     expect(scrubProviderMessage(`token ${'a1'.repeat(20)} expired`)).toBe('token *** expired');
-    expect(scrubProviderMessage('x'.repeat(30) + ' ' + 'word '.repeat(60))!.length).toBe(160);
+    expect(scrubProviderMessage('x'.repeat(30) + ' ' + 'word '.repeat(100))!.length).toBe(400);
     expect(scrubProviderMessage('   ')).toBeNull();
+  });
+
+  it("keeps the provider's words that follow our hint", () => {
+    const hint = 'The target API returned a server error (500). This is on their side, not your configuration.';
+    const odoo = `${hint} (Request failed with status code 500: {"name":"builtins.ValueError","message":"Invalid field 'customer_rank' on 'res.partner'"})`;
+    expect(scrubProviderMessage(odoo)).toContain("Invalid field 'customer_rank' on 'res.partner'");
   });
 
   it('cuts a URL at its first ? or #, wherever it sits in the text', () => {
@@ -177,12 +257,84 @@ describe('scrubProviderMessage', () => {
       const started = Date.now();
       const out = scrubProviderMessage(input);
       expect(Date.now() - started).toBeLessThan(200);
-      expect(out!.length).toBeLessThanOrEqual(160);
+      expect(out!.length).toBeLessThanOrEqual(400);
+    }
+  });
+});
+
+describe('ProductEventService.log — a refused setup check', () => {
+  const log = async (metadata: Record<string, unknown>) => {
+    const create = jest.fn().mockResolvedValue({});
+    await new ProductEventService({ productEvent: { create } } as any).log({
+      event: 'setup_verify_failed',
+      userId: 'u1',
+      organizationId: 'org-1',
+      metadata,
+    });
+    return create.mock.calls[0][0].data.metadata;
+  };
+
+  it("keeps the provider's error code next to the kind and status", async () => {
+    expect(await log({ adapterSlug: 'shopify', kind: 'bad_request', status: 400, code: 'app_not_installed' })).toEqual({
+      adapterSlug: 'shopify',
+      kind: 'bad_request',
+      status: 400,
+      code: 'app_not_installed',
+    });
+  });
+
+  it('drops a code that is not a short identifier: a sentence, a key, a number', async () => {
+    for (const code of ['Not Found', 'sk_live_51Hx2kQ8rT9vZpYwA3bC', 'x'.repeat(41), 'ab', 400, { a: 1 }]) {
+      expect(await log({ adapterSlug: 'shopify', kind: 'bad_request', code })).toEqual({
+        adapterSlug: 'shopify',
+        kind: 'bad_request',
+      });
     }
   });
 });
 
 describe('ProductEventService.log — server-written metadata', () => {
+  // The callers' own tests replace this service with a mock, so only a test
+  // through it shows what is really stored: 'phone', `attempt` and `reason`
+  // were all dropped here once.
+  it('keeps the device and the attempt of an authorization page view', async () => {
+    const create = jest.fn().mockResolvedValue({});
+    const service = new ProductEventService({ productEvent: { create } } as any);
+    const view = (metadata: Record<string, unknown>) => service.log({ event: 'authorize_page_viewed', metadata });
+    await view({ client: 'Claude', device: 'mobile', attempt: 'mh0zq3k1' });
+    await view({ client: 'Claude', device: 'desktop', attempt: 'mh0zq3k1' });
+    // Only the two coarse devices, and only a short base-36 value as the attempt.
+    await view({ client: 'Claude', device: 'phone', attempt: 'A session-id, or any text' });
+    await view({ client: 'Claude', attempt: 'x'.repeat(13) });
+    expect(create.mock.calls.map((c) => c[0].data.metadata)).toEqual([
+      { client: 'Claude', device: 'mobile', attempt: 'mh0zq3k1' },
+      { client: 'Claude', device: 'desktop', attempt: 'mh0zq3k1' },
+      { client: 'Claude' },
+      { client: 'Claude' },
+    ]);
+  });
+
+  it('keeps which way a Telegram creation link was opened', async () => {
+    const create = jest.fn().mockResolvedValue({});
+    const service = new ProductEventService({ productEvent: { create } } as any);
+    for (const via of ['app', 'web', 'qr']) {
+      await service.log({ event: 'telegram_bot_link_opened', userId: 'u1', organizationId: 'org-1', metadata: { adapterSlug: 'telegram-bot', device: 'desktop', via } });
+    }
+    expect(create.mock.calls.map((c) => c[0].data.metadata.via)).toEqual(['app', 'web', 'qr']);
+  });
+
+  it('keeps why an install from the chat added nothing', async () => {
+    const create = jest.fn().mockResolvedValue({});
+    const service = new ProductEventService({ productEvent: { create } } as any);
+    await service.log({
+      event: 'setup_install_failed',
+      userId: 'u1',
+      organizationId: 'org-1',
+      metadata: { adapterSlug: 'openplz', via: 'mcp', kind: 'plan_limit' },
+    });
+    expect(create.mock.calls[0][0].data.metadata).toEqual({ adapterSlug: 'openplz', via: 'mcp', kind: 'plan_limit' });
+  });
+
   it('keeps cardTrialOffered on the empty-workspace prompt (the #920 measurement)', async () => {
     const create = jest.fn().mockResolvedValue({});
     const service = new ProductEventService({ productEvent: { create } } as any);
@@ -193,6 +345,63 @@ describe('ProductEventService.log — server-written metadata', () => {
       metadata: { client: 'Claude', cardTrialOffered: true },
     });
     expect(create.mock.calls[0][0].data.metadata).toEqual({ client: 'Claude', cardTrialOffered: true });
+  });
+
+  it('keeps the reactivation-link arm on a blocked call and the state on a page view', async () => {
+    const create = jest.fn().mockResolvedValue({});
+    const service = new ProductEventService({ productEvent: { create } } as any);
+    for (const variant of ['page', 'pricing']) {
+      await service.log({
+        event: 'trial_expired_call_blocked',
+        organizationId: 'org-1',
+        metadata: { toolName: 't', adapterSlug: 'odoo', client: 'claude-ai', variant },
+      });
+    }
+    await service.log({ event: 'reactivate_page_viewed', organizationId: 'org-1', metadata: { state: 'trial-ended' } });
+    await service.log({ event: 'license_wall_viewed', organizationId: 'org-1', metadata: { variant: 'trust' } });
+    await service.log({ event: 'reactivate_page_viewed', organizationId: 'org-1', metadata: { state: 'x', variant: 'y' } });
+    const stored = create.mock.calls.map((c) => c[0].data.metadata);
+    expect(stored[0]).toEqual({ toolName: 't', adapterSlug: 'odoo', client: 'claude-ai', variant: 'page' });
+    expect(stored[1].variant).toBe('pricing');
+    expect(stored[2]).toEqual({ state: 'trial-ended' });
+    expect(stored[3]).toEqual({ variant: 'trust' });
+    expect(stored[4]).toBeNull();
+  });
+
+  it('keeps a paywall_action from either pay screen, with only known actions, plans and periods', async () => {
+    const create = jest.fn().mockResolvedValue({});
+    const service = new ProductEventService({ productEvent: { create } } as any);
+    expect(service.isKnown('paywall_action')).toBe(true);
+    await service.log({
+      event: 'paywall_action',
+      organizationId: 'org-1',
+      metadata: { source: 'trial_ended_wall', variant: 'trust', action: 'subscribe_clicked', plan: 'team', period: 'yearly', device: 'mobile' },
+    });
+    await service.log({
+      event: 'paywall_action',
+      organizationId: 'org-1',
+      metadata: { source: 'mcp_reactivate', action: 'pwned', plan: 'business', period: 'weekly', email: 'a@b.c' },
+    });
+    const stored = create.mock.calls.map((c) => c[0].data.metadata);
+    expect(stored[0]).toEqual({
+      source: 'trial_ended_wall',
+      device: 'mobile',
+      variant: 'trust',
+      action: 'subscribe_clicked',
+      plan: 'team',
+      period: 'yearly',
+    });
+    expect(stored[1]).toEqual({ source: 'mcp_reactivate' });
+  });
+
+  it('keeps the Telegram price test arm, and only its two values', async () => {
+    const create = jest.fn().mockResolvedValue({});
+    const service = new ProductEventService({ productEvent: { create } } as any);
+    await service.log({ event: 'reactivate_page_viewed', organizationId: 'org-1', metadata: { state: 'trial-ended', offer: 'personal' } });
+    await service.log({ event: 'paywall_action', organizationId: 'org-1', metadata: { action: 'shown', offer: 'free-forever' } });
+    const stored = create.mock.calls.map((c) => c[0].data.metadata);
+    expect(stored[0]).toEqual({ state: 'trial-ended', offer: 'personal' });
+    expect(stored[1]).toEqual({ action: 'shown' });
   });
 });
 
@@ -222,5 +431,73 @@ describe('ProductEventService — the Claude setup discoverability events', () =
       await controller.record(req as any, { event, metadata: { adapterSlug: 'telegram-bot' } } as any);
     }
     expect(stored()).toEqual([]);
+  });
+});
+
+describe('ProductEventService — the authorization attempt events', () => {
+  const stored = async (events: Array<{ event: string; metadata: Record<string, unknown> }>) => {
+    const create = jest.fn().mockResolvedValue({});
+    const service = new ProductEventService({ productEvent: { create } } as any);
+    for (const e of events) await service.log(e as any);
+    return create.mock.calls.map(([{ data }]) => data.metadata);
+  };
+
+  it('keeps the button, the sign-in method, the account, the language and the page arm', async () => {
+    const attempt = { client: 'Claude', device: 'desktop', attempt: 'mws7ha5r', connectedArm: 'next_step', signinArm: 'buttons_first' };
+    expect(
+      await stored([
+        { event: 'authorize_page_viewed', metadata: { ...attempt, lang: 'de' } },
+        { event: 'authorize_action', metadata: { ...attempt, button: 'google' } },
+        { event: 'authorization_signed_in', metadata: { ...attempt, method: 'google', account: 'new' } },
+        { event: 'post_approve_continue_clicked', metadata: { ...attempt, button: 'auto_continue' } },
+        { event: 'authorization_code_issued', metadata: attempt },
+      ]),
+    ).toEqual([
+      { ...attempt, lang: 'de' },
+      { ...attempt, button: 'google' },
+      { ...attempt, method: 'google', account: 'new' },
+      { ...attempt, button: 'auto_continue' },
+      attempt,
+    ]);
+  });
+
+  it('keeps every value the pages send, and drops any other', async () => {
+    for (const button of ['google', 'microsoft', 'github', 'sso', 'password', 'session', 'cancel', 'create_account', 'continue', 'auto_continue', 'copy_continue']) {
+      expect(await stored([{ event: 'authorize_action', metadata: { button } }])).toEqual([{ button }]);
+    }
+    for (const method of ['google', 'microsoft', 'github', 'sso', 'password', 'session', 'email_code']) {
+      expect(await stored([{ event: 'authorization_signed_in', metadata: { method } }])).toEqual([{ method }]);
+    }
+    for (const signinArm of ['control', 'buttons_first']) {
+      expect(await stored([{ event: 'authorize_page_viewed', metadata: { signinArm } }])).toEqual([{ signinArm }]);
+    }
+    for (const lang of ['en', 'de', 'it', 'es', 'zh', 'ja', 'ru', 'other']) {
+      expect(await stored([{ event: 'authorize_page_viewed', metadata: { lang } }])).toEqual([{ lang }]);
+    }
+    // An address typed into a field, a made-up arm, a language tag: none is stored.
+    expect(
+      await stored([
+        {
+          event: 'authorize_action',
+          metadata: {
+            client: 'Claude',
+            button: 'max@example.com',
+            method: 'magic',
+            account: 'max@example.com',
+            lang: 'fr-FR',
+            connectedArm: 'treatment',
+            signinArm: 'treatment',
+          },
+        },
+      ]),
+    ).toEqual([{ client: 'Claude' }]);
+  });
+
+  it('refuses all of them from a page: only the server writes them', async () => {
+    const { controller, req, stored: written } = build();
+    for (const event of ['authorize_action', 'authorization_signed_in', 'post_approve_continue_clicked', 'authorization_code_issued']) {
+      await controller.record(req as any, { event, metadata: { button: 'continue' } } as any);
+    }
+    expect(written()).toEqual([]);
   });
 });

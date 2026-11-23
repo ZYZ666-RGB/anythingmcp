@@ -1,4 +1,5 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { withCatalogUserAgent } from '../connectors/catalog-user-agent.util';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { AxiosError } from 'axios';
 import { ToolRegistry } from './tool-registry';
 import { CodeExecutorService } from './code-executor.service';
@@ -14,12 +15,18 @@ import { RestEngine } from '../connectors/engines/rest.engine';
 import { GraphqlEngine } from '../connectors/engines/graphql.engine';
 import { SoapEngine } from '../connectors/engines/soap.engine';
 import { McpClientEngine } from '../connectors/engines/mcp-client.engine';
-import { DatabaseEngine } from '../connectors/engines/database.engine';
+import { DatabaseEngine, assertSafeSqlIdentifierVars } from '../connectors/engines/database.engine';
 import { AuditService } from '../audit/audit.service';
 import { RedisService } from '../common/redis.service';
 import { LicenseGuardService, TrialEndedException } from '../license/license-guard.service';
+import {
+  monthlyCodeRunCapForPlan,
+  concurrentCodeRunCapForPlan,
+  startOfUtcMonth,
+} from '../license/code-run-quotas';
 import { ProductEventService } from '../audit/product-event.service';
 import { TrialBlockedCallRecorder, trialEndedToolResult } from './trial-blocked-call';
+import { trialReactivationLink, trialReactivationUrl } from '../license/license-checkout';
 import { DeploymentService } from '../common/deployment.service';
 import { PrismaService } from '../common/prisma.service';
 import {
@@ -42,11 +49,20 @@ import { KgService } from '../knowledge-graph/kg.service';
 import { WebhookEventsService } from '../connectors/webhook-events.service';
 import type { ResponseMapping } from '../connectors/engines/engine-types';
 import type { RegisteredTool } from './tool-registry';
-import { deriveErrorHint, hostFromAxiosConfig, hostFromUrl } from './error-hints';
-import { envVarsForMcpTool } from '../connectors/mcp-connector-config.util';
+import {
+  bodyText,
+  deriveErrorHint,
+  hostFromAxiosConfig,
+  hostFromUrl,
+  isMissingScopeHint,
+  isRefusedKeyHint,
+  ODOO_FIELD_HINT,
+} from './error-hints';
+import { egressIps } from '../connectors/egress';
+import { envVarsForMcpTool, resolveMcpFixedArguments } from '../connectors/mcp-connector-config.util';
 import { processGauges } from '../common/process-vitals';
 import { recordToolCall } from '../common/metrics';
-import { applySchemaDefaults } from '../common/schema-defaults.util';
+import { applyEnvDefaults, applySchemaDefaults } from '../common/schema-defaults.util';
 import { renderStaticResponse } from '../connectors/static-response.util';
 import { ODataEngine, isODataBuiltinMethod } from '../connectors/engines/odata.engine';
 import { EmailEngine } from '../connectors/engines/email.engine';
@@ -54,9 +70,12 @@ import { FileSearchEngine } from '../file-search/file-search.engine';
 import { connectorPageUrl } from '../common/url.util';
 import { hashContent } from '../adapters/catalog-fingerprint';
 import { getAdapter } from '../adapters/catalog';
+import { ArgumentPatternError, catalogPatternViolations } from './catalog-patterns';
+import { missingRequiredDefault } from './required-env-defaults';
 import { odooNoDatabaseAdvice } from '../adapters/odoo-database-hint';
 import { UserCredentialsService } from '../connectors/user-credentials.service';
-import { connectorErrorWhen } from '../connectors/error-when.util';
+import { ToolRateLimitService } from './tool-rate-limit.service';
+import { connectorErrorWhen, connectorLargeIntegers } from '../connectors/error-when.util';
 import {
   isBinaryBody,
   readBinaryConfig,
@@ -85,6 +104,7 @@ interface CodeExecContext {
   organizationId?: string;
   authMethod?: string;
   apiKeyName?: string;
+  supportKeyId?: string;
   mcpServerId?: string;
   mcpServerName?: string;
   connectorIds?: string[];
@@ -103,6 +123,24 @@ import {
   fitsResponseLimit,
   toolMaxResponseBytes,
 } from '../common/response-size-limit';
+import { ConnectorAuthStatusService } from '../connectors/engines/connector-auth-status.service';
+import { deriveResultHint } from './result-hints';
+import {
+  isOdooModelName,
+  odooFieldAdvice,
+  odooFieldsFromFieldsGet,
+  parseOdooInvalidField,
+  type OdooField,
+} from '../adapters/odoo-field-suggestions';
+import {
+  CREDENTIAL_REFUSED_CODE,
+  CredentialRefusalTracker,
+  REFUSALS_BEFORE_MARK,
+  STATIC_CREDENTIAL_AUTH_TYPES,
+  UNDECLARED_CREDENTIAL_AUTH_TYPES,
+  credentialRefusedMessage,
+  marksAt,
+} from '../connectors/engines/credential-refusal-tracker';
 
 /**
  * ToolExecutor — executes dynamically registered MCP tools.
@@ -110,9 +148,35 @@ import {
  * Each tool is mapped to a connector engine (REST, GraphQL, SOAP, etc.)
  * and executed with caching, audit logging, and env interpolation.
  */
+/**
+ * Above this many characters of compact JSON a tool result is rendered without
+ * indentation (renderResult). About 1 MB: far more than any answer a person
+ * reads, small enough that the event loop never pretty-prints megabytes.
+ */
+export const COMPACT_RENDER_CHARS = 1_000_000;
+
+/** How long a model's field list is reused for the Odoo "did you mean" hint. */
+const ODOO_FIELDS_TTL_MS = 10 * 60 * 1000;
+/** The field list must not hold up the error it explains. */
+const ODOO_FIELDS_TIMEOUT_MS = 8_000;
+/** Field lists kept at most; beyond that the cache starts over (memory bound). */
+const ODOO_FIELDS_CACHE_MAX = 500;
+
+/** Redis: refusals in a row of a connector's stored credential (credential-refusal-tracker.ts). */
+const REFUSAL_COUNT_KEY = 'cred_refused:';
+/** Refusals further apart than this are not "in a row". */
+const REFUSAL_COUNT_TTL_S = 14 * 24 * 60 * 60;
+/** Redis: an email about a connector's refused credential was sent. */
+const REFUSAL_EMAIL_KEY = 'cred_refused_mail:';
+const REFUSAL_EMAIL_PAUSE_S = 7 * 24 * 60 * 60;
+
 @Injectable()
 export class DynamicMcpTools {
   private readonly logger = new Logger(DynamicMcpTools.name);
+  /** Odoo field lists by connector (or user sign-in) and model, for odooModelFields. */
+  private readonly odooFieldLists = new Map<string, { at: number; fields: OdooField[] }>();
+  /** Repeated 401s on read tools, recorded as the connector's credential status. */
+  private readonly credentialRefusals = new CredentialRefusalTracker();
 
   constructor(
     private readonly toolRegistry: ToolRegistry,
@@ -134,6 +198,9 @@ export class DynamicMcpTools {
     @Optional() private readonly codeExecutor?: CodeExecutorService,
     @Optional() productEvents?: ProductEventService,
     @Optional() private readonly fileSearchEngine?: FileSearchEngine,
+    // Required by Nest (no @Optional); older manually built test fixtures may omit it.
+    @Inject(ToolRateLimitService) private readonly toolRateLimits?: ToolRateLimitService,
+    @Optional() private readonly authStatus?: ConnectorAuthStatusService,
   ) {
     this.blockedCalls = new TrialBlockedCallRecorder(prisma, productEvents);
   }
@@ -207,7 +274,7 @@ export class DynamicMcpTools {
    */
   private logToolCall(
     tool: RegisteredTool,
-    context: { organizationId?: string; mcpServerId?: string; authMethod?: string } | undefined,
+    context: { organizationId?: string; mcpServerId?: string; authMethod?: string; supportKeyId?: string } | undefined,
     durationMs: number,
     status: 'SUCCESS' | 'ERROR',
     renderedText?: string,
@@ -230,6 +297,8 @@ export class DynamicMcpTools {
       organizationId: context?.organizationId,
       mcpServerId: context?.mcpServerId,
       authMethod: context?.authMethod,
+      // The internal trace of an operator's support call (no workspace log row).
+      ...(context?.supportKeyId ? { supportKeyId: context.supportKeyId } : {}),
       durationMs,
       resultBytes,
       status,
@@ -284,6 +353,34 @@ export class DynamicMcpTools {
   }
 
   /**
+   * Cloud: what an ended trial tells the user before any tool call (the
+   * anythingmcp_list_connectors notice), with the same reactivation link a
+   * blocked call gives; null when the licence is active, on self-hosted, or
+   * when the licence cannot be read (the tools then answer for themselves).
+   */
+  /** Cloud: names of the connectors a plan change paused, or null (see LicenseGuardService). */
+  async pausedByPlanConnectorNames(organizationId: string | undefined): Promise<string[] | null> {
+    if (!this.deployment.isCloud() || !organizationId) return null;
+    return this.licenseGuard.pausedByPlanConnectorNames(organizationId).catch(() => null);
+  }
+
+  async trialEndedNotice(
+    organizationId: string | undefined,
+    userId?: string,
+  ): Promise<{ message: string; reactivateUrl: string } | null> {
+    if (!organizationId) return null;
+    try {
+      await this.licenseGuard.checkLicenseActive(organizationId);
+      return null;
+    } catch (err) {
+      if (!(err instanceof TrialEndedException)) return null;
+      const link = trialReactivationLink(organizationId, userId);
+      const result = trialEndedToolResult(err.trialEndedAt, link.url);
+      return { message: result.error, reactivateUrl: result.reactivateUrl };
+    }
+  }
+
+  /**
    * Execute a tool by name with the given parameters.
    * Handles caching, audit logging, env interpolation, and engine dispatch.
    */
@@ -296,6 +393,8 @@ export class DynamicMcpTools {
       organizationId?: string;
       authMethod?: string;
       apiKeyName?: string;
+      /** Set when the caller used an operator's support key (support-keys.ts). */
+      supportKeyId?: string;
       mcpServerId?: string;
       mcpServerName?: string;
       connectorIds?: string[];
@@ -334,6 +433,11 @@ export class DynamicMcpTools {
       // hand the AI the reactivation link to show. The blocked call is
       // recorded in the background; it never delays or breaks this answer.
       if (err instanceof TrialEndedException) {
+        // Half of the workspaces get the no-login reactivation page, half the
+        // pricing page (the reactivation-link test, license-checkout.ts).
+        const link = context?.organizationId
+          ? trialReactivationLink(context.organizationId, context.userId)
+          : { url: trialReactivationUrl(), variant: undefined };
         const blocked = this.resolveTool(toolName, context);
         if (blocked && context?.organizationId) {
           const slug = (blocked.connectorConfig?.config as { adapterSlug?: unknown } | undefined)?.adapterSlug;
@@ -343,10 +447,11 @@ export class DynamicMcpTools {
             toolName: blocked.name,
             adapterSlug: typeof slug === 'string' && slug ? slug : undefined,
             oauthClientId: context.oauthClientId,
+            variant: link.variant,
           });
         }
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify(trialEndedToolResult(err.trialEndedAt)) }],
+          content: [{ type: 'text' as const, text: JSON.stringify(trialEndedToolResult(err.trialEndedAt, link.url)) }],
           isError: true,
         };
       }
@@ -395,6 +500,25 @@ export class DynamicMcpTools {
         ],
         isError: true,
       };
+    }
+
+    // Apply to every invocation, including cache hits, code tools themselves
+    // and nested bridge calls. The limiter re-reads the caller's role policy;
+    // a definer-mode bridge's broader allowedToolIds must not bypass it.
+    if (this.toolRateLimits) {
+      try {
+        const refused = await this.toolRateLimits.check(tool, context);
+        if (refused) {
+          const result: { content: ToolResultContent; isError: true } = { content: [{ type: 'text', text: JSON.stringify(refused) }], isError: true };
+          await this.logRateLimited(tool, params, context, refused.error, result);
+          return result;
+        }
+      } catch {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: `Could not check rate limits for tool '${toolName}'. Please retry.` }) }],
+          isError: true,
+        };
+      }
     }
 
     // Code tools run a stored program in the out-of-process runner instead of
@@ -454,6 +578,13 @@ export class DynamicMcpTools {
     // An error message or an echoing API can quote them back (a URL with the
     // bot token in its path); they never reach the client or the log.
     const secretValues = this.connectorSecretValues(tool);
+    // The catalog adapter the connector was installed from: adapter-specific
+    // advice (result-hints.ts, error-hints.ts) is keyed on it.
+    const rawAdapterSlug = (tool.connectorConfig?.config as { adapterSlug?: unknown } | undefined)?.adapterSlug;
+    const adapterSlug = typeof rawAdapterSlug === 'string' && rawAdapterSlug ? rawAdapterSlug : undefined;
+    // Set once the request is built: reads a model's fields with this very
+    // connector and caller, for the "did you mean" of an unknown Odoo field.
+    let lookupOdooFields: ((model: string) => Promise<OdooField[] | undefined>) | undefined;
 
     try {
       const envVars = tool.connectorConfig.envVars || {};
@@ -465,6 +596,17 @@ export class DynamicMcpTools {
         ...envVars,
         ...buildCallerContextVars(context),
       };
+
+      // A DATABASE connector that declares table-name variables
+      // (config.sqlIdentifierVars) has them checked before they become SQL
+      // text below. Without the field this does nothing.
+      if (tool.connectorType === 'DATABASE') {
+        assertSafeSqlIdentifierVars(
+          tool.connectorConfig.config?.sqlIdentifierVars,
+          tool.endpointMapping?.path,
+          interpolationVars,
+        );
+      }
 
       // Interpolate {{VAR}} patterns in config and endpoint mapping
       const {
@@ -479,6 +621,17 @@ export class DynamicMcpTools {
         interpolationVars,
         { reservedPrefix: CALLER_CONTEXT_PREFIX },
       );
+
+      // A catalog tool's argument that does not match the pattern the tool
+      // declares for it is refused here, with the rule in words, instead of
+      // going to the vendor for a refusal of its own (catalog-patterns.ts).
+      const patternViolations = catalogPatternViolations(
+        (tool.connectorConfig.config as { adapterSlug?: string } | undefined)?.adapterSlug,
+        tool.name,
+        tool.parameters,
+        params,
+      );
+      if (patternViolations.length > 0) throw new ArgumentPatternError(patternViolations);
 
       // Decide proxy routing (env present + tool opted in + cloud rate-limit).
       // Throws on over-quota (choice B). Returns null → direct request.
@@ -528,11 +681,16 @@ export class DynamicMcpTools {
         envVars,
       );
 
+      const mcpFixedArguments =
+        tool.connectorType === 'MCP'
+          ? resolveMcpFixedArguments(tool.connectorConfig.config, envVars)
+          : undefined;
+
       const engineConfig = {
         baseUrl: interpolatedConfig.baseUrl,
         authType: tool.connectorConfig.authType,
         authConfig,
-        headers: interpolatedConfig.headers,
+        headers: withCatalogUserAgent(interpolatedConfig.headers, tool.connectorConfig.config),
         specUrl: (tool.connectorConfig as any).specUrl,
         // The engines key the OAuth2 token cache, the refresh lock and the
         // saving of a renewed token on the connector id. Without it every
@@ -545,9 +703,15 @@ export class DynamicMcpTools {
         connectorId: credentialKey ??
           (usesCallerContext(tool.connectorConfig.authConfig) ? undefined : tool.connectorId),
         errorWhen: connectorErrorWhen(tool.connectorConfig.config),
+        largeIntegers: connectorLargeIntegers(tool.connectorConfig.config),
         // Masked in the engines' log lines (a bot token in the URL path).
         logSecrets: secretValues,
+        // The connector's own workspace: an uploaded file (amcp-file:) only
+        // resolves for tools of the workspace that uploaded it.
+        organizationId: tool.organizationId,
         ...(proxyUrl ? { proxyUrl } : {}),
+        // Arguments an MCP bridge sends with every call (mcpFixedArguments).
+        ...(mcpFixedArguments ? { fixedArguments: mcpFixedArguments } : {}),
       };
 
       // An OAuth connector nobody has authorized carries a placeholder where
@@ -579,6 +743,13 @@ export class DynamicMcpTools {
         `the connector behind ${tool.name}`,
         connectorPageUrl(tool.connectorId),
       );
+      if (mcpFixedArguments) {
+        assertNoUnresolvedPlaceholders(
+          { body: mcpFixedArguments },
+          `the connector behind ${tool.name}`,
+          connectorPageUrl(tool.connectorId),
+        );
+      }
       // A base URL without https:// (a variable typed as `shop.example.com`
       // on an older install) would otherwise fail in the SSRF guard as
       // "invalid URL", naming neither the variable nor the fix.
@@ -603,7 +774,22 @@ export class DynamicMcpTools {
       );
 
       // Apply JSON Schema defaults for missing params
-      const mergedParams = this.applyDefaults(tool.parameters, paramsWithEnv);
+      // A parameter left out takes the variable the tool names for it
+      // (endpointMapping.envDefaults), before the schema's own defaults.
+      const mergedParams = this.applyDefaults(
+        tool.parameters,
+        applyEnvDefaults(tool.endpointMapping, paramsWithEnv, envVars),
+      );
+      // A required argument that the call left out and the connector variable
+      // meant to fill is empty (a Telegram send with no chat and no default
+      // chat) is refused here instead of going out empty.
+      const missingDefault = missingRequiredDefault(adapterSlug, tool.endpointMapping, mergedParams);
+      if (missingDefault) throw missingDefault;
+
+      if (adapterSlug === 'odoo' || adapterSlug === 'odoo-jsonrpc') {
+        lookupOdooFields = (model) =>
+          this.odooModelFields(tool, model, engineConfig, interpolationVars, credentialKey);
+      }
 
       processGauges.inc('toolCallsInFlight');
       let engineOut: Awaited<ReturnType<DynamicMcpTools['executeWithEngine']>>;
@@ -668,6 +854,8 @@ export class DynamicMcpTools {
           adapterSlug: mcpSlug,
           connectorPage: connectorPageUrl(tool.connectorId),
           cloud: this.deployment.isCloud(),
+          egressIps: egressIps(),
+          usedProxy,
         });
         const errorResult: { content: ToolResultContent; isError: true } = {
           content: [
@@ -683,6 +871,7 @@ export class DynamicMcpTools {
           toolId: tool.id,
           userId: context?.userId,
           userEmail: context?.userEmail,
+          supportKeyId: context?.supportKeyId,
           mcpServerId: context?.mcpServerId,
           organizationId: context?.organizationId,
           connectorId: tool.connectorId,
@@ -729,12 +918,15 @@ export class DynamicMcpTools {
         toolName,
         meta,
         tool.endpointMapping?.queryParams,
+        // A success that needs explaining (an empty Telegram read).
+        deriveResultHint({ adapterSlug, toolName: tool.name, args: params, result }),
       );
 
       await this.auditService.logInvocation({
         toolId: tool.id,
         userId: context?.userId,
         userEmail: context?.userEmail,
+        supportKeyId: context?.supportKeyId,
         mcpServerId: context?.mcpServerId,
         organizationId: context?.organizationId,
         connectorId: tool.connectorId,
@@ -765,6 +957,9 @@ export class DynamicMcpTools {
         this.logToolCall(tool, context, durationMs, 'ERROR');
         return rendered;
       }
+
+      // The credential works: a status recorded for repeated 401s is over.
+      this.noteCredentialAccepted(tool);
 
       // Grow the knowledge graph from this real call (debounced, fire-and-forget).
       void this.kgService.scheduleObservationalIngest(context?.organizationId);
@@ -810,8 +1005,6 @@ export class DynamicMcpTools {
       // for a refused credential, and the link to its page where the user
       // fixes it: a connector saved without a passing setup check otherwise
       // repeats the vendor's bare "API key not valid" on every call.
-      const rawSlug = (tool.connectorConfig?.config as { adapterSlug?: unknown } | undefined)?.adapterSlug;
-      const adapterSlug = typeof rawSlug === 'string' && rawSlug ? rawSlug : undefined;
       const message = typeof error?.message === 'string' ? error.message : undefined;
       let hint = engineHint ?? deriveErrorHint({
         host:
@@ -824,6 +1017,9 @@ export class DynamicMcpTools {
         verifyHints: adapterSlug ? getAdapter(adapterSlug)?.verifyHints : undefined,
         connectorPage: connectorPageUrl(tool.connectorId),
         cloud: this.deployment.isCloud(),
+        egressIps: egressIps(),
+        usedProxy,
+        args: params,
       });
       // Odoo JSON-2 "No database is selected": ask Odoo which databases this
       // address serves and name them, as the setup check does. One small
@@ -836,12 +1032,36 @@ export class DynamicMcpTools {
         ).catch(() => undefined);
         if (advice) hint = `${advice} ${hint}`;
       }
+      // Odoo "Invalid field": name the fields of that model that are close
+      // to the one asked for, instead of sending the assistant to list them
+      // all first. One extra read of the model's field list, cached; the
+      // general hint stays when it fails or says nothing.
+      if (hint === ODOO_FIELD_HINT && lookupOdooFields) {
+        const refused = parseOdooInvalidField(`${message ?? ''}\n${bodyText(errorDetail.responseBody)}`);
+        const model = refused?.model ?? params.model;
+        if (refused && isOdooModelName(model)) {
+          const fields = await lookupOdooFields(model).catch(() => undefined);
+          const advice = fields ? odooFieldAdvice(refused.field, model, fields) : undefined;
+          if (advice) hint = advice;
+        }
+      }
       if (hint) errorDetail.hint = hint;
+
+      // A stored key refused again and again: the dashboard and
+      // setup_get_status show it, and the owner of a connector that used to
+      // work is emailed (credential-refusal-tracker.ts).
+      this.noteCredentialRefused(
+        tool,
+        typeof errorDetail.status === 'number' ? errorDetail.status : undefined,
+        hint,
+        adapterSlug,
+      );
 
       await this.auditService.logInvocation({
         toolId: tool.id,
         userId: context?.userId,
         userEmail: context?.userEmail,
+        supportKeyId: context?.supportKeyId,
         mcpServerId: context?.mcpServerId,
         organizationId: context?.organizationId,
         connectorId: tool.connectorId,
@@ -869,6 +1089,190 @@ export class DynamicMcpTools {
         ],
         isError: true,
       };
+    }
+  }
+
+  /**
+   * Whether a refused call on this tool says something about the connector's
+   * own stored credential: a read tool, a key stored on the connector (not a
+   * user's own sign-in, not one built from the caller, not an OAuth2 or
+   * login flow, which record their refusals themselves). A connector without
+   * a declared auth type keeps its key in the URL or the body (a Telegram bot
+   * token, an Odoo JSON-RPC key): it counts only for an answer the error
+   * hints know as a refused key (`knownKeyRefusal`).
+   */
+  private tracksStoredCredential(tool: RegisteredTool, knownKeyRefusal = false): boolean {
+    const cfg = tool.connectorConfig;
+    if (!this.authStatus || !cfg || cfg.credentialScope === 'USER') return false;
+    const authType = String(cfg.authType);
+    if (!STATIC_CREDENTIAL_AUTH_TYPES.has(authType)) {
+      if (!(knownKeyRefusal && UNDECLARED_CREDENTIAL_AUTH_TYPES.has(authType))) return false;
+    }
+    if (usesCallerContext(cfg.authConfig)) return false;
+    return (
+      deriveToolAnnotations({
+        name: tool.name,
+        connectorType: tool.connectorType,
+        endpointMapping: tool.endpointMapping as { method?: string; path?: string },
+        connectorConfig: { config: cfg.config ?? null },
+        annotations: tool.annotations,
+      }).readOnlyHint === true
+    );
+  }
+
+  /**
+   * A failed call. When it is a refused credential on a read tool, it is
+   * counted; at the threshold the connector's credential status is recorded,
+   * and the owner is emailed when the connector worked before.
+   */
+  private noteCredentialRefused(
+    tool: RegisteredTool,
+    status: number | undefined,
+    hint: string | undefined,
+    adapterSlug: string | undefined,
+  ): void {
+    const knownKeyRefusal = isRefusedKeyHint(hint);
+    if (status !== 401 && !knownKeyRefusal) return;
+    // The credential works but lacks a scope: a new key would not help.
+    if (isMissingScopeHint(hint)) return;
+    if (!this.tracksStoredCredential(tool, knownKeyRefusal)) return;
+    const seenHere = this.credentialRefusals.refused(tool.connectorId);
+    const authStatus = this.authStatus!;
+    void (async () => {
+      const count = Math.max(seenHere, await this.sharedRefusalCount(tool.connectorId));
+      if (count < REFUSALS_BEFORE_MARK) return;
+      // Never over a status another service recorded (a revoked sign-in, a logged-out session).
+      const current = await authStatus.get(tool.connectorId);
+      if (current && current.code !== CREDENTIAL_REFUSED_CODE) return;
+      // Already recorded: only its count is brought up to date now and then.
+      // Not recorded although past the threshold: an edit cleared it without
+      // fixing the key, so the very next refusal says so again.
+      if (current && !marksAt(count)) return;
+      // What the owner reads: the adapter's own advice from its setup check
+      // when it has one, else the hint of this call.
+      const own = adapterSlug ? getAdapter(adapterSlug)?.verifyHints : undefined;
+      const ownAdvice = (status !== undefined ? own?.[String(status)] : undefined) ?? own?.auth_failed;
+      const advice = (typeof ownAdvice === 'string' ? ownAdvice : ownAdvice?.hint) ?? hint;
+      await authStatus.mark(
+        tool.connectorId,
+        {
+          status: 'needs_reauth',
+          code: CREDENTIAL_REFUSED_CODE,
+          message: credentialRefusedMessage(count, advice, status === 401 ? status : undefined),
+        },
+        { notify: current ? false : await this.emailsRefusedCredential(tool.connectorId) },
+      );
+    })().catch((err) =>
+      this.logger.warn(`Could not record refused credentials for connector ${tool.connectorId}: ${err?.message ?? err}`),
+    );
+  }
+
+  /**
+   * The refusals in a row counted across restarts and processes (Redis), this
+   * one included. 0 without Redis: the caller then uses its own count.
+   */
+  private async sharedRefusalCount(connectorId: string): Promise<number> {
+    try {
+      const key = `${REFUSAL_COUNT_KEY}${connectorId}`;
+      const count = await this.redisService.incr(key);
+      if (!Number.isFinite(count) || count <= 0) return 0;
+      if (count === 1) await this.redisService.expire(key, REFUSAL_COUNT_TTL_S);
+      return count;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Whether the owner gets the email for this incident. Only for a connector
+   * that has worked: its owner is not looking at it. One that never worked is
+   * still being set up, and the chat and the dashboard already say why. At
+   * most one email per connector in REFUSAL_EMAIL_PAUSE_S, for a key that
+   * works on and off.
+   */
+  private async emailsRefusedCredential(connectorId: string): Promise<boolean> {
+    try {
+      const worked = await this.prisma.toolInvocation.findFirst({
+        where: { connectorId, status: 'SUCCESS' },
+        select: { id: true },
+      });
+      if (!worked) return false;
+      const key = `${REFUSAL_EMAIL_KEY}${connectorId}`;
+      if (await this.redisService.get(key)) return false;
+      await this.redisService.set(key, '1', REFUSAL_EMAIL_PAUSE_S);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** A call that worked: clear a status recorded for repeated refusals (once per connector and process otherwise). */
+  private noteCredentialAccepted(tool: RegisteredTool): void {
+    if (!this.authStatus || !tool.connectorConfig || tool.connectorConfig.credentialScope === 'USER') return;
+    const authType = String(tool.connectorConfig.authType);
+    if (!STATIC_CREDENTIAL_AUTH_TYPES.has(authType) && !UNDECLARED_CREDENTIAL_AUTH_TYPES.has(authType)) return;
+    if (!this.credentialRefusals.succeeded(tool.connectorId)) return;
+    void this.redisService.del(`${REFUSAL_COUNT_KEY}${tool.connectorId}`).catch(() => undefined);
+    void this.authStatus.clear(tool.connectorId, { onlyCodes: [CREDENTIAL_REFUSED_CODE] });
+  }
+
+  /**
+   * The fields of an Odoo model, read with the connector's own
+   * `odoo_fields_get` tool and the credentials of the failed call (so a
+   * user's own sign-in sees what that user may see). Asked only after Odoo
+   * refused a field name, kept for ten minutes, and never logged as a call
+   * of the customer. `undefined` when the connector has no such tool, the
+   * read fails or takes too long: the caller then keeps its general hint.
+   */
+  private async odooModelFields(
+    tool: RegisteredTool,
+    model: string,
+    engineConfig: Record<string, unknown>,
+    interpolationVars: Record<string, string>,
+    credentialKey: string | undefined,
+  ): Promise<OdooField[] | undefined> {
+    const key = `${credentialKey ?? tool.connectorId}:${model}`;
+    const known = this.odooFieldLists.get(key);
+    if (known && Date.now() - known.at < ODOO_FIELDS_TTL_MS) return known.fields;
+
+    const fieldsTool = this.toolRegistry
+      .getToolsForConnectors?.([tool.connectorId])
+      .find((t) => t.name === 'odoo_fields_get');
+    if (!fieldsTool) return undefined;
+
+    const { endpointMapping } = interpolateConnectorConfig(
+      { baseUrl: tool.connectorConfig.baseUrl, headers: tool.connectorConfig.headers },
+      fieldsTool.endpointMapping,
+      interpolationVars,
+      { reservedPrefix: CALLER_CONTEXT_PREFIX },
+    );
+    const call = this.executeWithEngine(
+      fieldsTool.connectorType,
+      engineConfig,
+      endpointMapping,
+      this.applyDefaults(fieldsTool.parameters, { model, attributes: ['string', 'type'] }),
+      {
+        connectorConfig: tool.connectorConfig.config,
+        connectorId: tool.connectorId,
+        organizationId: tool.organizationId,
+      },
+    );
+    // Abandoned after the timeout: its late failure is nobody's error.
+    call.catch(() => undefined);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tooSlow = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Odoo field list timed out')), ODOO_FIELDS_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    try {
+      const { body } = await Promise.race([call, tooSlow]);
+      const fields = odooFieldsFromFieldsGet(body);
+      if (fields.length === 0) return undefined;
+      if (this.odooFieldLists.size >= ODOO_FIELDS_CACHE_MAX) this.odooFieldLists.clear();
+      this.odooFieldLists.set(key, { at: Date.now(), fields });
+      return fields;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -904,6 +1308,8 @@ export class DynamicMcpTools {
     toolName: string,
     meta?: ResponseMeta,
     queryParams?: Record<string, unknown>,
+    /** Advice for this very answer (result-hints.ts), after the tool's own followUp. */
+    resultHint?: string,
   ): {
     result: {
       content: ToolResultContent;
@@ -954,18 +1360,33 @@ export class DynamicMcpTools {
       ? attachResponseMeta(outcome.value, meta, queryParams)
       : outcome.value;
 
-    const hint = responseMapping?.followUp
-      ? `\n\n---\nWORKFLOW HINT (guidance for the assistant, not part of the API response): ${responseMapping.followUp}`
+    const guidance = [responseMapping?.followUp, resultHint].filter(
+      (part): part is string => typeof part === 'string' && part.length > 0,
+    );
+    const hint = guidance.length
+      ? `\n\n---\nWORKFLOW HINT (guidance for the assistant, not part of the API response): ${guidance.join(' ')}`
       : '';
-    let resultText = (JSON.stringify(value, null, 2) ?? 'null') + hint;
+    // A large result is rendered compactly from the start: indenting a
+    // multi-megabyte object (a page of 100 full WooCommerce orders) more than
+    // doubles its text and costs a second full serialization on the event
+    // loop, for a reader (the model) that does not need the whitespace.
+    // Small results keep the readable indented form.
+    // Only an object or an array has indentation; anything else serializes to
+    // the same text either way, so it is serialized once.
+    const isObject = value !== null && typeof value === 'object';
+    const compact = JSON.stringify(value) ?? 'null';
+    let resultText =
+      (isObject && compact.length <= COMPACT_RENDER_CHARS
+        ? (JSON.stringify(value, null, 2) ?? 'null')
+        : compact) + hint;
 
     const limitBytes = toolMaxResponseBytes();
     if (!fitsResponseLimit(resultText, limitBytes)) {
       // Indentation can make up much of a large text. Only an object or an
       // array has any: anything else would serialize to the same text again.
       const prettyChars = resultText.length;
-      if (value !== null && typeof value === 'object') {
-        resultText = (JSON.stringify(value) ?? 'null') + hint;
+      if (isObject) {
+        resultText = compact + hint;
       }
       if (!fitsResponseLimit(resultText, limitBytes)) {
         const tooLarge = new ResponseTooLargeError(limitBytes, { source: 'result' });
@@ -1058,6 +1479,51 @@ export class DynamicMcpTools {
    * bare axios message ("Request failed with status code 400") hides. Keeping it
    * in the audit log makes failures diagnosable without re-running the call.
    */
+  /**
+   * A call refused by a per-tool rate limit is recorded like any failed call,
+   * so administrators see it under Logs and in GET /api/audit/invocations
+   * (status ERROR, error "Rate limit reached: ..."). The upstream system is
+   * never called. A failure to write the log never changes the refusal.
+   *
+   * No connectorId on purpose: connector health, the failure alerts and the
+   * support desk's connector_issues group errors by connector, and a refusal
+   * we made ourselves says nothing about the connector.
+   */
+  private async logRateLimited(
+    tool: RegisteredTool,
+    params: Record<string, unknown>,
+    context: { userId?: string; userEmail?: string; organizationId?: string; mcpServerId?: string; mcpServerName?: string; authMethod?: string; apiKeyName?: string; supportKeyId?: string; intent?: string; learnable?: boolean } | undefined,
+    message: string,
+    output: { content: ToolResultContent; isError: true },
+  ): Promise<void> {
+    try {
+      await this.auditService.logInvocation({
+        toolId: tool.id,
+        userId: context?.userId,
+        userEmail: context?.userEmail,
+        supportKeyId: context?.supportKeyId,
+        mcpServerId: context?.mcpServerId,
+        organizationId: context?.organizationId,
+        usedProxy: false,
+        intent: context?.intent,
+        learnable: false,
+        input: params,
+        output,
+        status: 'ERROR',
+        durationMs: 0,
+        error: `Rate limit reached: ${message}`,
+        clientInfo: context ? JSON.stringify({
+          authMethod: context.authMethod,
+          apiKeyName: context.apiKeyName,
+          userEmail: context.userEmail,
+          mcpServerName: context.mcpServerName,
+        }) : undefined,
+      });
+    } catch (err: any) {
+      this.logger.warn(`Could not log a rate-limited call of ${tool.name}: ${err?.message ?? err}`);
+    }
+  }
+
   private formatStoredError(detail: Record<string, unknown>): string {
     const parts: string[] = [];
     const head = detail.status
@@ -1097,6 +1563,8 @@ export class DynamicMcpTools {
         'x-ratelimit-reset',
         'www-authenticate',
         'content-type',
+        // Intuit's per-request correlation id, which its support asks for.
+        'intuit_tid',
       ];
       for (const key of headerKeys) {
         const value = res.headers?.[key];
@@ -1200,19 +1668,27 @@ export class DynamicMcpTools {
           ? []
           : null;
 
-    const deps = this.codeBridgeDeps(usesConnectorIds, allowedToolIds, context);
+    const deps = this.codeBridgeDeps(usesConnectorIds, allowedToolIds, context, spec.runAs === 'invoker');
     const bridge = buildCodeBridge(spec, deps);
     // The program receives its tool arguments as `args` via a wrapper the runner
     // does not add, so expose them through a declared variable: prepend a const.
     const program = `const args = ${JSON.stringify(params ?? {})};\n${spec.code}`;
 
-    const result = await this.codeExecutor.run({ code: program, bridge });
+    const lease = await this.acquireCodeRunLease(tool.organizationId);
+    if (!lease.allowed) return fail(lease.reason ?? 'Code run quota exceeded.', 'QuotaExceeded');
+    let result: Awaited<ReturnType<CodeExecutorService['run']>>;
+    try {
+      result = await this.codeExecutor.run({ code: program, bridge });
+    } finally {
+      await lease.release();
+    }
     const durationMs = Date.now() - startTime;
 
     // One code_runs row for the run itself (retention/quotas); the inner tool
     // calls keep their own tool_invocations rows. Best-effort: a failed audit
     // write must never fail the run. Uses the tool's own org, always present.
-    void this.prisma.codeRun
+    // A support key's run is not the workspace's (see support-keys.ts).
+    if (!context?.supportKeyId) void this.prisma.codeRun
       .create({
         data: {
           organizationId: tool.organizationId,
@@ -1233,6 +1709,7 @@ export class DynamicMcpTools {
       toolId: tool.id,
       userId: context?.userId,
       userEmail: context?.userEmail,
+      supportKeyId: context?.supportKeyId,
       mcpServerId: context?.mcpServerId,
       organizationId: context?.organizationId,
       connectorId: tool.connectorId,
@@ -1309,6 +1786,82 @@ export class DynamicMcpTools {
     return this.licenseGuard.canUseInlineCode(organizationId);
   }
 
+  /**
+   * Admit one code run against this workspace's Cloud quotas, or refuse it.
+   * Two limits: a monthly run cap (counted authoritatively from `code_runs`)
+   * and a per-org concurrency cap (best-effort via Redis, to protect the shared
+   * runner). Cloud only — self-hosted is single-tenant and not metered, so this
+   * is a no-op there and whenever there is no organization to count against.
+   * Returns a lease whose `release()` the caller MUST invoke when the run ends.
+   */
+  private async acquireCodeRunLease(
+    organizationId?: string,
+  ): Promise<{ allowed: boolean; reason?: string; release: () => Promise<void> }> {
+    const noRelease = async () => {};
+    if (!this.deployment.isCloud() || !organizationId) {
+      return { allowed: true, release: noRelease };
+    }
+
+    const plan = await this.licenseGuard.codeRunPlanForOrg(organizationId);
+
+    // 1. Monthly run cap — authoritative from the audit table, so it holds even
+    //    when Redis is down. The current run has no row yet, so `used` counts
+    //    only runs already finished this month.
+    const monthly = monthlyCodeRunCapForPlan(plan);
+    if (monthly != null) {
+      const used = await this.prisma.codeRun
+        .count({ where: { organizationId, createdAt: { gte: startOfUtcMonth() } } })
+        .catch((e) => {
+          this.logger.warn(`code run quota count failed: ${e?.message ?? e}`);
+          return 0;
+        });
+      if (used >= monthly) {
+        return {
+          allowed: false,
+          reason:
+            plan === 'trial'
+              ? `Monthly code run limit reached (${monthly} runs during a trial without a card). Add a payment card to the trial under Settings → License to raise it to ${monthlyCodeRunCapForPlan('team')?.toLocaleString('en')} runs.`
+              : `Monthly code run limit reached (${monthly} runs on the ${plan} plan this month). It resets at the start of next month; upgrade the plan for more.`,
+          release: noRelease,
+        };
+      }
+    }
+
+    // 2. Concurrency cap — best-effort. Without Redis there is no shared counter,
+    //    so skip it rather than guess (the monthly cap still applies).
+    const concurrent = concurrentCodeRunCapForPlan(plan);
+    if (concurrent != null && this.redisService.isConnected) {
+      const key = `coderun:inflight:${organizationId}`;
+      const n = await this.redisService.incr(key);
+      // Safety TTL: a run is bounded to well under this, so the counter can
+      // never stick if a release is lost (crash, redeploy mid-run).
+      await this.redisService.expire(key, 120);
+      if (n > concurrent) {
+        await this.releaseInflight(key);
+        return {
+          allowed: false,
+          reason: `Too many code runs at once (limit ${concurrent} concurrent on the ${plan} plan). Wait for a run to finish and retry.`,
+          release: noRelease,
+        };
+      }
+      return { allowed: true, release: () => this.releaseInflight(key) };
+    }
+
+    return { allowed: true, release: noRelease };
+  }
+
+  /** Decrement an in-flight counter, clearing it if it would go negative. */
+  private async releaseInflight(key: string): Promise<void> {
+    const client = this.redisService.getClient();
+    if (!client) return;
+    try {
+      const v = await client.decr(key);
+      if (v < 0) await client.del(key);
+    } catch (e: any) {
+      this.logger.warn(`code run quota release failed: ${e?.message ?? e}`);
+    }
+  }
+
   async executeInlineCode(
     code: string,
     context: CodeExecContext,
@@ -1332,11 +1885,18 @@ export class DynamicMcpTools {
       runAs: 'invoker' as const,
       allowWrites: false,
     };
-    const deps = this.codeBridgeDeps(opts.connectorIds, opts.allowedToolIds, context);
+    const deps = this.codeBridgeDeps(opts.connectorIds, opts.allowedToolIds, context, true);
     const bridge = buildCodeBridge(spec, deps);
     const program = `const args = {};\n${code}`;
 
-    const result = await this.codeExecutor.run({ code: program, bridge });
+    const lease = await this.acquireCodeRunLease(context.organizationId);
+    if (!lease.allowed) return fail(lease.reason ?? 'Code run quota exceeded.', 'QuotaExceeded');
+    let result: Awaited<ReturnType<CodeExecutorService['run']>>;
+    try {
+      result = await this.codeExecutor.run({ code: program, bridge });
+    } finally {
+      await lease.release();
+    }
     const durationMs = Date.now() - startTime;
 
     if (context.organizationId) {
@@ -1366,12 +1926,20 @@ export class DynamicMcpTools {
    * licence, tenant scope and audit apply, with inCodeRun set), and search /
    * describe over the same set. The access rules (uses, read/write, role) are
    * applied by buildCodeBridge around these, per the spec.
+   *
+   * `searchWithinRole`: with invoker rights the search names only the tools
+   * the caller's role allows, as `run` and `describe` accept only those. A
+   * connector is in reach with one allowed tool, so without this a member
+   * read the names and descriptions of every other tool on it. With definer
+   * rights the author's `uses` decides, as for the calls.
    */
   private codeBridgeDeps(
     usesConnectorIds: string[],
     allowedToolIds: string[] | null,
-    context?: CodeExecContext,
+    context: CodeExecContext | undefined,
+    searchWithinRole: boolean,
   ): CodeBridgeDeps {
+    const searchable = searchWithinRole && allowedToolIds !== null ? new Set(allowedToolIds) : null;
     const toBridgeTool = (t: RegisteredTool): BridgeResolvedTool => ({
       id: t.id,
       name: t.name,
@@ -1418,6 +1986,7 @@ export class DynamicMcpTools {
         for (const connectorId of usesConnectorIds) {
           for (const t of this.toolRegistry.getAllTools()) {
             if (t.connectorId !== connectorId || isCodeMethod(t.endpointMapping)) continue;
+            if (searchable && !searchable.has(t.id)) continue;
             if (seen.has(t.name)) continue;
             const hay = `${t.name} ${t.description ?? ''}`.toLowerCase();
             if (q && !hay.includes(q)) continue;

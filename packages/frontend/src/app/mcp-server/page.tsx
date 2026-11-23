@@ -4,7 +4,9 @@ import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useTranslations } from 'next-intl';
 import { useAuth } from '@/lib/auth-context';
-import { mcpServers } from '@/lib/api';
+import { mcpServers, planLimitOf, type PlanLimitError } from '@/lib/api';
+import { pausedByPlanSets, usePlanUsage } from '@/lib/use-plan-fit';
+import { PausedByPlanBadge, PlanLimitNotice } from '@/components/plan-swap-dialog';
 import { AppShell } from '@/components/app-shell';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -13,11 +15,16 @@ import { AppSelect } from '@/components/ui/select';
 import { isTrialLimitMessage, TrialLimitNotice } from '@/lib/trial-limit';
 import { copyText } from '@/lib/clipboard';
 import { timeAgo, type TimeAgoTranslate } from '@/components/connection-check';
+import { useMemberVisibility } from '@/lib/use-member-visibility';
 
 export default function McpServerListPage() {
-  const { token } = useAuth();
+  const { token, user } = useAuth();
   const router = useRouter();
   const t = useTranslations('mcpServers');
+  // A VIEWER cannot create a server (the API answers 403), so the page does not offer it.
+  const canCreate = user?.role !== 'VIEWER';
+  // Restricted member visibility: an empty list means nothing was shared yet.
+  const { restrictedForMe } = useMemberVisibility();
   const tAgo = useTranslations('timeAgo');
   const [servers, setServers] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -29,6 +36,10 @@ export default function McpServerListPage() {
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  // A create refused at the plan's limit (Cloud): "Pause one or upgrade".
+  const [createLimit, setCreateLimit] = useState<PlanLimitError | null>(null);
+  const { usage, reload: reloadUsage } = usePlanUsage();
+  const pausedByPlan = pausedByPlanSets(usage).mcpServers;
 
   useEffect(() => {
     if (!token) return;
@@ -39,6 +50,7 @@ export default function McpServerListPage() {
     if (!token || !newName.trim()) return;
     setCreating(true);
     setCreateError('');
+    setCreateLimit(null);
     try {
       const server = await mcpServers.create(
         { name: newName.trim(), description: newDescription.trim() || undefined },
@@ -51,6 +63,7 @@ export default function McpServerListPage() {
       router.push(`/mcp-server/${server.id}`);
     } catch (err: any) {
       // Used to be swallowed: a failed create left the button doing nothing.
+      setCreateLimit(planLimitOf(err));
       setCreateError(err?.message || t('createError'));
     } finally {
       setCreating(false);
@@ -77,15 +90,17 @@ export default function McpServerListPage() {
     <AppShell
       title={t('title')}
       actions={
-        <Button onClick={() => setShowCreate(true)}>
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
-          {t('new')}
-        </Button>
+        canCreate ? (
+          <Button onClick={() => setShowCreate(true)}>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
+            {t('new')}
+          </Button>
+        ) : undefined
       }
     >
       <div className="flex flex-col gap-[18px]">
         {/* Create dialog */}
-        {showCreate && (
+        {showCreate && canCreate && (
           <Card className="border-[var(--brand)] p-6">
             <h3 className="mb-4 text-base font-semibold tracking-[-0.01em]">{t('createTitle')}</h3>
             <div className="max-w-md space-y-3">
@@ -110,7 +125,15 @@ export default function McpServerListPage() {
                   className="w-full rounded-[9px] border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)] outline-none focus:border-[var(--brand)]"
                 />
               </div>
-              {createError && isTrialLimitMessage(createError) ? (
+              {createLimit ? (
+                <PlanLimitNotice
+                  limit={createLimit}
+                  onFreed={() => {
+                    mcpServers.list(token!).then(setServers).catch(() => {});
+                    reloadUsage();
+                  }}
+                />
+              ) : createError && isTrialLimitMessage(createError) ? (
                 <TrialLimitNotice message={createError} />
               ) : createError ? (
                 <div className="rounded-md border border-[var(--destructive-border)] bg-[var(--destructive-bg)] p-2.5 text-sm text-[var(--destructive-text)]">
@@ -175,8 +198,12 @@ export default function McpServerListPage() {
             <span className="flex h-12 w-12 items-center justify-center rounded-[12px]" style={{ background: 'var(--t-emerald-bg)', color: 'var(--t-emerald-fg)' }}>
               <ServerIcon />
             </span>
-            <p className="text-sm text-[var(--text-3)]">{t('empty')}</p>
-            <Button onClick={() => setShowCreate(true)}>{t('createFirst')}</Button>
+            {restrictedForMe ? (
+              <p className="text-sm text-[var(--text-3)]" data-testid="nothing-shared">{t('nothingShared')}</p>
+            ) : (
+              <p className="text-sm text-[var(--text-3)]">{t('empty')}</p>
+            )}
+            {canCreate && <Button onClick={() => setShowCreate(true)}>{t('createFirst')}</Button>}
           </Card>
         ) : filtered.length === 0 ? (
           <Card className="px-6 py-12 text-center">
@@ -212,13 +239,17 @@ export default function McpServerListPage() {
                         </div>
                       </div>
                     </div>
-                    <StatusPill
-                      tone={active ? 'success' : 'danger'}
-                      dot={active ? 'var(--ok)' : 'var(--danger)'}
-                      className="flex-shrink-0"
-                    >
-                      {active ? t('active') : t('inactive')}
-                    </StatusPill>
+                    {!active && pausedByPlan.has(s.id) ? (
+                      <PausedByPlanBadge className="flex-shrink-0" />
+                    ) : (
+                      <StatusPill
+                        tone={active ? 'success' : 'danger'}
+                        dot={active ? 'var(--ok)' : 'var(--danger)'}
+                        className="flex-shrink-0"
+                      >
+                        {active ? t('active') : t('inactive')}
+                      </StatusPill>
+                    )}
                   </div>
 
                   {s.description && (

@@ -1,6 +1,6 @@
 # AnythingMCP
 
-> Turn any REST/OpenAPI, SOAP/WSDL, GraphQL, OData or SQL API into MCP tools for Claude, ChatGPT and Copilot, no code. 694 pre-built adapters for ERP, e-commerce and more (SAP S/4HANA, SAP Business One, Odoo, Xentral, JTL-Wawi, Shopware, WooCommerce, Amazon Seller). Self-hosted, open source (AGPL-3.0).
+> Turn any REST/OpenAPI, SOAP/WSDL, GraphQL, OData or SQL API into MCP tools for Claude, ChatGPT and Copilot, no code. 958 pre-built adapters for ERP, e-commerce and more (SAP S/4HANA, SAP Business One, Odoo, Xentral, JTL-Wawi, Shopware, WooCommerce, Amazon Seller). Self-hosted, open source (AGPL-3.0).
 
 ## Getting started
 
@@ -13,8 +13,10 @@
 - [SQL database to MCP](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/connectors/database.md): AnythingMCP lets Claude, ChatGPT and Copilot query PostgreSQL, MySQL, MariaDB, Microsoft SQL Server, Oracle, SAP HANA, SQLite and MongoDB through MCP,...
 - [Email (IMAP/SMTP) to MCP](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/connectors/email.md): An Email connector gives Claude, ChatGPT and Copilot a mailbox through MCP: IMAP to read, search and organise mail, SMTP to send it.
 - [File Search and File Share](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/connectors/file-search.md): Search inside the documents of SFTP, FTP/FTPS, WebDAV, S3 and network folders from AI clients, with File Share download links, plan limits and pauses.
+- [File uploads from AI clients](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/connectors/file-uploads.md): Many connector tools send a file to the app: a listing photo or a digital download on Etsy, a product image on a marketplace, a document to sign.
 - [GraphQL to MCP](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/connectors/graphql.md): AnythingMCP turns any GraphQL API into MCP tools for Claude, ChatGPT and Copilot without code.
 - [LOGIN_TOKEN Authentication](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/connectors/login-token-auth.md): Build connectors that exchange credentials for cached bearer tokens with automatic refresh and re-login.
+- [Loom (agent memory)](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/connectors/loom.md): The Loom catalog preset connects AnythingMCP to your own Loom deployment through the existing MCP bridge.
 - [MCP Bridge Connector — MCP-to-MCP Gateway](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/connectors/mcp-bridge.md): The MCP Bridge connector lets you connect to other MCP servers and re-expose their tools through AnythingMCP.
 - [OData to MCP](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/connectors/odata.md): AnythingMCP connects Claude, ChatGPT and Copilot to OData V2 and V4 services through MCP, with SAP Gateway (S/4HANA, ECC, BW) as a first-class case.
 - [Per-user sign-in for OAuth2 connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/connectors/per-user-sign-in.md): By default an OAuth2 connector is authorized once: whoever clicks "Authorize with Provider" signs in, and every user of the workspace then calls the...
@@ -37,6 +39,7 @@
 - [Operations](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/operations/README.md): Documents that exist for the people running AnythingMCP in production rather than the people building it.
 - [Backup & restore](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/operations/backup-restore.md): AnythingMCP stores all state in PostgreSQL.
 - [Disaster recovery](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/operations/disaster-recovery.md): Targets we hold ourselves to for AnythingMCP-the-managed-product.
+- [Member visibility](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/operations/member-visibility.md): Limit what members who are not admins see in the dashboard and the API to their own calls and what their MCP roles reach.
 - [Observability](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/operations/observability.md): Configure structured logging, Sentry error reporting, and Prometheus metrics for your deployment.
 - [Row-Level Security (defense-in-depth tenant isolation)](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/operations/row-level-security.md): AnythingMCP isolates tenants at the application layer today: every org-scoped query carries an explicit where: { organizationId }, and the MCP endpoints are...
 - [Service level objectives](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/operations/slo.md): These are the SLOs we commit to for the managed AnythingMCP cloud.
@@ -44,6 +47,8 @@
 - [SCIM provisioning with Microsoft Entra ID — step by step](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/scim-entra-setup.md): Click-by-click setup for automatic user and group provisioning from Entra ID into AnythingMCP.
 - [Code mode](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/code-mode.md): Run isolated JavaScript that orchestrates several MCP tools in one step: saved code tools, inline code_execute, governance and deployment.
 - [License FAQ](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/license-faq.md): Understand the AGPL license, the commercial EE boundary, and contributor licensing.
+- [Invoices on AnythingMCP Cloud](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/cloud-invoices.md): Find your AnythingMCP Cloud invoices and have each paid invoice emailed as a PDF, from the dashboard or the CLI.
+- [Cloud plan limits](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/cloud-plans.md): What each AnythingMCP Cloud plan includes (connectors, servers, users, File Search, code mode) and what happens above a plan's limits.
 
 ## Reference
 
@@ -51,6 +56,7 @@
 - [MCP resources](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/mcp-resources.md): Besides tools, every per-server MCP endpoint (/mcp/<serverId>) serves resources: read-only text a client can attach to the model's context (resources/list,...
 - [Knowledge Graph & AI skills](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/knowledge-graph.md): The Knowledge Graph turns the connectors in a workspace into a queryable map of entities (customers, orders, products, …) and the relationships between them...
 - [Workspace memory](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/memory.md): Workspace memory lets AI clients save facts, preferences and notes and find them again later, in any client connected to an MCP server of the workspace...
+- [Learning projects](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/learning-projects.md): A learning project keeps what one colleague teaches the AI.
 
 ## Contributing
 
@@ -59,6 +65,52 @@
 
 ## Optional
 
+- [AnythingMCP connector catalog](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/README.md): 704 ready connectors with 13,037 MCP tools, in 45 categories.
+- [Accounting MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/accounting.md): 38 accounting connectors for AnythingMCP.
+- [Advertising MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/advertising.md): 10 advertising connectors for AnythingMCP.
+- [Analytics MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/analytics.md): 25 analytics connectors for AnythingMCP.
+- [Banking MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/banking.md): 5 banking connectors for AnythingMCP.
+- [CMS MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/cms.md): 8 CMS connectors for AnythingMCP.
+- [Construction MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/construction.md): 2 construction connectors for AnythingMCP.
+- [CRM MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/crm.md): 38 CRM connectors for AnythingMCP.
+- [Public Data MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/data.md): 45 public data connectors for AnythingMCP.
+- [Databases MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/database.md): 18 databases connectors for AnythingMCP.
+- [Document Management MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/dms.md): 3 document management connectors for AnythingMCP.
+- [E-commerce MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/e-commerce.md): 67 e-commerce connectors for AnythingMCP.
+- [E-Signature MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/e-signature.md): 10 e-signature connectors for AnythingMCP.
+- [Email MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/email.md): 14 email connectors for AnythingMCP.
+- [Data Enrichment MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/enrichment.md): 14 data enrichment connectors for AnythingMCP.
+- [ERP MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/erp.md): 23 ERP connectors for AnythingMCP.
+- [Field Service MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/field-service.md): 4 field service connectors for AnythingMCP.
+- [Finance MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/finance.md): 23 finance connectors for AnythingMCP.
+- [Food & Drink MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/food.md): 2 food & drink connectors for AnythingMCP.
+- [Forms & Surveys MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/forms.md): 6 forms & surveys connectors for AnythingMCP.
+- [Government MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/government.md): 10 government connectors for AnythingMCP.
+- [Healthcare MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/healthcare.md): 2 healthcare connectors for AnythingMCP.
+- [HR MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/hr.md): 22 HR connectors for AnythingMCP.
+- [Infrastructure MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/infrastructure.md): 32 infrastructure connectors for AnythingMCP.
+- [IT Service Management MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/itsm.md): 6 IT service management connectors for AnythingMCP.
+- [Knowledge Base MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/knowledge.md): 6 knowledge base connectors for AnythingMCP.
+- [Logistics MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/logistics.md): 18 logistics connectors for AnythingMCP.
+- [Maps MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/maps.md): 5 maps connectors for AnythingMCP.
+- [Marketing Automation MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/marketing-automation.md): 13 marketing automation connectors for AnythingMCP.
+- [Messaging MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/messaging.md): 29 messaging connectors for AnythingMCP.
+- [Monitoring MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/monitoring.md): 22 monitoring connectors for AnythingMCP.
+- [Payments MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/payments.md): 23 payments connectors for AnythingMCP.
+- [Productivity MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/productivity.md): 27 productivity connectors for AnythingMCP.
+- [Project Management MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/project-management.md): 26 project management connectors for AnythingMCP.
+- [Publishing MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/publishing.md): 13 publishing connectors for AnythingMCP.
+- [Real Estate MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/real-estate.md): 2 real estate connectors for AnythingMCP.
+- [Remote Access MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/remote.md): 1 remote access connector for AnythingMCP.
+- [Scheduling MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/scheduling.md): 11 scheduling connectors for AnythingMCP.
+- [Social Media MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/social.md): 13 social media connectors for AnythingMCP.
+- [Sports MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/sports.md): 13 sports connectors for AnythingMCP.
+- [File Storage MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/storage.md): 22 file storage connectors for AnythingMCP.
+- [Customer Support MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/support.md): 17 customer support connectors for AnythingMCP.
+- [Time Tracking MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/time-tracking.md): 10 time tracking connectors for AnythingMCP.
+- [Transport MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/transport.md): 3 transport connectors for AnythingMCP.
+- [Travel MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/travel.md): 2 travel connectors for AnythingMCP.
+- [Wholesale MCP connectors](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/catalog/wholesale.md): 1 wholesale connector for AnythingMCP.
 - [Connect Sorare to ChatGPT — fantasy football tools inside GPT](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/guides/connect-sorare-to-chatgpt.md): Connect Sorare fantasy football tools to ChatGPT through AnythingMCP.
 - [Connect Sorare to Claude — NFT fantasy football inside Claude Desktop & Claude Code](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/guides/connect-sorare-to-claude.md): Connect Sorare fantasy football tools to Claude Desktop and Claude Code.
 - [Connect Sorare to AnythingMCP Cloud — managed MCP server for the Sorare GraphQL API](https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/main/docs/guides/connect-sorare-to-cloud.md): Use AnythingMCP Cloud to connect the Sorare GraphQL API without a local server.

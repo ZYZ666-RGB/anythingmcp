@@ -19,8 +19,8 @@ import {
   Optional,
 } from '@nestjs/common';
 import type { Response } from 'express';
-import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery, ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { AuthGuard } from '@nestjs/passport';
+import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery, ApiProperty, ApiPropertyOptional, ApiSecurity, ApiBody, ApiResponse } from '@nestjs/swagger';
+import { JwtOrManagementKeyGuard } from '../auth/jwt-or-management-key.guard';
 import { PaginationQueryDto } from '../common/pagination.dto';
 import { ConfigService } from '@nestjs/config';
 import {
@@ -34,6 +34,8 @@ import {
   ValidateNested,
   ArrayMinSize,
   MaxLength,
+  IsNumber,
+  Allow,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ConnectorType, AuthType } from '../generated/prisma/client';
@@ -45,24 +47,28 @@ import { GraphqlParser } from './parsers/graphql.parser';
 import { PostmanParser } from './parsers/postman.parser';
 import { CurlParser } from './parsers/curl.parser';
 import { HarParser } from './parsers/har.parser';
-import { describeSpecError, readRemoteSpec } from './parsers/spec-read-error';
+import { describeSpecError, normalizeSpecUrl, readRemoteSpec } from './parsers/spec-read-error';
 import { McpClientEngine } from './engines/mcp-client.engine';
 import { McpOAuthService } from './mcp-oauth.service';
 import { connectorOAuthCallbackUrl, startConnectorAuthorization } from './connector-authorization';
-import { CatalogResyncService } from './catalog-resync.service';
+import { CatalogResyncService, toPublicCatalogDiff } from './catalog-resync.service';
 import { McpServersService } from '../mcp-servers/mcp-servers.service';
 import { DeploymentService } from '../common/deployment.service';
 import { validateBaseUrl } from './base-url.util';
-import { normalizeAddressVariables } from '../common/base-url-variable.util';
 import { PrismaService } from '../common/prisma.service';
 import { McpServerService } from '../mcp-server/mcp-server.service';
 import { LicenseGuardService } from '../license/license-guard.service';
 import { getRequiredSecret } from '../common/secrets.util';
-import { decrypt } from '../common/crypto/encryption.util';
+import { decrypt, encrypt } from '../common/crypto/encryption.util';
+import { keepMaskedUrlPassword, moveUrlCredentials } from './database-url-credentials.util';
 import { getAdapter } from '../adapters/catalog';
-import { checkAdapterEnvValues, describeFieldProblems, normalizeAdapterEnvValues } from '../adapters/env-var-checks';
-import { resolveDerivedEnvVars, withDerivedValues } from '../adapters/derived-settings';
 import { resolvePkce } from './oauth-authorize-settings';
+import { LoginTokenService } from './engines/login-token.service';
+import {
+  mergeLoginTokenConfig,
+  toPublicLoginTokenConfig,
+  type LoginTokenConfigPatch,
+} from './login-token-config.util';
 import { isMachineGrant } from './oauth-grant.util';
 import { mcpPathOf } from './mcp-connector-config.util';
 import {
@@ -83,11 +89,8 @@ import {
   secretContext,
   toPublicConnector,
 } from './connector-secrets.util';
-import {
-  describeMissing,
-  rebuildCatalogCredentials,
-  variablesForAuthFields,
-} from './catalog-env-rebuild.util';
+import { seesMemberView, toMemberConnector } from './connector-member-view.util';
+import { rebuildCatalogCredentials, variablesForAuthFields } from './catalog-env-rebuild.util';
 import {
   buildODataBuiltinTools,
   odataToolPrefix,
@@ -97,20 +100,42 @@ import { parseODataTools } from './parsers/odata.parser';
 import { normalizeSettings } from './engines/odata.engine';
 import { buildEmailBuiltinTools } from './email/email-builtins';
 import { buildWebhookBuiltinTools, wantsWebhookBuiltins, webhookToolPrefix } from './webhook-builtins';
+import { WebhookEventsService } from './webhook-events.service';
 import { EmailConnectorError, emailToolPrefix, resolveEmailSettings } from './email/email-settings';
 import { computeSetupState } from './connector-setup-status.util';
+import { assertConsumerKeyIsNotEmail, looksLikeEmail } from './oauth1-consumer-key.util';
+import {
+  assertCatalogValues,
+  normalizeConnectorVariables,
+  readStoredAuthConfig,
+  withDerivedSettings,
+  writeConnectorEnvVars,
+} from './connector-env-write.util';
 import { EditionService } from '../ee/licensing/edition.service';
 import {
   USER_CREDENTIALS_FEATURE,
   UserCredentialsService,
 } from './user-credentials.service';
 import { supportsUserCredentials } from './user-credential.util';
+import { egressIps } from './egress';
+import { IOP_TOKEN_PROVIDER, isIopAuth } from './engines/iop-token.service';
+import { SHEIN_TOKEN_PROVIDER, isSheinAuth } from './engines/shein-token.service';
 import {
   SECRET_GUARDED_TYPES,
   SecretExtractor,
   mergeSummaries,
   type SecretMoveSummary,
 } from './secret-extraction.util';
+import { hasHttpBaseUrl, keepMaskedBaseUrl } from './base-url-secrets.util';
+import {
+  MemberVisibilityService,
+  canSeeConnector,
+  connectorWhere,
+  ownedConnectorWhere,
+  serverWhere,
+  visibleTools,
+  type VisibilityScope,
+} from '../settings/member-visibility.service';
 
 class UpdateCredentialScopeDto {
   @ApiProperty({
@@ -428,6 +453,68 @@ class UpdateOAuthConfigDto {
   pkce?: boolean;
 }
 
+class UpdateLoginTokenConfigDto {
+  @ApiPropertyOptional({ description: 'The login endpoint (Login → Token). Cannot be emptied.' })
+  @IsOptional()
+  @IsString()
+  loginUrl?: string;
+
+  @ApiPropertyOptional({ description: 'HTTP method of the login request.', enum: ['GET', 'POST', 'PUT', 'PATCH'] })
+  @IsOptional()
+  @IsString()
+  @IsIn(['GET', 'POST', 'PUT', 'PATCH', 'get', 'post', 'put', 'patch'])
+  loginMethod?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'The login body: a JSON value (strings may use ${username}, ${password} and {{VARIABLES}}) or a string. ' +
+      'null removes it (the login then sends username and password as JSON).',
+  })
+  @IsOptional()
+  @Allow()
+  loginBody?: unknown;
+
+  @ApiPropertyOptional({ description: 'Username for the login. Empty or null removes it.', nullable: true })
+  @IsOptional()
+  @IsString()
+  username?: string | null;
+
+  @ApiPropertyOptional({ description: 'Password (or key) for the login. Empty or null removes it.', nullable: true })
+  @IsOptional()
+  @IsString()
+  password?: string | null;
+
+  @ApiPropertyOptional({
+    description:
+      'Where the token is in the login answer: a dotted path (data.token), a list of paths tried in order, ' +
+      'or empty for the whole response body (a plain-text token or a JSON string).',
+  })
+  @IsOptional()
+  @Allow()
+  tokenJsonPath?: string | string[];
+
+  @ApiPropertyOptional({ description: 'Token lifetime when the answer does not say; null removes it (30 days).', nullable: true })
+  @IsOptional()
+  @IsNumber()
+  tokenTTLSeconds?: number | null;
+
+  @ApiPropertyOptional({ description: 'Log in again and retry once when a call gets HTTP 401.' })
+  @IsOptional()
+  @IsBoolean()
+  refreshOn401?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'The complete set of headers sent with the login request only (connector headers are not). A name left out ' +
+      'is removed; a header the GET answer listed in maskedLoginHeaders, sent back empty, keeps its stored value. ' +
+      'null removes them all.',
+    nullable: true,
+  })
+  @IsOptional()
+  @IsObject()
+  loginHeaders?: Record<string, string> | null;
+}
+
 class UpdateOAuth1ConfigDto {
   @ApiPropertyOptional({
     description:
@@ -696,9 +783,61 @@ class UpdateEnvVarsDto {
   envVars: Record<string, string>;
 }
 
+/**
+ * Whether an export may carry secret env vars and headers in clear: only for
+ * an admin, and never for a read-only management key. A MANAGEMENT_READ key
+ * inherits its owner's role, so without the scope check an admin's "read-only"
+ * key would hand out every connector credential.
+ */
+/**
+ * The caller's workspace for an export. Exports must never run without one:
+ * Prisma reads `organizationId: undefined` as "no filter", which on the
+ * multi-tenant Cloud would export every workspace.
+ */
+function requireOrganizationId(req: any): string {
+  const organizationId = req.user?.organizationId;
+  if (typeof organizationId !== 'string' || !organizationId) {
+    throw new ForbiddenException('No workspace selected');
+  }
+  return organizationId;
+}
+
+function mayExportSecrets(req: any): boolean {
+  return req.user?.role === 'ADMIN' && req.mcpKeyScope !== 'MANAGEMENT_READ';
+}
+
+const UNRESTRICTED_SCOPE: VisibilityScope = Object.freeze({ restricted: false as const });
+
+/**
+ * The health check's `message` for a restricted member who does not own the
+ * connector, by status. The real one quotes the provider or the driver.
+ */
+const MEMBER_HEALTH_MESSAGES: Record<string, string> = {
+  healthy: 'Connection successful',
+  unhealthy: 'Connection failed. The connector owner or a workspace admin can see why.',
+  needs_reauth: 'The provider refused the credential. The connector owner or a workspace admin has to authorize again.',
+};
+
+/**
+ * Member visibility (settings/member-visibility.service.ts) on this
+ * controller: in a workspace set to `restricted`, a member who is not an admin
+ * reads only the connectors that hold a tool their roles allow and, for an
+ * EDITOR, the connectors they own ("owns" below: `ownsConnector`, never a
+ * VIEWER). A connector they own they read in full. Any other they read in
+ * the reduced view of connector-member-view.util.ts: its name, type, status
+ * and the allowed tools by name and description, never its address, settings
+ * or the tools' mappings; routes whose whole answer is settings (the OAuth
+ * settings) answer 404 for it. Every GET route with a connector id answers a
+ * hidden connector with exactly the 404 an unknown id gets; exports cover
+ * owned connectors only. Writes keep their owner-or-admin rule. Admins and
+ * open workspaces take today's code path.
+ * The route-by-route rules are listed in connectors.member-visibility.spec.ts.
+ */
+
 @ApiTags('Connectors')
 @ApiBearerAuth()
-@UseGuards(AuthGuard('jwt'))
+@ApiSecurity('api-key')
+@UseGuards(JwtOrManagementKeyGuard)
 @Controller('api/connectors')
 export class ConnectorsController {
   private readonly logger = new Logger(ConnectorsController.name);
@@ -720,8 +859,15 @@ export class ConnectorsController {
     private readonly licenseGuard: LicenseGuardService,
     private readonly mcpServers: McpServersService,
     private readonly deployment: DeploymentService,
+    private readonly webhookEvents: WebhookEventsService,
     @Optional() private readonly edition?: EditionService,
     @Optional() private readonly userCredentials?: UserCredentialsService,
+    // Not @Optional: Nest refuses to boot without it. It is missing only in
+    // unit specs that build the controller by hand and predate the setting.
+    private readonly visibility?: MemberVisibilityService,
+    // Drops a token obtained with old login settings. Optional for the same
+    // reason as `visibility`.
+    @Optional() private readonly loginTokens?: LoginTokenService,
   ) {
     this.encryptionKey = getRequiredSecret(
       'ENCRYPTION_KEY',
@@ -734,6 +880,61 @@ export class ConnectorsController {
   private assertOrgMatch(connector: any, req: any) {
     if (connector.organizationId !== req.user.organizationId) {
       throw new ForbiddenException('Resource not found');
+    }
+  }
+
+  /** The caller's member visibility; unrestricted for admins and open workspaces. */
+  private scopeFor(req: any): Promise<VisibilityScope> {
+    return this.visibility ? this.visibility.scopeFor(req.user) : Promise.resolve(UNRESTRICTED_SCOPE);
+  }
+
+  /** A connector the scope may not see: exactly the 404 ConnectorsService.findById gives an unknown id. */
+  private assertVisible(scope: VisibilityScope, connector: { userId: string; tools?: Array<{ id: string }> }, id: string) {
+    if (!canSeeConnector(scope, { userId: connector.userId, tools: connector.tools ?? [] })) {
+      throw new NotFoundException(`Connector ${id} not found`);
+    }
+  }
+
+  /**
+   * For a restricted member: another workspace's connector stays the 403 it is
+   * today, a hidden one is a 404. Nothing at all for admins and open workspaces.
+   */
+  private async hideUnlessVisible(req: any, connector: any, id: string): Promise<void> {
+    const scope = await this.scopeFor(req);
+    if (!scope.restricted) return;
+    this.assertOrgMatch(connector, req);
+    this.assertVisible(scope, connector, id);
+  }
+
+  /** `tools` narrowed to the ones the scope may see (all of them for the owner). */
+  private narrowTools<V extends object>(scope: VisibilityScope, connector: { userId: string }, view: V): V {
+    const tools = (view as { tools?: unknown }).tools;
+    if (!Array.isArray(tools)) return view;
+    return { ...view, tools: visibleTools(scope, connector, tools as Array<{ id: string }>) };
+  }
+
+  /**
+   * What a restricted member reads of a connector they can see: all of it
+   * when they own it, otherwise the reduced view (connector-member-view.util.ts)
+   * with the tools their roles allow.
+   */
+  private viewFor<V extends object>(scope: VisibilityScope, connector: { userId: string }, view: V) {
+    const narrowed = this.narrowTools(scope, connector, view);
+    return seesMemberView(scope, connector) ? toMemberConnector(narrowed) : narrowed;
+  }
+
+  /**
+   * For a restricted member: 404 (the body an unknown id gets) unless they own
+   * the connector, for a route whose whole answer is the connector's settings.
+   * Another workspace's connector stays the 403 it is today. Nothing at all
+   * for admins and open workspaces.
+   */
+  private async hideUnlessFullView(req: any, connector: any, id: string): Promise<void> {
+    const scope = await this.scopeFor(req);
+    if (!scope.restricted) return;
+    this.assertOrgMatch(connector, req);
+    if (seesMemberView(scope, connector)) {
+      throw new NotFoundException(`Connector ${id} not found`);
     }
   }
 
@@ -754,15 +955,40 @@ export class ConnectorsController {
   }
 
   @Get()
-  @ApiOperation({ summary: 'List connectors for current organization' })
-  @ApiQuery({ name: 'limit', required: false, type: Number, description: '1..200' })
-  @ApiQuery({ name: 'offset', required: false, type: Number })
+  @ApiOperation({
+    summary: 'List connectors for current organization',
+    description:
+      'Every connector of your workspace, newest first, with its tools. Secrets are never returned: secret variables and ' +
+      'headers come back empty and are named in `maskedEnvVars` / `maskedHeaders`, `authConfig` is left out, and a ' +
+      'DATABASE connection string shows its password as `********`. ' +
+      '`setupStatus` says whether the connector can serve calls: `ready`, `needs_input` (the variables in ' +
+      '`missingVariables` are empty) or `needs_authorization` (a sign-in at the provider is pending). ' +
+      'Without `limit` all connectors are returned.\n\n' +
+      '```bash\namcp api GET "/api/connectors?limit=50"\n```\n\n' +
+      'In a workspace with restricted member visibility, a member who is not an admin gets only the connectors that hold ' +
+      'a tool their roles allow and, for an EDITOR, the connectors they own. Any other connector comes back in a reduced view, marked ' +
+      '`memberView: true`: `id`, `name`, `type`, `icon`, `isActive`, `credentialScope`, `setupStatus`, `authStatus`, ' +
+      '`authStatusCode` and, of the tools their roles allow, `id`, `name`, `description` and `isEnabled`. Its address, ' +
+      'variables, headers, instructions and the tools\' parameters and endpoint mappings are left out.',
+  })
+  @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Page size, 1..200. Omit for all.', example: 50 })
+  @ApiQuery({ name: 'offset', required: false, type: Number, description: 'Rows to skip.', example: 0 })
   async list(@Req() req: any, @Query() pagination: PaginationQueryDto) {
-    const rows = await this.connectorsService.findByOrg(req.user.organizationId, {
+    const scope = await this.scopeFor(req);
+    if (!scope.restricted) {
+      const rows = await this.connectorsService.findByOrg(req.user.organizationId, {
+        limit: pagination.limit,
+        offset: pagination.offset,
+      });
+      return rows.map((c) => this.withSetupState(c));
+    }
+    // Filtered in the query, so limit and offset page over visible rows only.
+    // The setup state is computed from all tools, as for an admin.
+    const rows = await this.connectorsService.findVisibleByOrg(req.user.organizationId, connectorWhere(scope), {
       limit: pagination.limit,
       offset: pagination.offset,
     });
-    return rows.map((c) => this.withSetupState(c));
+    return rows.map((c) => this.viewFor(scope, c, this.withSetupState(c)));
   }
 
   /**
@@ -799,11 +1025,47 @@ export class ConnectorsController {
       ...toPublicConnector(connector),
       setupStatus: setup.status,
       missingVariables: setup.missing,
+      // A seller authorization at an IOP gateway (Lazada, Miravia, AliExpress
+      // seller): the connector page shows its Authorize button. Not a secret;
+      // absent on every other connector.
+      ...(isIopAuth(connector.authType, authConfig) ? { tokenProvider: IOP_TOKEN_PROVIDER } : {}),
+      // A SHEIN store authorization, likewise.
+      ...(isSheinAuth(connector.authType, authConfig) ? { tokenProvider: SHEIN_TOKEN_PROVIDER } : {}),
     };
   }
 
   @Post()
-  @ApiOperation({ summary: 'Create a new connector' })
+  @ApiOperation({
+    summary: 'Create a new connector',
+    description:
+      'Creates a hand-built connector. For an app in the catalogue, `POST /api/adapters/{slug}/import` is simpler: it ' +
+      'creates the connector with its tools in one call. A new connector has no tools: add them with ' +
+      '`POST /api/connectors/{id}/import` (from a spec, Postman, cURL, HAR or JSON), `POST /api/connectors/{id}/import-spec` ' +
+      '(from `specUrl`), `POST /api/connectors/{id}/discover-tools` (MCP connectors) or the Tools endpoints.\n\n' +
+      'A key typed into `baseUrl` or a header is moved into an encrypted variable and referenced as `{{VAR}}`. ' +
+      'The connector is added to your default MCP server. File Search connectors are created with ' +
+      '`POST /api/file-search/connectors` instead. 403 for VIEWERs or when the plan allows no more connectors.',
+  })
+  @ApiBody({
+    type: CreateConnectorDto,
+    examples: {
+      rest: {
+        summary: 'REST API with a bearer token',
+        value: {
+          name: 'Acme CRM',
+          type: 'REST',
+          baseUrl: 'https://api.acme.example/v1',
+          authType: 'BEARER_TOKEN',
+          authConfig: { token: 'sk_live_…' },
+          specUrl: 'https://api.acme.example/v1/openapi.json',
+        },
+      },
+      mcp: {
+        summary: 'Remote MCP server',
+        value: { name: 'Docs MCP', type: 'MCP', baseUrl: 'https://mcp.example.com/mcp', authType: 'NONE' },
+      },
+    },
+  })
   async create(@Req() req: any, @Body() dto: CreateConnectorDto) {
     this.assertCanCreate(req);
     if ((dto.type as string) === 'FILE_SEARCH') {
@@ -831,6 +1093,9 @@ export class ConnectorsController {
         ? { ...guarded, envVars: { ...(envVars ?? {}), ...secrets.newEnvVars } }
         : guarded;
     await this.licenseGuard.checkCanCreateConnector(req.user.sub, req.user.organizationId);
+    if (dto.webhookEnabled === true) {
+      await this.licenseGuard.checkCanEnableWebhook(req.user.organizationId);
+    }
     const connector = await this.connectorsService.create(req.user.sub, req.user.organizationId, data);
     if (secrets.changed) {
       this.logger.log(
@@ -1025,21 +1290,7 @@ export class ConnectorsController {
     connector: { envVars?: unknown; config?: unknown },
     next: Record<string, string>,
   ): void {
-    const slug = (connector.config as { adapterSlug?: unknown } | null | undefined)?.adapterSlug;
-    const adapter = typeof slug === 'string' ? getAdapter(slug) : undefined;
-    if (!adapter) return;
-    const stored = (connector.envVars as Record<string, unknown> | null) ?? {};
-    const changed = Object.keys(next).filter((name) => next[name] !== stored[name]);
-    if (changed.length === 0) return;
-    const fields = checkAdapterEnvValues(adapter, next, changed);
-    if (Object.keys(fields).length > 0) {
-      throw new BadRequestException({
-        statusCode: 400,
-        code: 'invalid_values',
-        fields,
-        message: describeFieldProblems(fields),
-      });
-    }
+    assertCatalogValues(connector, next);
   }
 
   /**
@@ -1052,37 +1303,14 @@ export class ConnectorsController {
     connector: { envVars?: unknown; config?: unknown },
     next: Record<string, string>,
   ): Promise<Record<string, string>> {
-    const slug = (connector.config as { adapterSlug?: unknown } | null | undefined)?.adapterSlug;
-    const adapter = typeof slug === 'string' ? getAdapter(slug) : undefined;
-    if (!adapter?.derivedEnvVars) return next;
-    const stored = (connector.envVars as Record<string, unknown> | null) ?? {};
-    const changed = Object.keys({ ...stored, ...next }).filter((name) => next[name] !== stored[name]);
-    if (changed.length === 0) return next;
-    const derived = await resolveDerivedEnvVars(adapter, next, { only: changed });
-    if (Object.keys(derived.fields).length > 0) {
-      throw new BadRequestException({
-        statusCode: 400,
-        code: 'invalid_values',
-        fields: derived.fields,
-        message: describeFieldProblems(derived.fields),
-      });
-    }
-    return (withDerivedValues(next, derived) ?? {}) as Record<string, string>;
+    return withDerivedSettings(connector, next);
   }
 
   private normalizeVariables(
     connector: { baseUrl: string | null; type: string; config?: unknown },
     values: Record<string, string>,
   ): Record<string, string> {
-    const cfg = connector.config as { adapterSlug?: string } | null | undefined;
-    const adapter = cfg?.adapterSlug ? getAdapter(cfg.adapterSlug) : null;
-    return normalizeAddressVariables(
-      adapter ? adapter.connector.baseUrl : connector.baseUrl,
-      // The adapter's own clean-ups, as at install (env-var-checks.ts).
-      adapter ? normalizeAdapterEnvValues(adapter, values) : values,
-      connector.type,
-      { singleLabel: !!adapter },
-    );
+    return normalizeConnectorVariables(connector, values);
   }
 
   /**
@@ -1162,20 +1390,45 @@ export class ConnectorsController {
     summary: 'Whether the proxy / web-unblocker is configured on this instance',
     description:
       'Returns { available: true } only when CONNECTOR_PROXY_URL is set. ' +
-      'The UI uses this to show or hide the per-tool "Use proxy" checkbox.',
+      'The UI uses this to show or hide the per-tool "Use proxy" checkbox. ' +
+      '`egressIps` lists the addresses direct calls leave from (EGRESS_IPS), ' +
+      'shown on the connector page for servers that only accept approved IPs.',
   })
   async proxyAvailability() {
-    return { available: !!process.env.CONNECTOR_PROXY_URL };
+    return { available: !!process.env.CONNECTOR_PROXY_URL, egressIps: egressIps() };
   }
 
   @Get('health-check')
   @ApiOperation({
     summary: 'Test connectivity of all active connectors',
     description:
-      'Runs a health check against all active connectors and returns their status.',
+      'Runs a health check against all active connectors and returns their status. Each check is a real request to the ' +
+      'provider (the connector\'s `healthcheckPath`, or its type\'s test). A connector whose credential the provider ' +
+      'refused for good is reported as `needs_reauth` without being called again. In a workspace with restricted ' +
+      'member visibility, a member who is not an admin gets only the connectors they can see in the list; for one ' +
+      'they do not own, `message` is a fixed sentence per status instead of the provider\'s answer, which can name ' +
+      'the host or the database.',
+  })
+  @ApiResponse({
+    status: 200,
+    schema: {
+      type: 'object',
+      example: {
+        total: 2,
+        healthy: 1,
+        unhealthy: 1,
+        connectors: [
+          { id: 'cmob60dvv00c01zrpeujwmnep', name: 'HubSpot', type: 'REST', status: 'healthy', message: 'Connection successful', latencyMs: 231 },
+          { id: 'cmob61abc00c11zrpq3x8kdm2', name: 'Acme CRM', type: 'REST', status: 'unhealthy', message: 'Auth handshake reached the API, but the credentials were rejected. Update authConfig and retry.', latencyMs: 118 },
+        ],
+      },
+    },
   })
   async healthCheck(@Req() req: any) {
-    const allConnectors = await this.connectorsService.findByOrg(req.user.organizationId);
+    const scope = await this.scopeFor(req);
+    const allConnectors = !scope.restricted
+      ? await this.connectorsService.findByOrg(req.user.organizationId)
+      : await this.connectorsService.findVisibleByOrg(req.user.organizationId, connectorWhere(scope));
     const active = allConnectors.filter((c) => c.isActive);
 
     const results = await Promise.allSettled(
@@ -1216,9 +1469,15 @@ export class ConnectorsController {
       }),
     );
 
-    const statuses = results.map((r) =>
-      r.status === 'fulfilled' ? r.value : { status: 'error', message: 'Check failed' },
-    );
+    const statuses = results.map((r, i) => {
+      if (r.status !== 'fulfilled') return { status: 'error', message: 'Check failed' };
+      // A restricted member who does not own the connector gets the outcome,
+      // not the provider's or driver's own words: those can name the host,
+      // the port or the database.
+      return seesMemberView(scope, active[i])
+        ? { ...r.value, message: MEMBER_HEALTH_MESSAGES[r.value.status] ?? MEMBER_HEALTH_MESSAGES.unhealthy }
+        : r.value;
+    });
 
     const healthy = statuses.filter((s: any) => s.status === 'healthy').length;
 
@@ -1237,15 +1496,29 @@ export class ConnectorsController {
       'Returns all connectors with their tools, environment variables, ' +
       'and configuration. authConfig is never exported. Secret environment ' +
       'variables and headers are exported only to admins, so that a backup ' +
-      'can be restored; for every other role they are left empty and named ' +
-      'in `maskedEnvVars` / `maskedHeaders`.',
+      'can be restored; for every other role, and for a read-only ' +
+      '(MANAGEMENT_READ) API key, they are left empty and named in ' +
+      '`maskedEnvVars` / `maskedHeaders`, and a DATABASE connection string ' +
+      'shows its password as `********`. A database password kept in ' +
+      'authConfig is in no export, so a restored connector needs it typed in again. ' +
+      'In a workspace with restricted member visibility, a member who is not ' +
+      'an admin exports only the connectors they own, and a VIEWER none.',
   })
   async exportAll(@Req() req: any) {
-    const allConnectors = await this.prisma.connector.findMany({
-      where: { organizationId: req.user.organizationId },
+    const organizationId = requireOrganizationId(req);
+    const scope = await this.scopeFor(req);
+    if (!scope.restricted) {
+      const allConnectors = await this.prisma.connector.findMany({
+        where: { organizationId },
+        include: { tools: true },
+      });
+      return toExportEnvelope(allConnectors, mayExportSecrets(req));
+    }
+    const owned = await this.prisma.connector.findMany({
+      where: { AND: [{ organizationId }, ownedConnectorWhere(scope)] },
       include: { tools: true },
     });
-    return toExportEnvelope(allConnectors, req.user.role === 'ADMIN');
+    return toExportEnvelope(owned, mayExportSecrets(req));
   }
 
   @Get(':id/export')
@@ -1255,10 +1528,15 @@ export class ConnectorsController {
       'Same file format as export-all, with a single entry in `connectors`, ' +
       'so it can be restored with import-all or import. authConfig is never ' +
       'exported. Secret environment variables and headers are exported only ' +
-      'to admins; for every other role they are left empty and named in ' +
-      '`maskedEnvVars` / `maskedHeaders`.',
+      'to admins; for every other role, and for a read-only (MANAGEMENT_READ) ' +
+      'API key, they are left empty and named in `maskedEnvVars` / `maskedHeaders`, ' +
+      'and a DATABASE connection string shows its password as `********`. A database ' +
+      'password kept in authConfig is in no export. ' +
+      'The `X-Secrets-Included` response header says which it was. In a workspace with restricted member ' +
+      'visibility, a member who is not an admin gets 404 for a connector they do not own, and a VIEWER for every connector.\n\n' +
+      '```bash\ncurl -s "$AMCP_URL/api/connectors/<id>/export?format=yaml" -H "Authorization: Bearer $AMCP_API_KEY" -o acme.yaml\n```',
   })
-  @ApiQuery({ name: 'format', required: false, enum: ['json', 'yaml'] })
+  @ApiQuery({ name: 'format', required: false, enum: ['json', 'yaml'], description: 'File format (default json).', example: 'yaml' })
   async exportOne(
     @Req() req: any,
     @Param('id') id: string,
@@ -1269,16 +1547,20 @@ export class ConnectorsController {
     if (!EXPORT_FORMATS.includes(fmt)) {
       throw new BadRequestException('format must be "json" or "yaml"');
     }
+    const organizationId = requireOrganizationId(req);
+    const scope = await this.scopeFor(req);
+    // Scoped in the query itself: a connector of another workspace (or, for a
+    // restricted member, one they do not own) is simply not found, so its
+    // existence is not revealed either.
     const connector = await this.prisma.connector.findFirst({
-      where: { id },
+      where: !scope.restricted ? { id, organizationId } : { AND: [{ id, organizationId }, ownedConnectorWhere(scope)] },
       include: { tools: true },
     });
     if (!connector) {
       throw new NotFoundException('Connector not found');
     }
-    this.assertOrgMatch(connector, req);
 
-    const secretsIncluded = req.user.role === 'ADMIN';
+    const secretsIncluded = mayExportSecrets(req);
     const data = toExportEnvelope([connector], secretsIncluded);
     res.setHeader('X-Secrets-Included', String(secretsIncluded));
     res.setHeader(
@@ -1293,11 +1575,95 @@ export class ConnectorsController {
   }
 
   @Get(':id')
-  @ApiOperation({ summary: 'Get connector details' })
+  @ApiOperation({
+    summary: 'Get connector details',
+    description:
+      'In a workspace with restricted member visibility, a member who is not an admin gets 404 for a connector they ' +
+      'cannot see. For a connector they own as an EDITOR they get all of it, with only the MCP servers they can see. For ' +
+      'any other they get the reduced view of `GET /api/connectors` (`memberView: true`): what it is called, whether ' +
+      'it works and the tools their roles allow by name and description, without its address, variables, headers, ' +
+      'instructions, MCP servers or the tools\' parameters and endpoint mappings.',
+  })
   async findOne(@Req() req: any, @Param('id') id: string) {
     const connector = await this.connectorsService.findById(id);
     this.assertOrgMatch(connector, req);
-    return this.withSetupState(connector);
+    const scope = await this.scopeFor(req);
+    if (!scope.restricted) {
+      return this.withSetupState(connector);
+    }
+    this.assertVisible(scope, connector as any, id);
+    if (seesMemberView(scope, connector)) {
+      return this.viewFor(scope, connector, this.withSetupState(connector));
+    }
+    // findById loads `mcpServers: [{ mcpServerId }]` with the connector.
+    const view: any = this.narrowTools(scope, connector, this.withSetupState(connector));
+    const servers: Array<{ mcpServerId: string }> = Array.isArray(view.mcpServers) ? view.mcpServers : [];
+    const serverIds = servers.map((s) => s.mcpServerId);
+    if (serverIds.length === 0) return view;
+    // A server holding a visible connector is visible by the servers rule, so
+    // today this keeps every entry; asked anyway so the two rules cannot drift.
+    const visible = await this.prisma.mcpServerConfig.findMany({
+      where: { AND: [{ id: { in: serverIds }, organizationId: connector.organizationId }, serverWhere(scope)] },
+      select: { id: true },
+    });
+    const keep = new Set(visible.map((s) => s.id));
+    return { ...view, mcpServers: servers.filter((s) => keep.has(s.mcpServerId)) };
+  }
+
+  @Get(':id/webhook/url')
+  @ApiOperation({
+    summary: 'The inbound webhook URL for this connector',
+    description:
+      'Computed by the server from SERVER_URL, like GET /api/connectors/oauth/redirect-uri, so it always matches ' +
+      'the path webhook-ingest.controller.ts listens on. Connector owner or admin; in a workspace with restricted ' +
+      'member visibility, a member who is not an admin gets 404 for a connector they cannot see.',
+  })
+  async webhookUrl(@Req() req: any, @Param('id') id: string) {
+    const connector = await this.connectorsService.findById(id);
+    await this.hideUnlessVisible(req, connector, id);
+    this.assertCanWrite(connector, req);
+    return { url: `${this.serverBaseUrl()}/api/webhooks/${connector.id}` };
+  }
+
+  @Get(':id/webhook/events')
+  @ApiOperation({
+    summary: 'Recent webhook deliveries for this connector, for the dashboard',
+    description:
+      'Metadata only, unlike the `<prefix>_recent_events` MCP tool: `payload` is left out, since it can carry ' +
+      'whatever personal data the provider sent (e.g. a Stripe customer\'s name, e-mail and address) and the ' +
+      'dashboard only ever shows type, id and time. Each event was verified (signature checked) before being ' +
+      'stored. Gated like any other connector setting: the connector owner or an admin. In a workspace with ' +
+      'restricted member visibility, a member who is not an admin gets 404 for a connector they cannot see.',
+  })
+  @ApiQuery({ name: 'limit', required: false, schema: { type: 'integer' }, description: 'At most this many events (default 20, max 50).' })
+  @ApiQuery({ name: 'since', required: false, schema: { type: 'string' }, description: 'ISO 8601 timestamp; only events received at or after this time.' })
+  async webhookEventsList(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Query('limit') limit?: string,
+    @Query('since') since?: string,
+  ) {
+    const connector = await this.connectorsService.findById(id);
+    await this.hideUnlessVisible(req, connector, id);
+    this.assertCanWrite(connector, req);
+    const events = await this.webhookEvents.recentEvents(connector.id, connector.organizationId, {
+      limit: limit !== undefined ? Number(limit) : undefined,
+      since,
+    });
+    return {
+      events: events.map(({ id: eventId, provider, eventType, externalId, receivedAt }) => ({
+        id: eventId,
+        provider,
+        eventType,
+        externalId,
+        receivedAt,
+      })),
+    };
+  }
+
+  /** Shared with oauthCallbackUrl(); both compute from SERVER_URL so a dashboard link always matches the live route. */
+  private serverBaseUrl(): string {
+    return (this.configService.get<string>('SERVER_URL') || 'http://localhost:4000').replace(/\/+$/, '');
   }
 
   @Put(':id')
@@ -1309,6 +1675,14 @@ export class ConnectorsController {
   ) {
     const connector = await this.connectorsService.findById(id);
     this.assertCanWrite(connector, req);
+    // Switching a paused connector back on counts against the plan's cap (Cloud).
+    if (dto.isActive === true && !connector.isActive) {
+      await this.licenseGuard.checkCanActivateConnector(connector.organizationId, connector.type as string);
+    }
+    // So does turning inbound webhooks on (off -> on only; turning them off is free).
+    if (dto.webhookEnabled === true && !connector.webhookEnabled) {
+      await this.licenseGuard.checkCanEnableWebhook(connector.organizationId);
+    }
     if ((connector.type as string) === 'FILE_SEARCH' && (dto.config !== undefined || dto.baseUrl !== undefined || dto.authConfig !== undefined)) {
       throw new BadRequestException('Change the source of a File Search connector on its Files tab.');
     }
@@ -1330,6 +1704,22 @@ export class ConnectorsController {
     // means "unchanged", not "erase".
     const ctx = secretContext(connector);
     const data = { ...dto };
+    if (connector.type === 'DATABASE' && dto.baseUrl !== undefined) {
+      // The connection string was shown with its password masked.
+      data.baseUrl = keepMaskedUrlPassword(dto.baseUrl, connector.baseUrl);
+    }
+    if (hasHttpBaseUrl(connector.type) && dto.baseUrl !== undefined) {
+      // A secret still stored in the base URL was shown as ********: the
+      // URL sent back as shown keeps the stored one (and the extraction
+      // below then moves the secret into a variable).
+      const kept = keepMaskedBaseUrl(dto.baseUrl, connector.baseUrl);
+      if (kept === null) {
+        throw new BadRequestException(
+          'The base URL still contains a hidden secret (********). Type the full address again, secret included: it is then stored in an encrypted variable.',
+        );
+      }
+      data.baseUrl = kept;
+    }
     if ((connector.type as string) === 'EMAIL') {
       data.authConfig = this.mergeEmailAuthConfig(connector.authConfig, dto.authConfig);
     }
@@ -1470,11 +1860,14 @@ export class ConnectorsController {
     description:
       'Returns the endpoints, client id and token-endpoint auth method so the ' +
       'UI can show the current configuration. The client secret and the issued ' +
-      'tokens are never returned — only booleans saying whether they are set.',
+      'tokens are never returned — only booleans saying whether they are set. ' +
+      'In a workspace with restricted member visibility, a member who is not an admin gets 404 for a connector ' +
+      'they do not own: the client id, endpoints and scopes are settings of the connector.',
   })
   async getOAuthConfig(@Req() req: any, @Param('id') id: string) {
     const connector = await this.connectorsService.findById(id);
     this.assertOrgMatch(connector, req);
+    await this.hideUnlessFullView(req, connector, id);
 
     let cfg: Record<string, unknown> = {};
     if (connector.authConfig) {
@@ -1565,11 +1958,14 @@ export class ConnectorsController {
     summary: 'Your own sign-in to a connector with per-user credentials',
     description:
       'Whether you are connected, since when, and whether the provider refused your sign-in. ' +
-      '`available` says whether the workspace may use per-user sign-in at all (Enterprise). No token is returned.',
+      '`available` says whether the workspace may use per-user sign-in at all (Enterprise). No token is returned. ' +
+      'In a workspace with restricted member visibility, a member who is not an admin gets 404 for a connector ' +
+      'they cannot see.',
   })
   async getMyCredential(@Req() req: any, @Param('id') id: string) {
     const connector = await this.connectorsService.findById(id);
     this.assertOrgMatch(connector, req);
+    await this.hideUnlessVisible(req, connector, id);
     const available = (await this.edition?.hasEnterprise(connector.organizationId)) ?? false;
     if (!this.userCredentials || connector.credentialScope !== 'USER') return { connected: false, available };
     return {
@@ -1581,11 +1977,15 @@ export class ConnectorsController {
   @Delete(':id/my-credential')
   @ApiOperation({
     summary: 'Disconnect your own account from a connector with per-user credentials',
-    description: 'Removes your stored tokens. The provider-side authorization stays until you revoke it there.',
+    description:
+      'Removes your stored tokens. The provider-side authorization stays until you revoke it there. ' +
+      'In a workspace with restricted member visibility, a member who is not an admin gets 404 for a connector ' +
+      'they cannot see.',
   })
   async deleteMyCredential(@Req() req: any, @Param('id') id: string) {
     const connector = await this.connectorsService.findById(id);
     this.assertOrgMatch(connector, req);
+    await this.hideUnlessVisible(req, connector, id);
     const removed = this.userCredentials
       ? await this.userCredentials.remove(connector.id, connector.organizationId, req.user.sub)
       : false;
@@ -1678,6 +2078,83 @@ export class ConnectorsController {
     return { message: 'OAuth configuration updated' };
   }
 
+  @Get(':id/login-token-config')
+  @ApiOperation({
+    summary: 'Read the Login → Token settings of a connector',
+    description:
+      'Returns the login URL, method, body, token path, token lifetime, re-login switch and the headers of the login ' +
+      'request, so the editor can show the stored configuration. Username and password are never returned, only ' +
+      'whether they are set; a login header holding a stored secret comes back empty and is named in ' +
+      '`maskedLoginHeaders`; a login body with a literal secret is left out (`loginBodyHidden`). An empty ' +
+      '`tokenJsonPath` means the whole response body is the token. ' +
+      'In a workspace with restricted member visibility, a member who is not an admin gets 404 for a connector ' +
+      'they do not own.',
+  })
+  async getLoginTokenConfig(@Req() req: any, @Param('id') id: string) {
+    const connector = await this.connectorsService.findById(id);
+    this.assertOrgMatch(connector, req);
+    await this.hideUnlessFullView(req, connector, id);
+    // Like the OAuth settings, answered for any auth type: a connector that
+    // does not log in this way gets the empty defaults.
+    return toPublicLoginTokenConfig(this.readLoginTokenAuthConfig(connector.authConfig), connector);
+  }
+
+  @Patch(':id/login-token-config')
+  @ApiOperation({
+    summary: 'Update the Login → Token settings of a connector (partial)',
+    description:
+      'Merges the supplied fields into the stored authConfig instead of replacing it: a field left out keeps its ' +
+      'value, and the settings the editor does not show (headerName, headerTemplate, extraHeaders, tokenSource, ' +
+      'expiry paths, password hashing …) are never touched. Username and password are only needed when the login ' +
+      'body or headers use ${username} / ${password} (or the login has no body). The token obtained with the old ' +
+      'settings is dropped, so the next call logs in again.',
+  })
+  async updateLoginTokenConfig(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() dto: UpdateLoginTokenConfigDto,
+  ) {
+    const connector = await this.connectorsService.findById(id);
+    this.assertCanWrite(connector, req);
+    if (connector.authType !== 'LOGIN_TOKEN') {
+      throw new BadRequestException('Connector auth type must be LOGIN_TOKEN');
+    }
+    const patch: LoginTokenConfigPatch = {};
+    for (const key of [
+      'loginUrl',
+      'loginMethod',
+      'loginBody',
+      'username',
+      'password',
+      'tokenJsonPath',
+      'tokenTTLSeconds',
+      'refreshOn401',
+      'loginHeaders',
+    ] as const) {
+      if (dto[key] !== undefined) (patch as Record<string, unknown>)[key] = dto[key];
+    }
+    if (Object.keys(patch).length === 0) {
+      return { message: 'Nothing to update' };
+    }
+    const existing = this.readLoginTokenAuthConfig(connector.authConfig);
+    const merged = mergeLoginTokenConfig(existing, patch, connector);
+    await this.connectorsService.replaceAuthConfig(id, merged);
+    await this.loginTokens?.forget(id);
+    await this.mcpServer.reloadConnectorTools(id);
+    return { message: 'Login settings updated' };
+  }
+
+  /** The stored authConfig of a LOGIN_TOKEN connector; empty when unreadable. */
+  private readLoginTokenAuthConfig(authConfig: string | null): Record<string, unknown> {
+    if (!authConfig) return {};
+    try {
+      const cfg = JSON.parse(decrypt(authConfig, this.encryptionKey));
+      return cfg && typeof cfg === 'object' && !Array.isArray(cfg) ? cfg : {};
+    } catch {
+      return {};
+    }
+  }
+
   @Patch(':id/oauth1-config')
   @ApiOperation({
     summary: 'Update the OAuth 1.0a credentials of a connector (partial)',
@@ -1754,9 +2231,28 @@ export class ConnectorsController {
   }
 
   @Post(':id/test')
-  @ApiOperation({ summary: 'Test connector connection' })
+  @ApiOperation({
+    summary: 'Test connector connection',
+    description:
+      'Makes one request to the provider with the stored settings (the connector\'s `healthcheckPath` for REST) and ' +
+      'reports the outcome; nothing is changed. `kind` classifies it: `ok`, `auth_failed` (401/403, check the ' +
+      'credentials), `not_found` (reachable, but the path does not exist), `unreachable` (DNS, network, timeout or a ' +
+      'blocked address), `unsupported` or `error`. A connector with per-user credentials is tested with your own sign-in. ' +
+      'Only the connector owner or an admin may test it. In a workspace with restricted member visibility, a member ' +
+      'who is not an admin gets 404 for a connector they cannot see.',
+  })
+  @ApiResponse({
+    status: 201,
+    schema: {
+      type: 'object',
+      example: { ok: false, kind: 'auth_failed', httpStatus: 401, message: 'Auth handshake reached the API, but the credentials were rejected. Update authConfig and retry.' },
+    },
+  })
   async test(@Req() req: any, @Param('id') id: string) {
     const connector = await this.connectorsService.findById(id);
+    // A restricted member gets the unknown-id 404 for a connector they cannot
+    // see, before the owner-or-admin 403 could tell them it exists.
+    await this.hideUnlessVisible(req, connector, id);
     this.assertCanWrite(connector, req);
     return this.connectorsService.testConnection(id, { userId: req.user.sub });
   }
@@ -1782,7 +2278,39 @@ export class ConnectorsController {
     description:
       'For MCP connectors: discovers OAuth endpoints via .well-known and optionally registers dynamically. ' +
       'For REST/GraphQL connectors: uses authorizationUrl and tokenUrl from authConfig. ' +
-      'Returns an authorization URL for the user to visit.',
+      'Returns an authorization URL for the user to visit.\n\n' +
+      'Open `authorizationUrl` in a browser and sign in at the provider; the provider then sends the browser back to ' +
+      'this server, which stores the tokens on the connector (or, for per-user credentials, for you only). ' +
+      'When the flow cannot start, the answer is `{ "error": "…" }` instead, e.g. for a connector whose auth type is not OAUTH2. ' +
+      'In a workspace with restricted member visibility, a member who is not an admin gets 404 for a connector they cannot see.\n\n' +
+      '```bash\namcp api POST /api/connectors/cmob60dvv00c01zrpeujwmnep/oauth/authorize --yes\n```',
+  })
+  @ApiBody({
+    required: false,
+    schema: {
+      type: 'object',
+      properties: {
+        returnTo: {
+          type: 'string',
+          maxLength: 500,
+          description:
+            'Dashboard path to come back to when the authorization is done, e.g. `/connectors/{id}`. ' +
+            'Only a path on this site is kept; anything else falls back to the connector page.',
+        },
+      },
+    },
+    examples: {
+      default: { summary: 'Come back to the connector page', value: {} },
+      returnTo: { summary: 'Come back to a given page', value: { returnTo: '/connectors' } },
+    },
+  })
+  @ApiResponse({
+    status: 201,
+    description: 'The URL to open, or the reason the flow could not start.',
+    schema: {
+      type: 'object',
+      example: { authorizationUrl: 'https://accounts.google.com/o/oauth2/v2/auth?client_id=…&state=…' },
+    },
   })
   async initiateOAuth(
     @Req() req: any,
@@ -1790,6 +2318,7 @@ export class ConnectorsController {
     @Body() body?: { returnTo?: string },
   ) {
     const connector = await this.connectorsService.findById(id);
+    await this.hideUnlessVisible(req, connector, id);
     // Per-user credentials: every member signs in with their own account,
     // which changes nothing on the connector but that member's own sign-in.
     const forUser = connector.credentialScope === 'USER';
@@ -1828,7 +2357,17 @@ export class ConnectorsController {
     summary: 'Discover and import tools from a remote MCP server',
     description:
       'Connects to the remote MCP server using stored credentials, ' +
-      'lists all available tools, and imports them as MCP tools.',
+      'lists all available tools, and imports them as MCP tools.\n\n' +
+      'Run it again to pick up tools the remote server added or changed: existing tools are updated, new ones created, ' +
+      'and tools the server no longer lists are deprecated (disabled, listed in `deprecated`). MCP connectors only. On failure the answer is ' +
+      'a success status (201) with `{"error": "…"}`.',
+  })
+  @ApiResponse({
+    status: 201,
+    schema: {
+      type: 'object',
+      example: { message: 'Imported tools: created 12, updated 0', created: 12, updated: 0, deprecated: [], skipped: [], renameConflicts: [], tools: [{ id: '…', name: 'search_docs', isEnabled: true }] },
+    },
   })
   async discoverMcpTools(@Req() req: any, @Param('id') id: string) {
     const connector = await this.connectorsService.findById(id);
@@ -1902,7 +2441,8 @@ export class ConnectorsController {
     summary: 'Import connectors and tools from a backup JSON',
     description:
       'Import a previously exported configuration. Skips connectors ' +
-      'with duplicate names. Does not import auth credentials.',
+      'with duplicate names. authConfig is never read from the file; a ' +
+      'password in a DATABASE connection string is moved into the encrypted authConfig.',
   })
   async importAll(@Req() req: any, @Body() body: ImportAllDto) {
     this.assertCanCreate(req);
@@ -1919,9 +2459,17 @@ export class ConnectorsController {
     description:
       'Takes the text of a file written by export-all or :id/export, in JSON ' +
       'or YAML, and imports it like import-all: into the caller\'s ' +
-      'organization only, skipping connectors with duplicate names, never ' +
-      'restoring auth credentials. Not to be confused with POST :id/import, ' +
-      'which imports tools from an API spec into an existing connector.',
+      'organization only, skipping connectors with duplicate names and never ' +
+      'reading authConfig from the file. Not to be confused with POST :id/import, ' +
+      'which imports tools from an API spec into an existing connector.\n\n' +
+      '```bash\namcp api POST /api/connectors/import --data "$(jq -Rs \'{content: .}\' acme.yaml)" --yes\n```',
+  })
+  @ApiResponse({
+    status: 201,
+    schema: {
+      type: 'object',
+      example: { message: 'Imported 1 connectors with 14 tools', created: 1, skipped: 0, tools: 14, errors: [] },
+    },
   })
   async importFile(@Req() req: any, @Body() dto: ImportFileDto) {
     this.assertCanCreate(req);
@@ -1979,7 +2527,13 @@ export class ConnectorsController {
       // headers and tools: restored, they land in variables instead.
       const secrets = new SecretExtractor(c.name, c.envVars as Record<string, string> | undefined);
       const guarded = SECRET_GUARDED_TYPES.has(c.type);
-      const baseUrl = guarded ? secrets.extractUrl(c.baseUrl, 'baseUrl') : c.baseUrl;
+      // An export carries no authConfig, so a database password restored
+      // from it can only be in the connection string: move it there.
+      const dbCredentials =
+        c.type === 'DATABASE' ? moveUrlCredentials(c.baseUrl, undefined) : null;
+      const baseUrl = guarded
+        ? secrets.extractUrl(c.baseUrl, 'baseUrl')
+        : (dbCredentials?.baseUrl ?? c.baseUrl);
       // A catalog connector's headers are rebuilt from its own template when
       // its variables change (catalog-env-rebuild.util.ts); they are left alone.
       const fromCatalog = !!(c.config as { adapterSlug?: unknown } | undefined)?.adapterSlug;
@@ -2010,6 +2564,9 @@ export class ConnectorsController {
             baseUrl,
             isActive: c.isActive ?? true,
             authType: c.authType || 'NONE',
+            ...(dbCredentials
+              ? { authConfig: encrypt(JSON.stringify(dbCredentials.authConfig), this.encryptionKey) }
+              : {}),
             specUrl: c.specUrl,
             headers: headers as any,
             config: config as any,
@@ -2066,7 +2623,16 @@ export class ConnectorsController {
   }
 
   @Post(':id/import-spec')
-  @ApiOperation({ summary: 'Auto-generate MCP tools from API specification' })
+  @ApiOperation({
+    summary: 'Auto-generate MCP tools from API specification',
+    description:
+      'Reads the spec the connector already points at and creates one tool per operation: the OpenAPI document at ' +
+      '`specUrl` (or the stored spec) for REST, the WSDL at `specUrl` or the base URL for SOAP, the schema by ' +
+      'introspection for GraphQL. No body. Running it again updates the tools and deprecates (disables) those the spec no longer has. ' +
+      'For other sources (Postman, cURL, HAR, JSON, inline content) use `POST /api/connectors/{id}/import`. ' +
+      'A spec that cannot be fetched or parsed answers 422; a connector without a spec, or of a type with no spec import, ' +
+      'answers a success status (201) with `{"error": "…"}`.',
+  })
   async importSpec(@Req() req: any, @Param('id') id: string) {
     const connector = await this.connectorsService.findById(id);
     this.assertCanWrite(connector, req);
@@ -2126,6 +2692,51 @@ export class ConnectorsController {
   @Post(':id/import')
   @ApiOperation({
     summary: 'Import tools from any source: OpenAPI, Postman, cURL, HAR, WSDL, GraphQL',
+    description:
+      'Parses `content` (inline text) or `url` with the parser named by `source` and creates or updates the ' +
+      'connector\'s tools.\n\n' +
+      '- `openapi`, `postman`: `content` or `url`.\n' +
+      '- `wsdl`: `url` or `content` with the WSDL address, else the connector base URL.\n' +
+      '- `graphql`: introspects `url` or the connector base URL.\n' +
+      '- `curl`, `har`, `json`: `content` only. These **add** tools and deprecate nothing; `json` takes ' +
+      '`[{name, description, parameters, endpointMapping}]`.\n' +
+      '- `mcp`: lists the tools of the remote MCP server (MCP connectors; `url` is an optional MCP path).\n' +
+      '- `odata`: `service` path (and optional `entitySets`); its `$metadata` is fetched unless `content` holds it.\n\n' +
+      'A full spec import (OpenAPI, WSDL, GraphQL, Postman, MCP) deprecates (disables) the tools the spec no longer has; ' +
+      'an OData import only those of the same service. Tools are matched by operationId, then method and path, then name. ' +
+      'Parse failures answer a success status (201) with `{"error": "…"}`.',
+  })
+  @ApiBody({
+    type: ImportToolsDto,
+    examples: {
+      openapiUrl: {
+        summary: 'OpenAPI from a URL',
+        value: { source: 'openapi', url: 'https://api.acme.example/v1/openapi.json' },
+      },
+      curl: {
+        summary: 'One tool from a cURL command',
+        value: { source: 'curl', content: "curl -X GET 'https://api.acme.example/v1/customers?limit=10' -H 'Accept: application/json'" },
+      },
+      odata: {
+        summary: 'SAP OData service',
+        value: { source: 'odata', service: '/sap/opu/odata/sap/API_BUSINESS_PARTNER', entitySets: ['A_BusinessPartner'] },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 201,
+    schema: {
+      type: 'object',
+      example: {
+        message: 'Imported tools: created 42, updated 3, deprecated 1',
+        created: 42,
+        updated: 3,
+        deprecated: ['get_legacy_report'],
+        skipped: [],
+        renameConflicts: [],
+        tools: [{ id: '…', name: 'list_customers', isEnabled: true }],
+      },
+    },
   })
   async importTools(
     @Req() req: any,
@@ -2134,6 +2745,10 @@ export class ConnectorsController {
   ) {
     const connector = await this.connectorsService.findById(id);
     this.assertCanWrite(connector, req);
+
+    if (dto.url && ['openapi', 'wsdl', 'graphql', 'postman'].includes(dto.source)) {
+      dto.url = normalizeSpecUrl(dto.url);
+    }
 
     let parsedTools: any[] = [];
     // An OData import covers one service: only that service's tools may be
@@ -2334,92 +2949,14 @@ export class ConnectorsController {
   ) {
     const connector = await this.connectorsService.findById(id);
     this.assertCanWrite(connector, req);
-
-    // Trim pasted values — a stray leading/trailing space would be stored
-    // (and encrypted into authConfig below) verbatim and break auth with an
-    // error the UI can't explain, since the displayed value looks correct.
-    // Rebuild via Object.fromEntries (no dynamic user-keyed property write) so
-    // a stray leading/trailing space in a pasted value can't survive into the
-    // encrypted authConfig and produce a 401 the UI can't explain.
-    const trimmed: Record<string, string> = Object.fromEntries(
-      Object.entries(body.envVars || {}).map(([k, v]) => [
-        k.trim(),
-        typeof v === 'string' ? v.trim() : v,
-      ]),
+    // Clean-ups, field checks, derived settings, catalog credentials rebuilt
+    // and tools reloaded: connector-env-write.util.ts, shared with the
+    // WooCommerce one-click key callback.
+    const { updated, warnings } = await writeConnectorEnvVars(
+      { connectorsService: this.connectorsService, mcpServer: this.mcpServer, encryptionKey: this.encryptionKey },
+      connector,
+      body.envVars || {},
     );
-
-    const cfg = connector.config as { adapterSlug?: string } | null;
-    const adapter = cfg?.adapterSlug ? getAdapter(cfg.adapterSlug) : null;
-    const stored = (connector.envVars as Record<string, string> | null) || {};
-
-    // The editor never receives stored secrets, so it sends them back empty
-    // when they were not retyped: keep the stored value for those.
-    const kept = mergeMaskedEnvVars(trimmed, stored, secretContext(connector));
-
-    // The variable a base URL starts with (`{{SUBSTACK_PUBLICATION_URL}}`)
-    // must hold a whole URL: add the missing https:// to a bare host, refuse
-    // anything else with the variable's name. Catalog connectors store the
-    // resolved URL, so the template comes from the catalog; a hand-built
-    // connector keeps its template as the base URL itself.
-    // A tenant field (`{{FRESHDESK_DOMAIN}}.freshdesk.com`) pasted as the
-    // whole address keeps only the label it stands for, as at install;
-    // without it the edit stored `acme.freshdesk.com/api/v2.freshdesk.com/…`.
-    const normalized = this.normalizeVariables(connector, kept);
-    // The same field checks as the install form: this editor used to store
-    // what the form would have refused (an Odoo address with /web after the
-    // host, a CRM page where the Bitrix24 webhook URL goes).
-    this.assertCatalogValues(connector, normalized);
-    // Settings looked up from a changed value (Atlassian's cloudId when the
-    // site changes) are stored, or dropped, with it.
-    const envVars = (await this.withDerivedSettings(connector, normalized)) as Record<string, string>;
-
-    const updateData: {
-      envVars: Record<string, string>;
-      authConfig?: Record<string, unknown>;
-      baseUrl?: string;
-      headers?: Record<string, string>;
-    } = { envVars };
-    const warnings: string[] = [];
-
-    // For catalog-installed connectors, authConfig/baseUrl/headers were
-    // resolved from the adapter template at import time and frozen (auth
-    // encrypted). Re-resolve the fields that use a changed variable, so
-    // editing a variable changes the credentials used for requests, and leave
-    // the rest — a key corrected in the auth editor, issued OAuth tokens, a
-    // custom header — as stored. See catalog-env-rebuild.util.ts.
-    if (adapter) {
-      const rebuilt = rebuildCatalogCredentials({
-        adapter,
-        connectorAuthType: connector.authType,
-        storedAuthConfig: this.readAuthConfig(connector.authConfig),
-        storedBaseUrl: connector.baseUrl,
-        storedHeaders: (connector.headers as Record<string, string> | null) ?? null,
-        previousEnvVars: stored,
-        nextEnvVars: envVars,
-      });
-      if (rebuilt.authConfig) {
-        const consumerKey = rebuilt.authConfig.consumerKey;
-        if (connector.authType === 'OAUTH1' && typeof consumerKey === 'string') {
-          assertConsumerKeyIsNotEmail(
-            consumerKey,
-            rebuilt.authFieldVariables.consumerKey?.join(', '),
-          );
-        }
-        updateData.authConfig = rebuilt.authConfig;
-      }
-      if (rebuilt.baseUrl !== undefined) updateData.baseUrl = rebuilt.baseUrl;
-      if (rebuilt.headers) updateData.headers = rebuilt.headers;
-      for (const { variable, from } of rebuilt.aliasesUsed) {
-        warnings.push(
-          `${variable} is not set; used ${from}, its name in earlier versions ` +
-            `of this connector. Rename ${from} to ${variable} to silence this.`,
-        );
-      }
-      warnings.push(...describeMissing(rebuilt.missing));
-    }
-
-    const updated = await this.connectorsService.update(id, updateData);
-    await this.mcpServer.reloadConnectorTools(id);
     return { ...toPublicConnector(updated), warnings };
   }
 
@@ -2504,13 +3041,7 @@ export class ConnectorsController {
 
   /** The stored authConfig, or null when there is none or it cannot be read. */
   private readAuthConfig(authConfig: string | null): Record<string, unknown> | null {
-    if (!authConfig) return null;
-    try {
-      const cfg = JSON.parse(decrypt(authConfig, this.encryptionKey));
-      return cfg && typeof cfg === 'object' ? cfg : null;
-    } catch {
-      return null;
-    }
+    return readStoredAuthConfig(authConfig, this.encryptionKey);
   }
 
   @Get(':id/catalog-diff')
@@ -2518,15 +3049,19 @@ export class ConnectorsController {
     summary:
       'Preview catalog updates for a connector installed from the catalog. ' +
       'Returns the tool diff (safe vs structural) without applying anything.',
+    description:
+      'Connector owner or admin. In a workspace with restricted member visibility, a member who is not an admin gets ' +
+      '404 for a connector they cannot see.',
   })
   async catalogDiff(@Req() req: any, @Param('id') id: string) {
     const connector = await this.connectorsService.findById(id);
+    await this.hideUnlessVisible(req, connector, id);
     this.assertCanWrite(connector, req);
     const diff = await this.catalogResync.computeDiff(id);
     if (!diff) {
       return { catalogManaged: false };
     }
-    return { catalogManaged: true, ...diff };
+    return { catalogManaged: true, ...toPublicCatalogDiff(diff) };
   }
 
   @Post(':id/resync-catalog')
@@ -2553,7 +3088,7 @@ export class ConnectorsController {
     if (applied) {
       await this.mcpServer.reloadConnectorTools(id);
     }
-    return { applied, ...diff };
+    return { applied, ...toPublicCatalogDiff(diff) };
   }
 
   /**
@@ -2799,34 +3334,5 @@ export class ConnectorsController {
   }
 }
 
-/**
- * Whether a credential field holds an e-mail address rather than a key.
- * Written without a backtracking regex: the value is user input, and the
- * equivalent `^[^\s@/]+@[^\s@/]+\.[^\s@/]+$` is polynomial on crafted
- * strings (CodeQL js/polynomial-redos).
- */
-export function looksLikeEmail(value: string): boolean {
-  if (value.length > 320 || /[\s/]/.test(value)) return false;
-  const at = value.indexOf('@');
-  if (at <= 0 || at !== value.lastIndexOf('@')) return false;
-  const domain = value.slice(at + 1);
-  const dot = domain.lastIndexOf('.');
-  return dot > 0 && dot < domain.length - 1;
-}
-
-/**
- * Refuse an e-mail address as an OAuth 1.0a consumer key. Two
- * ImmobilienScout24 installs had the account's login there, and IS24 answered
- * "Consumer not found" to every call; no provider issues keys of that shape.
- * `source` names where the value came from (an environment variable) when it
- * was not typed into the consumer key field itself.
- */
-export function assertConsumerKeyIsNotEmail(value: string, source?: string): void {
-  if (!looksLikeEmail(value)) return;
-  throw new BadRequestException(
-    `The consumer key${source ? ` (${source})` : ''} looks like an e-mail ` +
-      'address. It is the key of the application registered with the ' +
-      'provider, not your login — copy it from the provider\'s developer or ' +
-      'API-key page.',
-  );
-}
+// Kept importable from here, where they used to live.
+export { assertConsumerKeyIsNotEmail, looksLikeEmail };

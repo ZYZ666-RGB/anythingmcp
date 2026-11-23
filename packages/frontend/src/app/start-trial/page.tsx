@@ -1,12 +1,14 @@
 'use client';
 
+import { PlanFitNotice } from '@/components/plan-fit-notice';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useLocale, useTranslations } from 'next-intl';
 import { useAuth } from '@/lib/auth-context';
-import { license, productEvents } from '@/lib/api';
+import { license, productEvents, type PlanFits } from '@/lib/api';
 import { LogoIcon } from '@/components/logo-icon';
 import { PlanPicker } from '@/components/plan-picker';
+import { PaywallIntl } from '@/components/paywall-intl';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import {
@@ -16,9 +18,14 @@ import {
   formatEur,
   formatTrialEnd,
   planById,
+  fitFor,
+  isAuthorizationPath,
+  isBackendAuthorizationPath,
   readAuthorizationReturn,
   readPlanIntent,
   readPromoCode,
+  saveAuthorizationReturn,
+  selectionForFit,
   takeAuthorizationReturn,
   trialRunning,
   writeCardTrialPrompt,
@@ -69,7 +76,16 @@ function deviceKind(): 'mobile' | 'desktop' {
   }
 }
 
+/** The card-trial page, in the visitor's language among the website's seven. */
 export default function StartTrialPage() {
+  return (
+    <PaywallIntl fallback={<div className="min-h-screen bg-[var(--bg)]" />}>
+      <StartTrialContent />
+    </PaywallIntl>
+  );
+}
+
+function StartTrialContent() {
   const { token, user, isLoading, deploymentMode, deploymentModeLoaded } = useAuth();
   const localPricing = useLocalPricing(deploymentMode === 'cloud');
   const router = useRouter();
@@ -91,22 +107,58 @@ export default function StartTrialPage() {
   // Which entry point sent the user here (?source=…), for Stripe and the events.
   const [source, setSource] = useState<CheckoutSource>('start_trial');
   const viewReported = useRef(false);
+  // What Starter and Team keep and pause for this workspace, shown under the
+  // plans before the card is added (the plan changes when the trial converts).
+  const [planFit, setPlanFit] = useState<PlanFits | null>(null);
+  // Set once the plan is chosen (pricing page intent or a click): the plan fit
+  // no longer moves the selection then.
+  const picked = useRef(false);
   // Set when the user came from "Connect" in an AI client: every way out of
   // this page goes back to that authorization.
   const [authorizationReturn, setAuthorizationReturn] = useState<string | null>(null);
+  // `?return=` is stored once per page load: stored again after leaving, it
+  // would send a later visit to an authorization that is long finished.
+  const returnStored = useRef(false);
+
+  // Set once the browser is on its way to the authorization. The stored
+  // return is spent by then, so a second call (the effect below runs again
+  // when the session refreshes) would send the same person to the dashboard.
+  const leavingForAuthorization = useRef(false);
+  useEffect(() => {
+    // Back on this page through the Back button (restored as it was left):
+    // the ways out work again.
+    const reset = (event: PageTransitionEvent) => {
+      if (event.persisted) leavingForAuthorization.current = false;
+    };
+    window.addEventListener('pageshow', reset);
+    return () => window.removeEventListener('pageshow', reset);
+  }, []);
 
   /** Leave for the waiting authorization (a backend page) or for `fallback`. */
   const leave = useCallback(
     (fallback: string) => {
+      if (leavingForAuthorization.current) return;
       const target = takeAuthorizationReturn(fallback);
-      if (target.startsWith('/auth/')) window.location.assign(target);
-      else router.replace(target);
+      if (isBackendAuthorizationPath(target)) {
+        leavingForAuthorization.current = true;
+        window.location.assign(target);
+      } else router.replace(target);
     },
     [router],
   );
 
   useEffect(() => {
     if (isLoading || !deploymentModeLoaded) return;
+    // Opened from the page after approving an AI client
+    // (`?return=/callback`): every way out finishes that authorization. Stored
+    // before anything below can leave the page, so the exits for someone the
+    // offer is not for (not an admin, no running trial, a licence that could
+    // not be read) go back to the client too, instead of to the dashboard.
+    if (deploymentMode === 'cloud' && !returnStored.current) {
+      returnStored.current = true;
+      const returnTo = new URLSearchParams(window.location.search).get('return');
+      if (isAuthorizationPath(returnTo)) saveAuthorizationReturn(returnTo);
+    }
     if (!token || !user) {
       // Keep ?source= through the sign-in (the offer email links here).
       router.replace(`/login?redirect=${encodeURIComponent(`/start-trial${window.location.search}`)}`);
@@ -132,7 +184,9 @@ export default function StartTrialPage() {
         setFreeTrialEnd(lic.expiresAt ?? null);
         setAuthorizationReturn(readAuthorizationReturn());
         setTrialEnd(cardTrialDisplayEnd(lic.expiresAt));
-        setSelection(readPlanIntent() ?? DEFAULT_SELECTION);
+        const intent = readPlanIntent();
+        picked.current = !!intent;
+        setSelection(intent ?? DEFAULT_SELECTION);
         setPromo(readPromoCode());
         const from = parseCheckoutSource(new URLSearchParams(window.location.search).get('source')) ?? 'start_trial';
         setSource(from);
@@ -149,6 +203,28 @@ export default function StartTrialPage() {
       live = false;
     };
   }, [isLoading, deploymentModeLoaded, deploymentMode, token, user, router, leave]);
+
+  useEffect(() => {
+    if (!ready || !token) return;
+    let live = true;
+    license
+      .getPlanFit(token)
+      .then((r) => {
+        const plans = r?.plans && typeof r.plans === 'object' ? r.plans : null;
+        if (!live || !plans) return;
+        setPlanFit(plans);
+        if (!picked.current) setSelection((prev) => selectionForFit(prev, plans));
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [ready, token]);
+
+  const choosePlan = (next: PlanSelection) => {
+    picked.current = true;
+    setSelection(next);
+  };
 
   // The licence site refused the trial at checkout: say so before sending anyone on.
   const paysToday = kind !== 'trial' || !!checkout.chargesTodayUrl;
@@ -198,11 +274,11 @@ export default function StartTrialPage() {
       ? t('start.tryAgain')
       : paysToday
         ? t('start.checkout')
-        : t('start.withCard');
+        : t('start.trial');
 
   return (
     <div className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
-      <header className="max-w-3xl mx-auto px-6 pt-5 flex items-center justify-between gap-4">
+      <header className="max-w-3xl mx-auto px-4 sm:px-6 pt-4 sm:pt-5 flex items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <span className="flex h-[30px] w-[30px] items-center justify-center rounded-[8px] bg-[var(--brand-tint)] text-[var(--brand)]">
             <LogoIcon size={20} />
@@ -211,22 +287,24 @@ export default function StartTrialPage() {
             Anything<span className="text-[var(--brand)]">MCP</span>
           </span>
         </div>
-        {/* Deliberately quiet: a plain text link in the corner, not a button. */}
+        {/* Easy to find on a phone: people who do not want to add a payment
+            method now must see straight away that they can go on without. */}
         <button
           type="button"
+          data-testid="skip-corner"
           onClick={handleSkip}
-          className="text-xs text-[var(--text-3)] underline-offset-2 hover:text-[var(--text-2)] hover:underline"
+          className="shrink-0 rounded-full border border-[var(--border-strong)] bg-[var(--surface)] px-3 py-1.5 text-[13px] font-medium text-[var(--text)] hover:border-[var(--brand)] hover:text-[var(--brand)]"
         >
           {t('skipCorner')}
         </button>
       </header>
 
-      <main className="max-w-3xl mx-auto px-6 py-10 sm:py-14">
-        <div className="text-center mb-8">
-          <p className="text-xs uppercase tracking-[0.18em] text-[var(--brand)] font-mono mb-3">
+      <main className="max-w-3xl mx-auto px-4 sm:px-6 py-6 sm:py-14">
+        <div className="text-center mb-5 sm:mb-8">
+          <p className="text-xs uppercase tracking-[0.18em] text-[var(--brand)] font-mono mb-2 sm:mb-3">
             {paysToday ? t('eyebrow.choosePlan') : endLong ? t('eyebrow.freeUntil', { date: endLong }) : t('eyebrow.freeTrial')}
           </p>
-          <h1 className="text-3xl sm:text-4xl font-bold tracking-tight mb-3">
+          <h1 className="text-2xl sm:text-4xl font-bold tracking-tight mb-2 sm:mb-3">
             {paysToday ? t('title.paysToday') : t('title.trial')}
           </h1>
           {kind === 'ending' ? (
@@ -240,9 +318,16 @@ export default function StartTrialPage() {
               {endLong ? t.rich('returning', { date: endLong, strong }) : t.rich('returningNoDate', { strong })}
             </p>
           ) : (
-            <p className="text-[var(--text-2)] max-w-xl mx-auto">
-              {endLong ? t.rich('trial', { date: endLong, strong }) : t.rich('trialNoDate', { strong })}
-            </p>
+            <>
+              {/* On a phone the full text pushed the plans below the first
+                  screen: one sentence there, the rest under the buttons. */}
+              <p data-testid="trial-intro-short" className="sm:hidden text-[var(--text-2)] max-w-xl mx-auto">
+                {endLong ? t.rich('trialShort', { date: endLong, strong }) : t.rich('trialShortNoDate', { strong })}
+              </p>
+              <p className="hidden sm:block text-[var(--text-2)] max-w-xl mx-auto">
+                {endLong ? t.rich('trial', { date: endLong, strong }) : t.rich('trialNoDate', { strong })}
+              </p>
+            </>
           )}
           {authorizationReturn && (
             <p className="mt-3 text-sm text-[var(--text-2)] max-w-xl mx-auto">
@@ -254,7 +339,7 @@ export default function StartTrialPage() {
         <Card className="p-5 sm:p-6">
           <PlanPicker
             value={selection}
-            onChange={setSelection}
+            onChange={choosePlan}
             disabled={checkout.loading || !!checkout.chargesTodayUrl}
           />
 
@@ -272,6 +357,10 @@ export default function StartTrialPage() {
             >
               {startLabel}
             </Button>
+            {/* Right under the button: what is due today, and that a card is not the only way to pay. */}
+            <p data-testid="payment-methods" className="-mt-1 text-xs font-medium text-[var(--text-2)] text-center">
+              {paysToday ? t('methods.pay') : t('methods.trial')}
+            </p>
             {promo && (
               <p className="text-xs font-medium text-[var(--ok)] text-center">
                 {t('promo', { code: promo })}
@@ -289,18 +378,44 @@ export default function StartTrialPage() {
                   ? t('finePrintTrial', { plan: plan.name, period: selection.period, date: endLong })
                   : t('finePrintTrialNoDate', { plan: plan.name, period: selection.period })}
             </p>
-            <p className="text-xs text-[var(--text-2)] text-center">
-              {paysToday ? t('notReady') : t('notReadyCard')}{' '}
-              <button
-                type="button"
-                onClick={handleSkip}
-                className="font-medium text-[var(--brand)] underline-offset-2 hover:underline"
-              >
-                {paysToday ? t('keepFree') : t('tryFree')}
-              </button>
-            </p>
+            {paysToday ? (
+              <p className="text-xs text-[var(--text-2)] text-center">
+                {t('notReady')}{' '}
+                <button
+                  type="button"
+                  onClick={handleSkip}
+                  className="font-medium text-[var(--brand)] underline-offset-2 hover:underline"
+                >
+                  {t('keepFree')}
+                </button>
+              </p>
+            ) : (
+              <>
+                <Button
+                  variant="secondary"
+                  size="lg"
+                  className="w-full sm:w-auto sm:min-w-[260px]"
+                  onClick={handleSkip}
+                >
+                  {t('tryFree')}
+                </Button>
+                <p className="-mt-1 text-xs text-[var(--text-3)] text-center max-w-md">{t('skipNote')}</p>
+              </>
+            )}
           </div>
         </Card>
+        {/* What the chosen plan changes for this workspace: under the card, in the same column. */}
+        <PlanFitNotice
+          className="mt-4"
+          fit={fitFor(planFit, selection.plan)}
+          quietFit={selection.plan === 'team'}
+          onTrack={(action, plan) => {
+            if (token) productEvents.track('paywall_action', token, { source, action, plan, device: deviceKind() });
+          }}
+          onChooseTeam={
+            !checkout.loading && fitFor(planFit, 'team')?.fits ? () => choosePlan({ ...selection, plan: 'team' }) : undefined
+          }
+        />
       </main>
     </div>
   );

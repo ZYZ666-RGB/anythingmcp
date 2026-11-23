@@ -120,6 +120,14 @@ describe('McpOAuthCallbackController — provider redirect', () => {
     expect(updateAuthConfigMerge).not.toHaveBeenCalled();
   });
 
+  it('does not rate limit the notifications (Mercado Libre retries every 429)', () => {
+    // @SkipThrottle() stores THROTTLER:SKIP + the bucket name on the handler.
+    const skip = (handler: unknown) => Reflect.getMetadata('THROTTLER:SKIPdefault', handler as object);
+    expect(skip(McpOAuthCallbackController.prototype.acknowledgeNotification)).toBe(true);
+    // The browser redirect keeps the global limit.
+    expect(skip(McpOAuthCallbackController.prototype.oauthCallback)).toBeUndefined();
+  });
+
   it('forwards code and state to the dashboard and exchanges nothing itself', async () => {
     const { controller, mcpOAuthService, updateAuthConfigMerge } = makeController();
     const res = makeRes();
@@ -178,6 +186,20 @@ describe('McpOAuthCallbackController — completion by the dashboard', () => {
     expect(mcpOAuthService.exchangeCodeForTokens).toHaveBeenCalledWith(
       expect.objectContaining({ code: 'the-code', userAgent: 'web:anythingmcp:v1 (by /u/anythingmcp)' }),
     );
+  });
+
+  it("passes the flow's tokenResponsePath to the code exchange (a token answer inside a wrapper)", async () => {
+    const { controller, mcpOAuthService } = makeController({ flow: { tokenResponsePath: 'data' } });
+    await controller.complete(asUser('user-1'), { state: 'the-state', code: 'the-code' });
+    expect(mcpOAuthService.exchangeCodeForTokens).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'the-code', tokenResponsePath: 'data' }),
+    );
+  });
+
+  it('adds no tokenResponsePath to the code exchange of a flow that has none', async () => {
+    const { controller, mcpOAuthService } = makeController();
+    await controller.complete(asUser('user-1'), { state: 'the-state', code: 'the-code' });
+    expect(mcpOAuthService.exchangeCodeForTokens.mock.calls[0][0]).not.toHaveProperty('tokenResponsePath');
   });
 
   it('refuses a user other than the one who started the flow, and kills the attempt', async () => {

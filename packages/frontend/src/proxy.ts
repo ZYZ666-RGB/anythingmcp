@@ -56,9 +56,23 @@ export function proxy(request: NextRequest) {
     // Setup links from an AI client: the page opens a session from the
     // sign-in just made to connect that client, or sends to /login itself.
     pathname.startsWith('/s/') ||
+    // Reactivation links an AI client shows once the trial ended: the token
+    // names the workspace and the page sells its plans without a sign-in.
+    pathname.startsWith('/reactivate/') ||
+    // One-time upload links from an AI client (file_upload_link): the token
+    // is the credential, no sign-in.
+    pathname.startsWith('/upload/') ||
+    // The File Search plugin's hand-off from its authorization page: it opens
+    // a session from the sign-in just made there, or shows how to go on.
+    pathname === '/setup/file-search' ||
     pathname.startsWith('/auth') ||
     pathname.startsWith('/.well-known') ||
     pathname === '/authorize' ||
+    // Where an AI client's authorization finishes, after "Allow access". The
+    // sign-in for it happens on the backend's own page and leaves no
+    // dashboard session, so behind a single port this gate sent the browser
+    // to /login instead and the client was never connected.
+    pathname === '/callback' ||
     pathname === '/token' ||
     // OIDC UserInfo: called by relying parties with a bearer token, never by
     // a browser session. Sending it to /login broke ChatGPT's identity check.
@@ -71,6 +85,12 @@ export function proxy(request: NextRequest) {
     // the key in sessionStorage, and it holds no data — the API it calls is
     // authenticated.
     pathname === '/settings/license/activate' ||
+    // Where a provider authorization completes. A TikTok Shop App Store
+    // install arrives here from TikTok, often before the seller has an
+    // account, and the page offers both sign-in and sign-up; every other
+    // flow is sent to /login by the page itself, as before. It holds no
+    // data, and the APIs it calls are authenticated.
+    pathname === '/connectors/oauth/complete' ||
     // Sentry tunnel (tunnelRoute in next.config.ts). Errors on /login and
     // /register come from signed-out visitors; redirecting them to /login
     // would drop exactly those reports.

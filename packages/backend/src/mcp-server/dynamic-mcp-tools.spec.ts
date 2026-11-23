@@ -1,4 +1,4 @@
-import { DynamicMcpTools } from './dynamic-mcp-tools';
+import { COMPACT_RENDER_CHARS, DynamicMcpTools } from './dynamic-mcp-tools';
 import type { RegisteredTool } from './tool-registry';
 import { Logger } from '@nestjs/common';
 import * as metrics from '../common/metrics';
@@ -151,6 +151,14 @@ describe('DynamicMcpTools — response shaping', () => {
     );
   });
 
+  it('hands the support key id to the audit, so the call stays out of the workspace logs', async () => {
+    const { executor, audit } = build(makeTool(SELECT_TRANSFORM));
+    await executor.executeTool('list_devices', {}, { userId: 'u1', authMethod: 'mcp_api_key', supportKeyId: 'sk-1' });
+    expect(audit.logInvocation).toHaveBeenCalledWith(expect.objectContaining({ supportKeyId: 'sk-1' }));
+    await executor.executeTool('list_devices', {}, { userId: 'u1', authMethod: 'mcp_api_key' });
+    expect(audit.logInvocation.mock.calls[1][0].supportKeyId).toBeUndefined();
+  });
+
   it('returns the raw response and does not fail the call when the mapping is broken', async () => {
     const { executor } = build(makeTool({ transform: { select: { bad: 'a[' } } }));
     const res = await executor.executeTool('list_devices', {});
@@ -194,6 +202,38 @@ describe('DynamicMcpTools — actionable hint on upstream errors', () => {
     // The audit row keeps the raw upstream cause, not the hint.
     expect(audit.logInvocation.mock.calls[0][0].error).toMatch(/unknown property/);
     expect(audit.logInvocation.mock.calls[0][0].error).not.toMatch(/fetch ONE record/);
+  });
+
+  it("returns the vendor's request id (intuit_tid) with the allowed headers, and drops the others", async () => {
+    const { AxiosError } = await import('axios');
+    const tool = makeTool();
+    tool.connectorConfig = { baseUrl: 'https://sandbox-quickbooks.api.intuit.com/v3/company/9341453050071234', authType: 'NONE' };
+    const { executor, restEngine, audit } = build(tool);
+    const err = new AxiosError('Request failed with status code 400', '400', { url: '/payment', baseURL: tool.connectorConfig.baseUrl } as any, undefined, {
+      status: 400,
+      statusText: 'Bad Request',
+      // As axios hands them over: names in lower case.
+      headers: {
+        intuit_tid: '1-6744f2a1-3c5d7e9f0a1b2c3d4e5f6a7b',
+        'content-type': 'application/json;charset=UTF-8',
+        'set-cookie': ['ivid=abc; Path=/'],
+        server: 'nginx',
+      },
+      config: {} as any,
+      data: { Fault: { Error: [{ Message: 'Business Validation Error', code: '6000' }], type: 'ValidationFault' } },
+    });
+    restEngine.execute.mockRejectedValueOnce(err);
+
+    const res = await executor.executeTool('list_devices', {});
+
+    expect(res.isError).toBe(true);
+    const detail = JSON.parse(res.content[0].text);
+    expect(detail.responseHeaders).toEqual({
+      intuit_tid: '1-6744f2a1-3c5d7e9f0a1b2c3d4e5f6a7b',
+      'content-type': 'application/json;charset=UTF-8',
+    });
+    expect(detail.responseBody.Fault.Error[0].code).toBe('6000');
+    expect(audit.logInvocation.mock.calls[0][0].error).toMatch(/Business Validation Error/);
   });
 
   it("returns the engine's own hint (a refused refresh token) to the model", async () => {
@@ -275,6 +315,21 @@ describe('DynamicMcpTools — actionable hint on upstream errors', () => {
       );
       const detail = JSON.parse((await executor.executeTool('list_devices', {})).content[0].text);
       expect(detail.hint).toMatch(/AnythingMCP Cloud calls TallyPrime over the internet/);
+    });
+
+    it("names the Etsy tags over Etsy's limit, from the call's own arguments", async () => {
+      const base = 'https://openapi.etsy.com/v3/application';
+      const { executor, restEngine } = build(catalogTool('etsy', base));
+      restEngine.execute.mockRejectedValueOnce(
+        await axiosFailure(400, { error: 'There was a problem with /tags : cannot be more than 20 characters' }, base),
+      );
+      const res = await executor.executeTool('list_devices', {
+        tags: 'mug, handmade ceramic coffee mug ,gift',
+        description: 'not quoted back',
+      });
+      const detail = JSON.parse(res.content[0].text);
+      expect(detail.hint).toMatch(/^tag "handmade ceramic coffee mug" has 27 characters; Etsy allows at most 20 characters per tag on English listings\./);
+      expect(detail.hint).not.toMatch(/gift|not quoted back/);
     });
 
     it('asks Odoo which databases it serves when a call says "No database is selected"', async () => {
@@ -1250,6 +1305,19 @@ describe('DynamicMcpTools — the size limit on the rendered result', () => {
     const res = await executor.executeTool('list_devices', {});
     expect(restEngine.execute).not.toHaveBeenCalled();
     expectTooLarge(res);
+  });
+
+  it('renders a large object compactly from the start, without a pretty-printed pass', async () => {
+    setLimit(50 * 1024 * 1024);
+    const big = { items: Array.from({ length: 12_000 }, (_, i) => ({ id: i, name: `order-${i}`, note: 'x'.repeat(60) })) };
+    const compact = JSON.stringify(big);
+    expect(compact.length).toBeGreaterThan(COMPACT_RENDER_CHARS);
+    const { executor } = build(makeTool(), { engineResult: big });
+    const stringify = jest.spyOn(JSON, 'stringify');
+    const res = await executor.executeTool('list_devices', {});
+    expect(res.isError).toBeUndefined();
+    expect(res.content[0].text).toBe(compact);
+    expect(stringify.mock.calls.some(([v, , indent]) => v === big && indent === 2)).toBe(false);
   });
 
   it('uses the 10 MB default when TOOL_MAX_RESPONSE_BYTES is unset', async () => {

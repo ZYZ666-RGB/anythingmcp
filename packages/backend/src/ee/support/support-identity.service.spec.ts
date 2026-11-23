@@ -1,6 +1,12 @@
 import { NotFoundException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { SupportIdentityService, splitName } from './support-identity.service';
+import {
+  SupportIdentityService,
+  connectorLinks,
+  mcpServerUrls,
+  missingOAuthAppKeys,
+  splitName,
+} from './support-identity.service';
 import { instanceHost, supportChatConfig, supportModuleEnabled, supportTriageConfig } from './support-config';
 
 const SAVED = { ...process.env };
@@ -19,11 +25,24 @@ function fakePrisma() {
     organization: { findUnique: jest.fn().mockResolvedValue({ name: 'Acme' }) },
     connector: {
       findMany: jest.fn().mockResolvedValue([
-        { id: 'c1', name: 'Etsy', isActive: true, authStatus: 'needs_reauth', authStatusMessage: 'refresh token revoked' },
+        {
+          id: 'c1',
+          name: 'Etsy',
+          isActive: true,
+          authStatus: 'needs_reauth',
+          authStatusMessage: 'refresh token revoked',
+          config: { adapterSlug: 'etsy' },
+        },
         { id: 'c2', name: 'Shopify', isActive: true, authStatus: null, authStatusMessage: null },
         { id: 'c3', name: 'Old', isActive: false, authStatus: null, authStatusMessage: null },
       ]),
     },
+    mcpServerConfig: {
+      findMany: jest.fn().mockResolvedValue([{ id: 's1', name: 'Default (Ada)' }]),
+    },
+    // No stored first success and no member stamp unless a test sets one.
+    orgSettings: { findUnique: jest.fn().mockResolvedValue(null) },
+    organizationMember: { findMany: jest.fn().mockResolvedValue([]) },
     toolInvocation: {
       groupBy: jest.fn().mockResolvedValue([{ connectorId: 'c2', _count: { _all: 7 } }]),
       findFirst: jest.fn().mockResolvedValue({
@@ -92,6 +111,7 @@ describe('SupportIdentityService', () => {
     process.env.SUPPORT_CHAT_INBOX_ID = 'inbox-uuid';
     process.env.SUPPORT_CHAT_SECRET = 'inbox-secret';
     process.env.FRONTEND_URL = 'https://cloud.anythingmcp.com';
+    process.env.SERVER_URL = 'https://cloud.anythingmcp.com/';
   });
   afterEach(() => {
     process.env = { ...SAVED };
@@ -125,6 +145,57 @@ describe('SupportIdentityService', () => {
     expect(attrs.connector_issues).not.toContain('FAKE-not-a-real-credential-0000');
   });
 
+  it('says when a catalog OAuth app has no keys saved, so the desk knows why Authorize does nothing', async () => {
+    const { svc, prisma } = build();
+    prisma.connector.findMany.mockResolvedValue([
+      {
+        id: 'c9',
+        name: 'Etsy Open API v3',
+        isActive: true,
+        authStatus: null,
+        authStatusMessage: null,
+        config: { adapterSlug: 'etsy' },
+        type: 'REST',
+        authType: 'OAUTH2',
+        envVars: null,
+      },
+    ]);
+    prisma.toolInvocation.groupBy.mockResolvedValue([]);
+    const attrs = await svc.contactAttributes('u1', 'org1');
+    expect(attrs.connector_issues).toBe(
+      'Etsy Open API v3: app keys not saved: Keystring, Shared Secret (Authorize cannot start)',
+    );
+  });
+
+  describe('missingOAuthAppKeys', () => {
+    const etsy = { type: 'REST', authType: 'OAUTH2', config: { adapterSlug: 'etsy' } };
+
+    it('lists the empty, placeholder or unsaved app keys by their label', () => {
+      expect(missingOAuthAppKeys({ ...etsy, envVars: null })).toEqual(['Keystring', 'Shared Secret']);
+      expect(missingOAuthAppKeys({ ...etsy, envVars: { ETSY_CLIENT_ID: 'abc123', ETSY_CLIENT_SECRET: ' ' } })).toEqual([
+        'Shared Secret',
+      ]);
+      expect(
+        missingOAuthAppKeys({ ...etsy, envVars: { ETSY_CLIENT_ID: 'PASTE_YOUR_KEYSTRING', ETSY_CLIENT_SECRET: 'x1' } }),
+      ).toEqual(['Keystring']);
+    });
+
+    it('is empty once both keys are saved', () => {
+      expect(missingOAuthAppKeys({ ...etsy, envVars: { ETSY_CLIENT_ID: 'abc123', ETSY_CLIENT_SECRET: 'def456' } })).toEqual(
+        [],
+      );
+    });
+
+    it('leaves out non-OAuth, MCP, hand-made and unknown connectors', () => {
+      expect(missingOAuthAppKeys({ ...etsy, authType: 'API_KEY', envVars: null })).toEqual([]);
+      expect(missingOAuthAppKeys({ ...etsy, type: 'MCP', envVars: null })).toEqual([]);
+      expect(missingOAuthAppKeys({ type: 'REST', authType: 'OAUTH2', config: {}, envVars: null })).toEqual([]);
+      expect(
+        missingOAuthAppKeys({ type: 'REST', authType: 'OAUTH2', config: { adapterSlug: 'no-such-adapter' }, envVars: null }),
+      ).toEqual([]);
+    });
+  });
+
   it('names the connectors and the day of the last successful tool call', async () => {
     const { svc, prisma } = build();
     prisma.toolInvocation.findFirst.mockImplementation(async (q: any) =>
@@ -137,10 +208,89 @@ describe('SupportIdentityService', () => {
     expect(q.where.organizationId).toBe('org1');
   });
 
+  it('links each connector to its own page, so the desk never sends the generic setup link', async () => {
+    const { svc } = build();
+    const attrs = await svc.contactAttributes('u1', 'org1');
+    expect(attrs.connector_links).toBe(
+      'Etsy: https://cloud.anythingmcp.com/connectors/setup/etsy?connector=c1 | ' +
+        'Shopify: https://cloud.anythingmcp.com/connectors/c2 | Old: https://cloud.anythingmcp.com/connectors/c3',
+    );
+  });
+
+  it('builds no links without a dashboard URL, and keeps them bounded', () => {
+    expect(connectorLinks([{ id: 'c1', name: 'Etsy' }], undefined)).toBe('');
+    expect(connectorLinks([{ id: 'c1', name: 'Etsy' }], 'not a url')).toBe('');
+    const many = Array.from({ length: 40 }, (_, i) => ({ id: `id${i}`, name: 'X'.repeat(80) }));
+    const out = connectorLinks(many, 'https://cloud.anythingmcp.com/');
+    expect(out.length).toBeLessThanOrEqual(1500);
+    expect(out.split(' | ').length).toBeLessThanOrEqual(15);
+    expect(out).not.toContain('com//connectors');
+  });
+
+  it("gives the workspace's MCP server URL, the address an AI client connects to", async () => {
+    const { svc, prisma } = build();
+    const attrs = await svc.contactAttributes('u1', 'org1');
+    expect(attrs.mcp_server_urls).toBe('Default (Ada): https://cloud.anythingmcp.com/mcp/s1');
+    const q = prisma.mcpServerConfig.findMany.mock.calls[0][0];
+    expect(q.where).toEqual({ organizationId: 'org1', isActive: true });
+  });
+
+  it('builds no server URL without a public server URL, and keeps the list bounded', () => {
+    expect(mcpServerUrls([{ id: 's1', name: 'Default' }], undefined)).toBe('');
+    expect(mcpServerUrls([{ id: 's1', name: 'Default' }], 'not a url')).toBe('');
+    const many = Array.from({ length: 6 }, (_, i) => ({ id: `s${i}`, name: `S${i}` }));
+    const out = mcpServerUrls(many, 'https://cloud.anythingmcp.com');
+    expect(out.split(' | ')).toHaveLength(5);
+    expect(out).toContain('and more on the MCP Servers page');
+    expect(out).not.toContain('/connectors/');
+  });
+
   it('says "never" when no AI client has called a tool yet', async () => {
     const { svc, prisma } = build();
     prisma.toolInvocation.findFirst.mockResolvedValue(null);
     expect((await svc.contactAttributes('u1', 'org1')).last_tool_call).toBe('never');
+  });
+
+  describe('when the retention deleted every successful call', () => {
+    afterEach(() => {
+      process.env = { ...SAVED };
+    });
+
+    it('says "more than 90 days ago" when the workspace stored its first success', async () => {
+      delete process.env.INVOCATION_RETENTION_DAYS;
+      const { svc, prisma } = build();
+      prisma.toolInvocation.findFirst.mockResolvedValue(null);
+      prisma.orgSettings.findUnique.mockResolvedValue({ value: '2026-06-01T10:00:00.000Z' });
+      expect((await svc.contactAttributes('u1', 'org1')).last_tool_call).toBe('more than 90 days ago');
+      expect(prisma.orgSettings.findUnique.mock.calls[0][0].where).toEqual({
+        organizationId_key: { organizationId: 'org1', key: 'first_successful_call_at' },
+      });
+    });
+
+    it("uses a member's first-success stamp and the configured retention", async () => {
+      process.env.INVOCATION_RETENTION_DAYS = '30';
+      const { svc, prisma } = build();
+      prisma.toolInvocation.findFirst.mockResolvedValue(null);
+      prisma.organizationMember.findMany.mockResolvedValue([
+        { joinedAt: new Date('2026-06-01T00:00:00Z'), user: { firstSuccessfulInvocationAt: new Date('2026-06-02T00:00:00Z') } },
+      ]);
+      expect((await svc.contactAttributes('u1', 'org1')).last_tool_call).toBe('more than 30 days ago');
+      expect(prisma.organizationMember.findMany.mock.calls[0][0].where).toMatchObject({ organizationId: 'org1' });
+    });
+
+    it('says "not in the call history" on a dedicated instance, which runs no retention', async () => {
+      const { svc, prisma } = build(false);
+      prisma.toolInvocation.findFirst.mockResolvedValue(null);
+      prisma.orgSettings.findUnique.mockResolvedValue({ value: '2026-06-01T10:00:00.000Z' });
+      expect((await svc.contactAttributes('u1', 'org1')).last_tool_call).toBe('not in the call history');
+    });
+
+    it('still gives the day when a successful call is kept, without reading the markers', async () => {
+      const { svc, prisma } = build();
+      prisma.toolInvocation.findFirst.mockResolvedValue({ createdAt: new Date('2026-11-01T08:00:00Z') });
+      expect((await svc.contactAttributes('u1', 'org1')).last_tool_call).toBe('2026-11-01');
+      expect(prisma.orgSettings.findUnique).not.toHaveBeenCalled();
+    });
   });
 
   it('filters every query by the caller organization', async () => {

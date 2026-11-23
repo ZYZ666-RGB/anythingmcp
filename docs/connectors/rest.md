@@ -407,6 +407,46 @@ way. Set `tokenAuthMethod` to `private_key_jwt` and describe the signature under
   (`BEGIN EC PRIVATE KEY`). A key pasted into a single-line field, with its line breaks gone, still works.
   Passphrase-protected keys are refused with a message saying how to export one without a passphrase.
 
+#### Token answers inside a wrapper (`tokenResponsePath`)
+
+RFC 6749 §5.1 puts `access_token`, `refresh_token` and `expires_in` at the top level of the token answer,
+and that is where they are read. A few providers wrap them in an answer of their own. Joom's token and
+refresh calls answer:
+
+```json
+{ "code": 0, "message": "", "data": { "access_token": "…", "refresh_token": "…", "expires_in": 2592000 } }
+```
+
+Name the object that holds the token fields in `authConfig.tokenResponsePath`, as a dotted path of keys:
+
+```json
+"authConfig": {
+  "grant": "refresh_token",
+  "authorizationUrl": "https://api-merchant.joom.com/api/v2/oauth/authorize",
+  "tokenUrl": "https://api-merchant.joom.com/api/v2/oauth/access_token",
+  "refreshUrl": "https://api-merchant.joom.com/api/v2/oauth/refresh_token",
+  "tokenResponsePath": "data",
+  "pkce": false,
+  "clientId": "{{JOOM_CLIENT_ID}}",
+  "clientSecret": "{{JOOM_CLIENT_SECRET}}",
+  "refreshToken": "{{JOOM_REFRESH_TOKEN}}"
+}
+```
+
+- The setting applies to the authorization-code exchange, to every refresh and to the `client_credentials`
+  and `password` grants: the access token, the refresh token and the lifetime are all read from that object.
+- It is opt-in. Without it nothing changes: the fields are read at the top level and a `data` object in the
+  answer is not looked into.
+- When the answer has no object at the path, the sign-in or the renewal fails with a message that names
+  the path and quotes the provider's own top-level `code` and `message` (how these APIs report a refused
+  code or refresh token inside a `200`). Nothing else of the answer is quoted.
+- It is part of the adapter definition (or of a connector's `authConfig` set through the API); the connector
+  form has no field for it. `scripts/validate-adapters.mjs` checks it (rule `token-response-path`): a dotted
+  path of keys, on `OAUTH2` only.
+
+`refreshUrl`, in the same example, is for providers that renew at another address than the one that issues
+the first token; without it refreshes go to `tokenUrl`.
+
 ---
 
 ## Environment Variables
@@ -426,6 +466,54 @@ curl -s -X PUT http://localhost:4000/api/connectors/$CONNECTOR_ID/env-vars \
 ```
 
 Use `{{VAR_NAME}}` in endpoint mappings. Parameters matching env var names are automatically stripped from the tool schema.
+
+### Secrets typed into the base URL
+
+Some services put the credential in the address itself: a Bitrix24 inbound webhook
+(`https://portal.bitrix24.com/rest/1/<code>/`), a Slack, Discord, Microsoft Teams, Zapier or Make
+webhook URL, a Telegram bot URL (`https://api.telegram.org/bot<token>`), a key in the query string
+(`?api_key=…`, `?token=…`, `?sig=…`), or `https://user:password@host`. Whoever holds such a URL can
+use it like a password.
+
+When you save a REST, GraphQL, SOAP, OData or MCP connector with such a base URL, AnythingMCP moves
+only the secret part into an encrypted variable and stores the rest of the URL with a reference:
+
+```
+typed:   https://portal.bitrix24.com/rest/1/k2bx…vqgo/
+stored:  https://portal.bitrix24.com/rest/1/{{BITRIX_CRM_WEBHOOK_TOKEN}}/
+```
+
+- The variable is named after the connector (`<NAME>_WEBHOOK_TOKEN`, `<NAME>_PASSWORD`,
+  `<NAME>_API_KEY`, `TELEGRAM_BOT_TOKEN`) or reuses a variable that already holds the same value.
+  Its value is encrypted at rest and never returned by the connector API, to admins neither (only an
+  admin export with secrets carries it, like every other variable); the dashboard shows it as set. The save answers with `secretsMoved` and `secretsNotice`, naming the variable,
+  never the secret.
+- Calls are unchanged: every call replaces `{{VAR}}` in the base URL with the variable's value as
+  stored, so the request goes to exactly the URL you typed. To change the secret, edit the variable,
+  or type the full URL again.
+- The host and the rest of the path stay readable, so the connector page, error hints and logs still
+  show where the connector points.
+- Headers and tool paths get the same treatment (`Authorization: Bearer <token>` becomes
+  `Bearer {{<NAME>_TOKEN}}`).
+
+Connectors saved before a rule existed keep the secret in the stored base URL until they are
+saved again. Until then the API shows it as `********`
+(`https://portal.bitrix24.com/rest/1/********/`); saving the form with the URL as shown keeps the
+stored secret and moves it into a variable, and a URL edited around `********` is refused, so type
+the full address again. The backend also moves these at every start, the same way a save does,
+except for long random path segments with no known shape (a save moves those and says so; the
+start-up pass leaves them alone). This needs no setting and works the same on AnythingMCP Cloud and
+self-hosted. The backend log shows the result with connector ids and counts, never a URL:
+
+```
+Base URL secrets: secrets of 2 connectors moved into encrypted variables (cm1…, cm2…); 0 left as is; 0 failed
+```
+
+"Left as is" are connectors that were saved while the pass ran; the next start checks them again.
+"Failed" names connectors whose variables could not be decrypted (a changed `ENCRYPTION_KEY`) or
+written; they stay unchanged, still masked in the API, and the next start tries again.
+`scripts/secret-literals/report.ts` lists what is left, and `repair.ts` also cleans tool paths,
+headers and tool names (dry run by default, with a backup table before `--apply`).
 
 ---
 

@@ -23,8 +23,10 @@ describe('RestEngine log lines carry no credentials', () => {
 
   // A 429 asking for longer than a tool call can wait: the engine gives up
   // at once (no retry delay) and logs the warning.
+  // As axios builds it: an HTTP error also carries a code (ERR_BAD_REQUEST
+  // for any 4xx), and the log line must still show the status.
   const rateLimited = () =>
-    new AxiosError('rate limited', undefined, undefined, {}, {
+    new AxiosError('rate limited', AxiosError.ERR_BAD_REQUEST, undefined, {}, {
       status: 429,
       data: {},
       headers: { 'retry-after': '60' },
@@ -88,6 +90,23 @@ describe('RestEngine log lines carry no credentials', () => {
     );
     expect(logged()).not.toContain('inl1neKey42');
     expect(logged()).not.toContain('qu3ryToken77');
+  });
+
+  it("appends the vendor's request id (intuit_tid) when the answer carries one", async () => {
+    mockedAxios.mockRejectedValue(
+      new AxiosError('rate limited', AxiosError.ERR_BAD_REQUEST, undefined, {}, {
+        status: 429,
+        data: {},
+        headers: { 'retry-after': '60', intuit_tid: '1-6744f2a1-3c5d7e9f0a1b2c3d4e5f6a7b' },
+      } as any),
+    );
+    await expect(
+      engine.execute({ baseUrl: 'https://quickbooks.api.intuit.com/v3/company/123456', authType: 'NONE' }, { method: 'GET', path: '/query' }, {}),
+    ).rejects.toBeDefined();
+
+    expect(gaveUp()).toBe(
+      'Gave up after 1 attempts on a transient upstream failure: 429 GET https://quickbooks.api.intuit.com/v3/company/123456/query intuit_tid=1-6744f2a1-3c5d7e9f0a1b2c3d4e5f6a7b',
+    );
   });
 
   it('masks a QUERY_AUTH credential', async () => {

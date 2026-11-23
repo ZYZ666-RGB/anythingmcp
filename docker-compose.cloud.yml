@@ -85,7 +85,10 @@ x-backend: &backend
     # end-to-end check; leave it empty otherwise.
     - SENTRY_DSN=${SENTRY_DSN_BACKEND:-}
     - SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT:-production}
-    - SENTRY_TRACES_SAMPLE_RATE=${SENTRY_TRACES_SAMPLE_RATE:-0.05}
+    # 0.5 % of HTTP requests (MCP calls a fifth of that). At 5 % Cloud sent
+    # about 1 M spans a day: far over the span quota, so Sentry accepted none
+    # and the SDK spent CPU on traces nobody could see (Nov 2026).
+    - SENTRY_TRACES_SAMPLE_RATE=${SENTRY_TRACES_SAMPLE_RATE:-0.005}
     - SENTRY_VERIFY_TOKEN=${SENTRY_VERIFY_TOKEN:-}
     # Prometheus /metrics — a separate listener, off by default (docs/operations/observability.md).
     # METRICS_TOKEN is required once METRICS_ENABLED=true; the listener refuses to start without it.
@@ -99,7 +102,15 @@ x-backend: &backend
     - NEXT_PUBLIC_API_URL=https://${DOMAIN}
     - DATABASE_URL=postgresql://amcp:${POSTGRES_PASSWORD}@postgres:5432/anythingmcp
     - REDIS_URL=redis://redis:6379
+    # Code mode: the out-of-process code-runner the backend connects to over
+    # the private network (a separate, secretless droplet). Unset = code mode
+    # unavailable (fail-closed): every run is refused, nothing runs in the
+    # backend. Code mode also stays off until a workspace turns it on per MCP
+    # server (codeMode), so setting this alone exposes nothing.
+    - CODE_RUNNER_URL=${CODE_RUNNER_URL:-}
     - JWT_SECRET=${JWT_SECRET}
+    # Signs the cookies of the sign-in and connect flows; empty = JWT_SECRET.
+    - COOKIE_SECRET=${COOKIE_SECRET:-}
     - ENCRYPTION_KEY=${ENCRYPTION_KEY}
     # `plaintext` only to roll back past encrypted connector variables (docs/operations/backup-restore.md)
     - ENV_VARS_AT_REST=${ENV_VARS_AT_REST:-}
@@ -156,11 +167,38 @@ x-backend: &backend
     # Largest upstream response one tool call reads, in bytes. Empty = the
     # default, 10 MB, the same as self-hosted (see .env.example).
     - TOOL_MAX_RESPONSE_BYTES=${TOOL_MAX_RESPONSE_BYTES:-}
+    # Public IPs the backend calls APIs from, shown on the setup and connector
+    # pages and named when an IP allowlist refuses a call (see .env.example).
+    - EGRESS_IPS=${EGRESS_IPS:-}
     # Internal MOTIS instance for the Deutsche Bahn connector. When set, the
     # adapter's MOTIS_URL is filled in automatically at import (and hidden
     # from the install form), so cloud users never see or choose it.
     # Self-hosters leave it unset and enter their own MOTIS URL.
     - MOTIS_INTERNAL_URL=${MOTIS_INTERNAL_URL:-http://motis:8080}
+    # TikTok Shop server app: TikTok Shop connectors without an App key of
+    # their own use it (see .env.example). Unset = each connector needs the
+    # seller's own app.
+    - TIKTOK_SHOP_PLATFORM_APP_KEY=${TIKTOK_SHOP_PLATFORM_APP_KEY:-}
+    - TIKTOK_SHOP_PLATFORM_APP_SECRET=${TIKTOK_SHOP_PLATFORM_APP_SECRET:-}
+    - TIKTOK_SHOP_PLATFORM_SERVICE_ID=${TIKTOK_SHOP_PLATFORM_SERVICE_ID:-}
+    # WooCommerce one-click key: off unless set to true (see .env.example).
+    - WOOCOMMERCE_ONE_CLICK=${WOOCOMMERCE_ONE_CLICK:-}
+    # Plan caps on connectors, MCP servers and users (docs/cloud-plans.md):
+    # unset = dry-run (log only), on = enforce, off = neither. It was never
+    # passed to the container, so it could not be switched from the .env.
+    - PLAN_CAPS_ENFORCE=${PLAN_CAPS_ENFORCE:-}
+    - META_PLATFORM_APP_ID=${META_PLATFORM_APP_ID:-}
+    - META_PLATFORM_APP_SECRET=${META_PLATFORM_APP_SECRET:-}
+    - META_PLATFORM_CONFIG_ID=${META_PLATFORM_CONFIG_ID:-}
+    - META_PLATFORM_ORG_IDS=${META_PLATFORM_ORG_IDS:-}
+    # One-tap Telegram bot: off unless the manager bot's token is set (see .env.example).
+    - TELEGRAM_MANAGER_BOT_TOKEN=${TELEGRAM_MANAGER_BOT_TOKEN:-}
+    - TELEGRAM_MANAGER_WEBHOOK_SECRET=${TELEGRAM_MANAGER_WEBHOOK_SECRET:-}
+    - TELEGRAM_MANAGED_BOT_ORG_IDS=${TELEGRAM_MANAGED_BOT_ORG_IDS:-}
+    # Split test of the page shown after approving into an empty workspace:
+    # unset = an equal split, 'off' or the name of one arm (see .env.example).
+    - AUTHORIZE_CONNECTED_PAGE_TEST=${AUTHORIZE_CONNECTED_PAGE_TEST:-}
+    - AUTHORIZE_SIGNIN_PAGE_TEST=${AUTHORIZE_SIGNIN_PAGE_TEST:-}
     # Allow the SSRF guard to reach the internal MOTIS host (it resolves to
     # a private docker IP, which the guard blocks by default). Harmless on
     # self-host (no such host on their network).
@@ -176,6 +214,14 @@ x-backend: &backend
     # /.well-known/openai-apps-challenge. Unset = route answers 404.
     - OPENAI_APPS_CHALLENGE_TOKEN=${OPENAI_APPS_CHALLENGE_TOKEN:-}
     - KG_LLM_REDACT_INTENTS=${KG_LLM_REDACT_INTENTS:-true}
+    # Scheduled AI extension: the kg-discovery cron extends the graph and the
+    # skills of workspaces that turned the switch on, only when this is true.
+    # These four were never passed to the container, so the job could not be
+    # turned on from the droplet's .env.
+    - KG_LLM_CRON_ENABLED=${KG_LLM_CRON_ENABLED:-false}
+    - KG_LLM_MIN_INTERVAL_HOURS=${KG_LLM_MIN_INTERVAL_HOURS:-24}
+    - KG_LLM_CRON_MAX_ORGS=${KG_LLM_CRON_MAX_ORGS:-20}
+    - KG_LLM_BATCH=${KG_LLM_BATCH:-false}
     # System (operator) transactional-email fallback — used when a workspace
     # hasn't set its own SMTP (e.g. Resend). Read only by the email sender,
     # never exposed to workspace admins. Set these in the droplet .env.
@@ -198,6 +244,7 @@ x-backend: &backend
     - SUPPORT_CHAT_URL=${SUPPORT_CHAT_URL:-}
     - SUPPORT_CHAT_INBOX_ID=${SUPPORT_CHAT_INBOX_ID:-}
     - SUPPORT_CHAT_SECRET=${SUPPORT_CHAT_SECRET:-}
+    - SUPPORT_CHAT_DISABLED_ORGS=${SUPPORT_CHAT_DISABLED_ORGS:-}
     - LIBREDESK_API_KEY=${LIBREDESK_API_KEY:-}
     - LIBREDESK_API_SECRET=${LIBREDESK_API_SECRET:-}
     - LIBREDESK_WEBHOOK_SECRET=${LIBREDESK_WEBHOOK_SECRET:-}
@@ -407,7 +454,7 @@ services:
         max-file: "5"
 
   file-extractor:
-    image: ${FILE_EXTRACTOR_IMAGE:-anythingmcp-file-extractor:2}
+    image: ${FILE_EXTRACTOR_IMAGE:-anythingmcp-file-extractor:4}
     build:
       context: ./deploy/ee/file-extractor
     profiles: [files]

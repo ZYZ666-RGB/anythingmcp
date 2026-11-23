@@ -1,5 +1,6 @@
-import { describeAdapterEnvVars, EnvVarDescriptor } from './env-var-meta';
+import { describeAdapterEnvVars, describeEnvVarOptions, EnvVarDescriptor } from './env-var-meta';
 import { addressFix, describeAddressFix, withMissingScheme } from './address-fix';
+import { normalizeWooCommerceUrl } from './woocommerce-setup';
 
 /**
  * Values that cannot be what the user meant, refused field by field before a
@@ -147,7 +148,37 @@ const NORMALISERS: Record<string, Record<string, (value: string) => string>> = {
       return m ? `${m[1]}/` : v;
     },
   },
+  // What the browser shows in WordPress (`/wp-admin/…`, `/wp-json/wc/v3`,
+  // `/wp-login.php`, a query, a trailing slash) cut back to the site's
+  // address, with https://. A subfolder stays; the setup check asks the site
+  // whether it is WordPress's (woocommerce-setup.ts).
+  woocommerce: {
+    WOOCOMMERCE_URL: normalizeWooCommerceUrl,
+  },
+  // A Shopify store as the browser shows it, cut back to the myshopify name
+  // the API address is built from: `acme-shop.myshopify.com`, and the admin
+  // address `admin.shopify.com/store/acme-shop/orders`, which is on another
+  // host and so not covered by normalizeSubdomainVariables.
+  shopify: {
+    SHOPIFY_STORE: normalizeShopifyStore,
+  },
 };
+
+/**
+ * `acme-shop` for `Acme-Shop`, `acme-shop.myshopify.com`,
+ * `https://acme-shop.myshopify.com/admin` and
+ * `https://admin.shopify.com/store/acme-shop/products?x=1`. Anything else (a
+ * custom domain, free text) comes back as typed, for the field's pattern to
+ * refuse.
+ */
+export function normalizeShopifyStore(value: string): string {
+  const text = value.trim();
+  const admin = /^(?:https?:\/\/)?admin\.shopify\.com\/store\/([A-Za-z0-9][A-Za-z0-9-]*)(?:[/?#]|$)/i.exec(text);
+  if (admin) return admin[1].toLowerCase();
+  const own = /^(?:https?:\/\/)?([A-Za-z0-9][A-Za-z0-9-]*)\.myshopify\.com(?:[/?#:]|$)/i.exec(text);
+  if (own) return own[1].toLowerCase();
+  return /^[A-Za-z0-9][A-Za-z0-9-]*$/.test(text) ? text.toLowerCase() : value;
+}
 
 /** The adapter fields a checker needs. */
 export type CheckedAdapter = Parameters<typeof describeAdapterEnvVars>[0];
@@ -191,12 +222,16 @@ export function normalizeAdapterEnvValues<T extends Record<string, unknown>>(
 }
 
 /**
- * One value as the setup stores it: the scheme clean-up of
+ * One value as the setup stores it: the clean-ups of
  * {@link normalizeAdapterEnvValues} for this field alone (a chat install
- * checks each setting as it arrives).
+ * checks each setting as it arrives). The adapter's own rules (NORMALISERS)
+ * apply when its slug is given.
  */
-export function normalizeAdapterEnvValue(d: EnvVarDescriptor, value: string): string {
-  return isPlainAddress(d) ? withMissingScheme(d.pattern, value) : value;
+export function normalizeAdapterEnvValue(d: EnvVarDescriptor, value: string, slug?: string): string {
+  const rules = slug ? NORMALISERS[slug] : undefined;
+  const ruled =
+    rules && Object.prototype.hasOwnProperty.call(rules, d.name) && value ? rules[d.name](value) : value;
+  return isPlainAddress(d) ? withMissingScheme(d.pattern, ruled) : ruled;
 }
 
 /**
@@ -227,6 +262,9 @@ export function checkAdapterEnvValues(
 function checkOne(d: EnvVarDescriptor, value: string): string | undefined {
   // Values that are still a {{VARIABLE}} are resolved later and checked there.
   if (/\{\{\s*[\w.]+\s*\}\}/.test(value)) return undefined;
+  // A variable with a fixed list of choices takes one of them and nothing
+  // else; a listed value needs no further check.
+  if (d.options?.length) return optionProblem(d, value);
   const isAddress = d.kind === 'address' || ADDRESS_NAME.test(d.name);
   const isCredential = d.secret || d.kind === 'credential';
   if (isAddress || isCredential) {
@@ -246,6 +284,16 @@ function checkOne(d: EnvVarDescriptor, value: string): string | undefined {
     return `${d.label} does not look right. ${d.patternMessage ?? (d.example ? `Example: ${d.example}` : d.help ?? '')}`.trim();
   }
   return undefined;
+}
+
+/**
+ * Why `value` is refused for a variable with a fixed list of choices
+ * (`envVarMeta.<VAR>.options`): undefined when it is one of them or the
+ * variable has no list, otherwise a sentence naming the choices.
+ */
+export function optionProblem(d: Pick<EnvVarDescriptor, 'label' | 'options'>, value: string): string | undefined {
+  if (!d.options?.length || d.options.some((o) => o.value === value)) return undefined;
+  return `${d.label} must be one of: ${describeEnvVarOptions(d.options)}.`;
 }
 
 /** One sentence naming every refused field, for callers without a form. */

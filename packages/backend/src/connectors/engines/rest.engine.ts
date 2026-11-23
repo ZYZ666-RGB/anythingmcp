@@ -5,24 +5,38 @@ import {
   AxiosError,
   Method,
 } from 'axios';
-import { createHmac } from 'node:crypto';
+import { createHash, createHmac, randomInt } from 'node:crypto';
 import FormData from 'form-data';
 import { createUnblockerProxyAgent } from './unblocker-proxy-agent';
 import { decodeResponseBody } from '../binary-response.util';
+import { stringifyWithIntegerLiterals } from './json-integers.util';
 import { buildOAuth1Header } from './oauth1-signer';
+import { hmacJwtHeader, isHmacJwtSignature } from './hmac-jwt.util';
 import { OAuth2TokenService } from './oauth2-token.service';
 import { BearerTokenRenewalService } from './bearer-token-renewal.service';
 import { ShopeeTokenService, isShopeeAccessTokenRejected, isShopeeAuth } from './shopee-token.service';
+import {
+  TikTokShopTokenService,
+  isTikTokShopAccessTokenRejected,
+  isTikTokShopAuth,
+  resolveTikTokShopAuthConfig,
+  shopCipherApplies,
+} from './tiktok-shop-token.service';
+import { IopTokenService, isIopAccessTokenRejected, isIopAuth } from './iop-token.service';
+import { SheinTokenService, isSheinAuth } from './shein-token.service';
 import { canRenewToken } from '../oauth-grant.util';
 import {
   LoginTokenService,
   LoginTokenAuthConfig,
+  loginTokenHeaderInterpolator,
 } from './login-token.service';
 import { assertSafeOutboundUrl } from '../../common/ssrf.util';
+import { followDownload, type DownloadFollowConfig } from './download-follow.util';
 import { fetchOutbound } from '../../common/outbound-fetch.util';
 import { assertNoUnresolvedPlaceholders } from '../../common/unresolved-placeholders.util';
 import { describeInvalidHeaderNames, isValidHeaderName } from '../../common/http-header-name.util';
-import { XMLParser } from 'fast-xml-parser';
+import { isXmlContentType, xmlParser } from './xml-parse.util';
+import { hasXmlTemplateBlocks, renderXmlTemplateBlocks } from './xml-body-template.util';
 import { pickExposedHeaders } from './response-headers.util';
 import { outboundRequest, OutboundRequestOptions } from '../../common/outbound-http';
 import {
@@ -30,10 +44,12 @@ import {
   toolResponseLimitBytes,
   toolTimeoutMs,
 } from './request-limits.util';
-import { assertNoResponseBodyError } from './response-error.util';
+import { assertNoResponseBodyError, ResponseBodyError } from './response-error.util';
 import { escapeXmlValue } from '../../common/xml-escape.util';
 import { containsMimeMarker, expandMimeMarkers } from './mime-message.util';
 import { engineLogSecrets, urlForLog } from '../../common/log-safe-url.util';
+import { FileUploadService } from '../../file-uploads/file-upload.service';
+import { isFileRef } from '../../file-uploads/file-upload-params';
 
 /**
  * RestEngine — executes HTTP calls to REST APIs.
@@ -71,6 +87,15 @@ const MAYBE_SENT_CODES = ['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED'];
 
 /** The codes axios raises when the request ran past its timeout. */
 const TIMEOUT_CODES = ['ETIMEDOUT', 'ECONNABORTED'];
+
+/**
+ * The request deadline ran out: axios and outbound-http both raise
+ * ECONNABORTED with "timeout of <n>ms exceeded". Other ECONNABORTED errors
+ * (a socket aborted early) are not this.
+ */
+function isDeadlineError(error: AxiosError): boolean {
+  return error.code === 'ECONNABORTED' && /^timeout of \d+ms exceeded/.test(error.message);
+}
 
 /**
  * Retry-After as milliseconds: delay-seconds or an HTTP date (RFC 9110
@@ -121,12 +146,19 @@ function isEmptyBody(data: unknown): boolean {
 @Injectable()
 export class RestEngine {
   private readonly logger = new Logger(RestEngine.name);
+  // Connectors already warned about a connector header that the Login → Token
+  // token header replaces (one warning per connector and header per process).
+  private readonly loginHeaderCollisionsWarned = new Set<string>();
 
   constructor(
     private readonly oauth2TokenService: OAuth2TokenService,
     private readonly loginTokenService: LoginTokenService,
     @Optional() private readonly bearerTokens?: BearerTokenRenewalService,
     @Optional() private readonly shopeeTokens?: ShopeeTokenService,
+    @Optional() private readonly tiktokShopTokens?: TikTokShopTokenService,
+    @Optional() private readonly iopTokens?: IopTokenService,
+    @Optional() private readonly sheinTokens?: SheinTokenService,
+    @Optional() private readonly fileUploads?: FileUploadService,
   ) {}
 
   /**
@@ -139,6 +171,15 @@ export class RestEngine {
     params: Record<string, unknown>,
   ): Promise<unknown> {
     return (await this.executeWithMeta(config, endpointMapping, params)).body;
+  }
+
+  /** The file behind an `amcp-file:` reference, for a multipart part. */
+  private async resolveUploadedFile(ref: string, organizationId: string | undefined): Promise<FetchedFile> {
+    if (!this.fileUploads) {
+      throw new Error('File references (amcp-file:) are not available on this server. Pass a public URL to the file instead.');
+    }
+    const file = await this.fileUploads.resolveForEngine(ref, organizationId);
+    return { buffer: file.buffer, filename: sanitizeFilename(file.filename), contentType: file.contentType };
   }
 
   /**
@@ -154,6 +195,10 @@ export class RestEngine {
       authConfig?: Record<string, unknown>;
       headers?: Record<string, string>;
       connectorId?: string;
+      // The workspace that owns the connector. Lets a `__file` parameter take
+      // an uploaded file's reference (`amcp-file:<id>`), which only resolves
+      // inside the workspace that uploaded it.
+      organizationId?: string;
       // When set, route this request through the proxy / web-unblocker.
       // The caller (DynamicMcpTools) decides whether a proxy applies
       // (env present, tool opted in, license + rate-limit ok) and passes
@@ -163,6 +208,11 @@ export class RestEngine {
       // a 2xx body. Absent for almost every connector, which then behaves as
       // it always has. See response-error.util.ts.
       errorWhen?: unknown;
+      // The connector's `config.largeIntegers`: "string" parses a JSON answer
+      // with integers outside ±(2^53 - 1) as strings of their exact digits
+      // (SHEIN's 64-bit goodsId). Absent for every other connector, which
+      // parses exactly as before. See json-integers.util.ts.
+      largeIntegers?: unknown;
       // The connector's secret variable values, as substituted into the URL
       // and headers. Never sent anywhere: log lines mask them.
       logSecrets?: readonly string[];
@@ -200,9 +250,26 @@ export class RestEngine {
       // Clamped, never off; see request-limits.util.ts.
       timeoutMs?: unknown;
       maxResponseBytes?: unknown;
+      // The API answers with a link to the data (Amazon report documents):
+      // fetch it on the server, decompress and page it. See
+      // download-follow.util.ts.
+      download?: unknown;
+      // JSON body fields, by path (`infoList[].goodsId`), whose digit-string
+      // values go out as number literals with exactly those digits: for an
+      // API that wants a JSON number for a 64-bit id the tool takes as a
+      // string. Opt-in per tool; see json-integers.util.ts.
+      bodyIntegers?: string[];
     },
     params: Record<string, unknown>,
   ): Promise<{ body: unknown; headers: Record<string, string> }> {
+    if (endpointMapping.download) {
+      const { download, ...apiCall } = endpointMapping;
+      const res = await this.executeWithMeta(config, apiCall, params);
+      return {
+        body: await followDownload(res.body, download as DownloadFollowConfig, params),
+        headers: res.headers,
+      };
+    }
     const withMeta = (response: AxiosResponse) => {
       const body = endpointMapping.rawBody ? response.data : parseXmlBody(response);
       assertNotJsonRpcError(body);
@@ -305,7 +372,13 @@ export class RestEngine {
       // always did, a file (image, PDF, …) becomes a BinaryBody instead of a
       // string of replacement characters. See binary-response.util.ts.
       responseType: 'arraybuffer',
-      transformResponse: [(data: unknown, headers?: unknown) => decodeResponseBody(data, headers)],
+      // A connector with `config.largeIntegers: "string"` keeps integers
+      // outside ±(2^53 - 1) as exact strings; every other one parses as before.
+      transformResponse: [
+        config.largeIntegers === 'string'
+          ? (data: unknown, headers?: unknown) => decodeResponseBody(data, headers, { largeIntegers: 'string' })
+          : (data: unknown, headers?: unknown) => decodeResponseBody(data, headers),
+      ],
       // Stop reading a body over the tool response limit instead of parsing
       // tens of MB on the event loop. See response-size-limit.ts. A tool may
       // raise it for a body whose bulk responseMapping.images takes out.
@@ -317,7 +390,20 @@ export class RestEngine {
 
     // Inject authentication
     const headersBeforeAuth = headerNames(axiosConfig.headers);
-    await this.injectAuth(axiosConfig, config);
+    // A connector or tool header with the name of the Login → Token header:
+    // the token replaces it (warned once in injectAuth), and a refused call
+    // says so in its hint.
+    const loginHeaderCollision =
+      config.authType === 'LOGIN_TOKEN'
+        ? loginTokenHeaderCollision(axiosConfig.headers, config.authConfig as unknown as LoginTokenAuthConfig)
+        : undefined;
+    // Set only for LOGIN_TOKEN with `tokenPlacement: "body"`: the token is
+    // then `${loginToken}` in the tool's bodyTemplate (or `$loginToken` in
+    // bodyMapping) instead of a header. `aud` is `${loginAud}` / `$loginAud`,
+    // for a login that returns a second value the later calls also send.
+    const loginBodyAuth = await this.injectAuth(axiosConfig, config);
+    // Renders the body again with a new token, for the retry after a re-login.
+    let renderTokenBody: ((token: string, aud?: string) => unknown) | undefined;
     // Headers that carry the connector's credentials stay behind when a
     // redirect leaves the origin: whatever auth added, plus the connector's
     // own headers and templated ones, which often hold a key.
@@ -343,6 +429,13 @@ export class RestEngine {
         // the prototype; the unsafe names are dropped as well.
         Object.assign(mappedQuery, safeEntries(new URLSearchParams(raw)));
       }
+      // OData `$skip=0` skips nothing, so leaving it out never changes the
+      // result. Microsoft Graph refuses any `$skip` next to `$search`
+      // ("SearchWithSkip"), and clients that always send `skip: 0` made every
+      // keyword search fail.
+      if (mappedQuery['$skip'] === 0 || mappedQuery['$skip'] === '0') {
+        delete mappedQuery['$skip'];
+      }
       axiosConfig.params = {
         ...(axiosConfig.params as Record<string, unknown> | undefined),
         ...mappedQuery,
@@ -366,31 +459,45 @@ export class RestEngine {
     const xmlBody = endpointMapping.bodyEncoding === 'xml';
     if (REQUEST_BODY_METHODS.has(httpMethod)) {
       if (endpointMapping.bodyTemplate && xmlBody) {
-        axiosConfig.data = renderXmlBodyTemplate(endpointMapping.bodyTemplate, params);
-      } else if (endpointMapping.bodyTemplate) {
-        const rendered = renderBodyTemplate(
-          endpointMapping.bodyTemplate,
-          params,
-        );
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(rendered);
-        } catch (e: any) {
-          // The parser's "position 38" is a position in a string the caller
-          // cannot see, and we must not show it: env vars are interpolated into
-          // the template too, so the rendered body can carry a credential. Name
-          // the placeholders that had nothing to substitute instead — that is
-          // the usual cause and the only part that is safe to repeat.
-          const missing = missingTemplateParams(endpointMapping.bodyTemplate, params);
-          const hint = missing.length
-            ? ` No value was supplied for ${missing.map((m) => `\`\${${m}}\``).join(', ')}, which is the usual cause.`
-            : '';
-          throw new Error(
-            `bodyTemplate produced invalid JSON after interpolation: ${e.message}.${hint}`,
-          );
+        const template = endpointMapping.bodyTemplate;
+        if (loginBodyAuth === undefined) {
+          axiosConfig.data = renderXmlBodyTemplate(template, params);
+        } else {
+          renderTokenBody = (token, aud) =>
+            renderXmlBodyTemplate(template, params, { loginToken: token, loginAud: aud ?? '' });
+          axiosConfig.data = renderTokenBody(loginBodyAuth.token, loginBodyAuth.aud);
         }
-        assertNoPrototypePollution(parsed);
-        axiosConfig.data = parsed;
+      } else if (endpointMapping.bodyTemplate) {
+        const template = endpointMapping.bodyTemplate;
+        const renderJson = (templateParams: Record<string, unknown>): unknown => {
+          const rendered = renderBodyTemplate(template, templateParams);
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(rendered);
+          } catch (e: any) {
+            // The parser's "position 38" is a position in a string the caller
+            // cannot see, and we must not show it: env vars are interpolated into
+            // the template too, so the rendered body can carry a credential. Name
+            // the placeholders that had nothing to substitute instead — that is
+            // the usual cause and the only part that is safe to repeat.
+            const missing = missingTemplateParams(template, templateParams);
+            const hint = missing.length
+              ? ` No value was supplied for ${missing.map((m) => `\`\${${m}}\``).join(', ')}, which is the usual cause.`
+              : '';
+            throw new Error(
+              `bodyTemplate produced invalid JSON after interpolation: ${e.message}.${hint}`,
+            );
+          }
+          assertNoPrototypePollution(parsed);
+          return parsed;
+        };
+        if (loginBodyAuth === undefined) {
+          axiosConfig.data = renderJson(params);
+        } else {
+          renderTokenBody = (token, aud) =>
+            renderJson({ ...params, loginToken: token, loginAud: aud ?? '' });
+          axiosConfig.data = renderTokenBody(loginBodyAuth.token, loginBodyAuth.aud);
+        }
       } else if (endpointMapping.bodyMapping) {
         let bodyMapping = endpointMapping.bodyMapping;
         let bodyParams = params;
@@ -403,16 +510,31 @@ export class RestEngine {
           bodyMapping = expanded.template;
           bodyParams = { ...params, ...expanded.values };
         }
+        // `$loginToken` / `$loginAud` in a bodyMapping. The engine's values
+        // win over anything the caller passed under those names. Every
+        // encoding (JSON, __raw, form-urlencoded, form-data) rebuilds the
+        // body with them after a re-login, and that body is marked as
+        // carrying credentials so a cross-origin redirect is refused.
+        const paramsBeforeToken = bodyParams;
+        const withLoginToken = (token: string, aud?: string): Record<string, unknown> => ({
+          ...paramsBeforeToken,
+          loginToken: token,
+          loginAud: aud ?? '',
+        });
+        if (loginBodyAuth) {
+          bodyParams = withLoginToken(loginBodyAuth.token, loginBodyAuth.aud);
+        }
         // Handle __raw body mapping (non-JSON body, e.g. XML/SOAP)
         if ('__raw' in bodyMapping) {
           // Resolved on its own rather than through mapParams so an XML body
           // can escape what `${param}` puts into it. A whole-value `$param`
           // is the caller's own body and goes out as given.
-          axiosConfig.data = this.resolveValue(
-            bodyMapping['__raw'],
-            bodyParams,
-            xmlBody ? escapeXmlValue : undefined,
-          );
+          const raw = bodyMapping['__raw'];
+          const escape = xmlBody ? escapeXmlValue : undefined;
+          axiosConfig.data = this.resolveValue(raw, bodyParams, escape);
+          if (loginBodyAuth) {
+            renderTokenBody = (token, aud) => this.resolveValue(raw, withLoginToken(token, aud), escape);
+          }
         } else {
           const mapped = this.mapParams(bodyMapping, bodyParams);
           // `{ "__json": … }`: the field goes out as the JSON text of its
@@ -425,9 +547,9 @@ export class RestEngine {
           // form-data tool download a URL of its choosing.
           const fileKeys = configuredFileKeys(bodyMapping);
 
-          if (encoding === 'form-urlencoded') {
+          const encodeUrlForm = (mappedBody: Record<string, unknown>): string => {
             const urlParams = new URLSearchParams();
-            for (const [k, v] of spreadFormEntries(mapped)) {
+            for (const [k, v] of spreadFormEntries(mappedBody)) {
               if (isFileMarker(v)) {
                 throw new Error(
                   `bodyMapping.${k} uses the __file marker, but this tool's ` +
@@ -437,7 +559,18 @@ export class RestEngine {
               }
               appendFormParam((key, val) => urlParams.append(key, val), k, v);
             }
-            axiosConfig.data = urlParams.toString();
+            return urlParams.toString();
+          };
+          if (encoding === 'form-urlencoded') {
+            axiosConfig.data = encodeUrlForm(mapped);
+            if (loginBodyAuth) {
+              const mapping = bodyMapping;
+              renderTokenBody = (token, aud) => {
+                const remapped = this.mapParams(mapping, withLoginToken(token, aud));
+                stringifyJsonMarkers(remapped, mapping);
+                return encodeUrlForm(remapped);
+              };
+            }
             // URLSearchParams percent-encodes UTF-8 bytes, but the charset of a
             // form body is not implied by the media type: a server that assumes
             // latin-1 reads "Bev%C3%B6lkerung" as mojibake and, in the Destatis
@@ -451,7 +584,7 @@ export class RestEngine {
               };
             }
           } else if (encoding === 'form-data') {
-            const plainEntries: Array<[string, unknown]> = [];
+            let plainEntries: Array<[string, unknown]> = [];
             const fileEntries: Array<{ key: string; file: FetchedFile }> = [];
             for (const [k, v] of spreadFormEntries(mapped)) {
               if (isFileMarker(v)) {
@@ -464,9 +597,15 @@ export class RestEngine {
                 }
                 // An optional file the caller did not pass: leave the part out.
                 if (v.__file === undefined || v.__file === null || v.__file === '') continue;
+                const source = String(v.__file).trim();
                 fileEntries.push({
                   key: k,
-                  file: await fetchFileForUpload(String(v.__file)),
+                  // An `amcp-file:<id>` reference comes from our own storage
+                  // (file_upload_link), checked against the connector's
+                  // workspace; anything else is a URL to download.
+                  file: isFileRef(source)
+                    ? await this.resolveUploadedFile(source, config.organizationId)
+                    : await fetchFileForUpload(source),
                 });
               } else {
                 plainEntries.push([k, v]);
@@ -499,13 +638,56 @@ export class RestEngine {
               ...form.getHeaders(),
             };
             buildBody = buildForm;
+            if (loginBodyAuth) {
+              const mapping = bodyMapping;
+              // The retry after a re-login calls this, then rebuildBody, which
+              // reads buildBody. Updating the entries the builder closes over
+              // is what puts the new token on that second stream. Files stay
+              // as fetched on the first build.
+              renderTokenBody = (token, aud) => {
+                const remapped = this.mapParams(mapping, withLoginToken(token, aud));
+                stringifyJsonMarkers(remapped, mapping);
+                const nextPlain: Array<[string, unknown]> = [];
+                for (const [k, v] of spreadFormEntries(remapped)) {
+                  if (isFileMarker(v)) continue;
+                  nextPlain.push([k, v]);
+                }
+                plainEntries = nextPlain;
+                return buildForm();
+              };
+            }
           } else {
             axiosConfig.data = mapped;
+            if (loginBodyAuth) {
+              const mapping = bodyMapping;
+              renderTokenBody = (token, aud) => {
+                const remapped = this.mapParams(mapping, withLoginToken(token, aud));
+                stringifyJsonMarkers(remapped, mapping);
+                return remapped;
+              };
+            }
           }
         }
       }
       if (httpMethod === 'DELETE' && isEmptyBody(axiosConfig.data)) {
         delete axiosConfig.data;
+      }
+      // Opt-in (endpointMapping.bodyIntegers): 64-bit ids the tool takes as
+      // digit strings go out as JSON number literals with the same digits,
+      // so nothing on the way converts them to a double. The body becomes
+      // its JSON text here, which is also what gets signed.
+      const bodyIntegers = endpointMapping.bodyIntegers;
+      if (
+        Array.isArray(bodyIntegers) &&
+        bodyIntegers.length > 0 &&
+        axiosConfig.data !== null &&
+        typeof axiosConfig.data === 'object' &&
+        (Array.isArray(axiosConfig.data) || Object.getPrototypeOf(axiosConfig.data) === Object.prototype)
+      ) {
+        axiosConfig.data = stringifyWithIntegerLiterals(axiosConfig.data, bodyIntegers);
+        if (!hasHeader(axiosConfig.headers, 'content-type')) {
+          axiosConfig.headers = { ...axiosConfig.headers, 'Content-Type': 'application/json' };
+        }
       }
       if (xmlBody && typeof axiosConfig.data === 'string' && !hasHeader(axiosConfig.headers, 'content-type')) {
         axiosConfig.headers = {
@@ -525,17 +707,39 @@ export class RestEngine {
     // HMAC signing is here for the same reason: the canonical string most
     // of these APIs sign folds in the request body, which does not exist
     // until the block above has run. A Shopee connector also signs the
-    // shop's access token and id (undefined for every other connector).
+    // shop's access token and id, a TikTok Shop connector its shop cipher
+    // (its access token goes in a header, unsigned), an IOP connector
+    // (Lazada, Miravia, AliExpress seller) the seller's access token;
+    // undefined for every other connector.
+    const tiktokShop = isTikTokShopAuth(config.authType, config.authConfig);
+    const iop = isIopAuth(config.authType, config.authConfig);
+    // A SHEIN connector signs with the shop's openKeyId and secretKey, which
+    // the provider fills into the signature block in memory, for this call
+    // only. Every other connector signs with its config as it is.
+    const shein = isSheinAuth(config.authType, config.authConfig);
+    // A TikTok Shop connector without an App key of its own signs, renews and
+    // reads its shops with the server's app: filled in here, in memory, for
+    // this call (and its retry) only.
+    const tiktokShopConfig = tiktokShop
+      ? { ...config, authConfig: resolveTikTokShopAuthConfig(config.authType, config.authConfig) }
+      : config;
     const hmacCredentials = isShopeeAuth(config.authType, config.authConfig)
       ? await this.shopeeShopParams(config)
-      : undefined;
-    this.applyHmacSignature(axiosConfig, config, hmacCredentials);
+      : tiktokShop
+        ? await this.tiktokShopCredentials(tiktokShopConfig, axiosConfig)
+        : iop
+          ? await this.iopCredentialParams(config)
+          : undefined;
+    const signingConfig = shein ? this.sheinSigningConfig(config) : tiktokShopConfig;
+    this.applyHmacSignature(axiosConfig, signingConfig, hmacCredentials);
     for (const h of headerNames(axiosConfig.headers)) {
       if (!headersBeforeSigning.includes(h)) credentialHeaders.add(h);
     }
     const outbound: OutboundRequestOptions = {
       data: buildBody,
       credentialHeaders: [...credentialHeaders],
+      // A body that carries the login token is not resent to another origin.
+      ...(renderTokenBody ? { credentialsInBody: true } : {}),
     };
 
     // Origin, path template and query parameter names only, with the
@@ -594,34 +798,69 @@ export class RestEngine {
         );
         if (renewalFailed) throw renewalFailed;
       }
-      // LOGIN_TOKEN auto-relogin: retry once on 401 when refreshOn401 is enabled
+      // LOGIN_TOKEN auto-relogin: retry once on 401 when refreshOn401 is enabled.
+      // With `refreshOnBody401: true` also when the API says so in the body:
+      // an `errorWhen` rule with status 401 matches a 2xx answer, or the body
+      // of an HTTP error answer (see bodyReports401).
       if (
-        error instanceof AxiosError &&
-        error.response?.status === 401 &&
         config.authType === 'LOGIN_TOKEN' &&
-        (config.authConfig as Record<string, unknown> | undefined)?.refreshOn401 !== false
+        ((error instanceof AxiosError &&
+          error.response?.status === 401 &&
+          (config.authConfig as Record<string, unknown> | undefined)?.refreshOn401 !== false) ||
+          ((config.authConfig as Record<string, unknown> | undefined)?.refreshOnBody401 === true &&
+            bodyReports401(error, config.errorWhen)))
       ) {
         this.logger.debug('LOGIN_TOKEN: 401 received, re-issuing token...');
         const authConfig = config.authConfig as unknown as LoginTokenAuthConfig;
         const bundle = await this.loginTokenService.forceRelogin(
           authConfig,
           config.connectorId,
-          { proxyUrl: config.proxyUrl },
+          { proxyUrl: config.proxyUrl, connectorHeaders: Object.keys(config.headers ?? {}) },
         );
         injectLoginTokenHeaders(axiosConfig, authConfig, bundle.token, bundle.aud);
+        if (renderTokenBody) axiosConfig.data = renderTokenBody(bundle.token, bundle.aud);
         rebuildBody(axiosConfig, buildBody);
         const retryResponse = await outboundRequest(axiosConfig, outbound);
         return withMeta(retryResponse);
       }
       // Shopee refused the shop's access token (expired early, or replaced
       // by another process's renewal): renew once, sign again, resend.
-      if (hmacCredentials && this.shopeeTokens && isShopeeAccessTokenRejected(error)) {
+      if (!tiktokShop && !iop && hmacCredentials && this.shopeeTokens && isShopeeAccessTokenRejected(error)) {
         const renewed = await this.shopeeTokens.renewAfterRejection(config, sentAt);
         if (renewed) {
           this.applyHmacSignature(axiosConfig, config, renewed);
           rebuildBody(axiosConfig, buildBody);
           return withMeta(await outboundRequest(axiosConfig, outbound));
         }
+      }
+      // TikTok Shop refused the access token (105002 expired, or the header
+      // named invalid): renew once, sign again with a new timestamp, resend.
+      if (tiktokShop && this.tiktokShopTokens && isTikTokShopAccessTokenRejected(error)) {
+        const renewed = await this.tiktokShopTokens.renewAfterRejection(tiktokShopConfig, sentAt);
+        if (renewed) {
+          const params = this.applyTikTokShopCredentials(axiosConfig, renewed);
+          this.applyHmacSignature(axiosConfig, tiktokShopConfig, params);
+          rebuildBody(axiosConfig, buildBody);
+          return withMeta(await outboundRequest(axiosConfig, outbound));
+        }
+      }
+      // An IOP gateway refused the seller's access token (an errorWhen rule
+      // with status 401, e.g. IllegalAccessToken, or HTTP 401): renew once,
+      // sign again with a new timestamp, resend once.
+      if (iop && this.iopTokens && isIopAccessTokenRejected(error)) {
+        const renewed = await this.iopTokens.renewAfterRejection(config, sentAt);
+        if (renewed) {
+          this.applyHmacSignature(axiosConfig, config, renewed);
+          rebuildBody(axiosConfig, buildBody);
+          return withMeta(await outboundRequest(axiosConfig, outbound));
+        }
+      }
+      // SHEIN no longer accepts the shop's key (openapi00004), or refused
+      // the signature: there is nothing to renew. Mark the connector when
+      // the key has ended and say what to do next to SHEIN's own error.
+      if (shein && this.sheinTokens) {
+        const hint = await this.sheinTokens.onRejected(config, error);
+        if (hint) (error as Error & { hint?: string }).hint = hint;
       }
       // A pasted token the provider ended for good (Meta 190 logged out,
       // expired, password changed): mark the connector, stop sending it,
@@ -636,7 +875,7 @@ export class RestEngine {
         const hint = await this.bearerTokens.onRejected(config.authConfig, config.connectorId, error);
         if (hint) (error as AxiosError & { hint?: string }).hint = hint;
       }
-      throw restateProxyError(error);
+      throw restateProxyError(withLoginHeaderCollisionHint(error, loginHeaderCollision));
     }
   }
 
@@ -778,11 +1017,14 @@ export class RestEngine {
         // A tool that raised its timeout (endpointMapping.timeoutMs) is slow
         // on purpose. Running it again after a timeout would wait that long
         // up to four times, so even an idempotent one is not retried then.
+        // The same holds for any call that used up its whole deadline: a GET
+        // cut at the default 30 s took 124 s over four attempts in prod.
         const slowTimeout =
-          (axiosConfig.timeout ?? 0) > DEFAULT_TOOL_TIMEOUT_MS &&
           error instanceof AxiosError &&
           !error.response &&
-          TIMEOUT_CODES.includes(error.code ?? '');
+          (((axiosConfig.timeout ?? 0) > DEFAULT_TOOL_TIMEOUT_MS &&
+            TIMEOUT_CODES.includes(error.code ?? '')) ||
+            isDeadlineError(error));
         const transient = !slowTimeout && this.isTransientError(error, method);
         const delay = transient ? this.retryDelayMs(error, attempt, delaysMs) : null;
         if (delay === null) {
@@ -790,11 +1032,16 @@ export class RestEngine {
           // every retry used to look identical to one that failed outright —
           // there was no way to tell a flaky upstream from a broken connector.
           if (transient) {
+            // Intuit's per-request correlation id (not a secret): its support
+            // asks for it to trace a failed call.
+            const tid = (error as AxiosError).response?.headers?.['intuit_tid'];
             this.logger.warn(
+              // The status first: axios also sets a code on HTTP errors
+              // (ERR_BAD_REQUEST for a 429), which hid the status here.
               `Gave up after ${attempt + 1} attempts on a transient upstream failure: ${
-                (error as AxiosError).code ??
-                (error as AxiosError).response?.status
-              } ${method} ${logUrl}`,
+                (error as AxiosError).response?.status ??
+                (error as AxiosError).code
+              } ${method} ${logUrl}${tid ? ` intuit_tid=${String(tid)}` : ''}`,
             );
           }
           throw this.describeConnectionError(error, attempt + 1, method);
@@ -807,6 +1054,20 @@ export class RestEngine {
     }
   }
 
+  /**
+   * Log once per connector and header that the Login → Token header replaces
+   * a header of the same name set on the connector (or the tool). The token
+   * wins, as it always did; the warning makes the replacement visible.
+   */
+  private warnLoginHeaderCollision(connectorId: string | undefined, header: string): void {
+    const key = `${connectorId ?? '(none)'}|${header.toLowerCase()}`;
+    if (this.loginHeaderCollisionsWarned.has(key)) return;
+    this.loginHeaderCollisionsWarned.add(key);
+    this.logger.warn(
+      `LOGIN_TOKEN: connector ${connectorId ?? '(none)'} sets a "${header}" header, which the login token header replaces on every call (authConfig.headerName). Remove the connector header, or send the token in another header.`,
+    );
+  }
+
   private async injectAuth(
     axiosConfig: AxiosRequestConfig,
     config: {
@@ -814,9 +1075,10 @@ export class RestEngine {
       authConfig?: Record<string, unknown>;
       connectorId?: string;
       proxyUrl?: string;
+      headers?: Record<string, string>;
     },
-  ): Promise<void> {
-    if (!config.authConfig) return;
+  ): Promise<{ token: string; aud?: string } | undefined> {
+    if (!config.authConfig) return undefined;
 
     switch (config.authType) {
       case 'API_KEY': {
@@ -897,14 +1159,21 @@ export class RestEngine {
         const bundle = await this.loginTokenService.getToken(
           config.authConfig as unknown as LoginTokenAuthConfig,
           config.connectorId,
-          { proxyUrl: config.proxyUrl },
+          { proxyUrl: config.proxyUrl, connectorHeaders: Object.keys(config.headers ?? {}) },
         );
-        injectLoginTokenHeaders(
+        const replaced = injectLoginTokenHeaders(
           axiosConfig,
           config.authConfig as unknown as LoginTokenAuthConfig,
           bundle.token,
           bundle.aud,
         );
+        if (replaced) this.warnLoginHeaderCollision(config.connectorId, replaced);
+        // `tokenPlacement: "body"`: the caller renders the token into the
+        // tool's body as `${loginToken}` / `$loginToken`, and `aud` as
+        // `${loginAud}` / `$loginAud`.
+        if (config.authConfig.tokenPlacement === 'body') {
+          return { token: bundle.token, aud: bundle.aud };
+        }
         break;
       }
       case 'OAUTH1':
@@ -912,6 +1181,7 @@ export class RestEngine {
         // built yet. Handled by applyOAuth1Signature() after they are.
         break;
     }
+    return undefined;
   }
 
   /**
@@ -957,7 +1227,8 @@ export class RestEngine {
    *                             `${query.NAME}` (the value of a query
    *                             parameter as sent, '' when absent)
    * `credentialParams` are query parameters a token provider adds (Shopee's
-   * access_token and shop_id); they win over a tool's own parameters.
+   * access_token and shop_id, an IOP gateway's access_token); they win over
+   * a tool's own parameters.
    *
    * Sorted-parameter signing, opt-in (the Alibaba IOP gateways: AliExpress,
    * Alibaba.com, Lazada). Also on the query-signing path only:
@@ -975,8 +1246,79 @@ export class RestEngine {
    *                             (`/auth/token/create` under `.../rest`).
    *   signature.encoding        'hex-upper': hex in capitals
    *   signature.timestampFormat 's' (default, Unix seconds) | 'ms'
+   *                             (milliseconds) | 'iso' (ISO 8601 in UTC,
+   *                             `2026-11-06T07:00:00+00:00`; Falabella)
    *                             (milliseconds), for `${timestamp}`,
    *                             timestampParam and timestampHeader alike
+   *
+   * TikTok Shop (`authConfig.tokenProvider: "tiktok-shop"`) uses the same
+   * query signing: its shop cipher arrives as a credential parameter, and
+   *   signature.excludeMultipartBody  true: `${body}` is empty for a
+   *                             multipart/form-data body (image uploads),
+   *                             as TikTok signs those
+   *
+   * Plain digest and body placement, opt-in (Temu's Partner API: every call
+   * is a JSON body that carries its own signature):
+   *   signature.mode            'hmac' (default) | 'digest': a plain hash of
+   *                             the rendered template, with no key. The
+   *                             secret is then part of the template, where
+   *                             the vendor puts it (Temu: before and after
+   *                             the parameters). `secret` is not used.
+   *   signature.algorithm       also 'md5', which the validator accepts in
+   *                             digest mode only
+   *   signature.placement       'body': the digest goes into the JSON body
+   *                             as the field `paramName`
+   *   signature.bodyParams      static fields written into the JSON body of
+   *                             every call (an app key, the access token),
+   *                             signed like the tool's own; they win over a
+   *                             tool's field of the same name
+   *   signature.timestampParam  with placement 'body': the timestamp is
+   *                             written into the body, as a JSON number for
+   *                             the 's' and 'ms' formats and as text for
+   *                             'iso'
+   *   template variables        `${sortedParams}` with placement 'body': the
+   *                             top-level fields of the JSON body as sent
+   *                             (the query is not part of it), sorted by
+   *                             name and written as name + value with no
+   *                             separators. A string contributes its text as
+   *                             it is; every other value (number, boolean,
+   *                             null, array, object) its JSON text, exactly
+   *                             the text the body carries for it. The
+   *                             signature field itself is left out; empty
+   *                             strings are kept, since they are sent. See
+   *                             sortedBodyParamsString.
+   *
+   * Random key suffix and wrapped header value, opt-in (SHEIN Open Platform):
+   *   signature.nonceLength     a random string of that many characters
+   *                             (A-Z a-z 0-9), new for every signature, as
+   *                             `${nonce}` in `template`, in `secret` (an
+   *                             HMAC key of secret + nonce) and in
+   *                             `headerTemplate`
+   *   signature.headerTemplate  the header value around the digest, e.g.
+   *                             `${nonce}${signature}`; default the digest.
+   *                             It must name `${signature}`.
+   *   signature.encoding        'hex-base64': Base64 of the lower-case hex
+   *                             text of the digest
+   *
+   * Form placement and a timestamp in the future, opt-in (Apaczka.pl API v2:
+   * every call is a form-urlencoded POST of app_id, request, expires and a
+   * signature over `app_id:route:request:expires`):
+   *   signature.placement       'form': the digest goes into the
+   *                             application/x-www-form-urlencoded body as
+   *                             the field `paramName`
+   *   signature.bodyParams      with placement 'form': static form fields of
+   *                             every call (an app id); they win over a
+   *                             tool's field of the same name
+   *   signature.timestampParam  with placement 'form': the timestamp is
+   *                             written into the form as this field
+   *   signature.timestampOffsetSeconds  a whole number of seconds added to
+   *                             the current time for `${timestamp}`,
+   *                             timestampParam and timestampHeader (an
+   *                             expiry time instead of the signing time)
+   *   template variables        `${form.NAME}` with placement 'form': the
+   *                             value of a form field as sent (decoded), ''
+   *                             when absent; `${apiPathNoSlash}`: `${apiPath}`
+   *                             without its leading slash (`order_send/`)
    */
   private applyHmacSignature(
     axiosConfig: AxiosRequestConfig,
@@ -986,6 +1328,15 @@ export class RestEngine {
     if (config.authType !== 'HMAC' || !config.authConfig) return;
     const sig = config.authConfig.signature as Record<string, unknown> | undefined;
     if (!sig) return;
+    // A JWT signed with the shared secret instead of a digest over the
+    // request (Ghost Admin API): see hmac-jwt.util.ts. Signed per request,
+    // so a retry gets a fresh token too.
+    if (isHmacJwtSignature(sig)) {
+      const { name, value } = hmacJwtHeader(sig);
+      const extra = (sig.extraHeaders as Record<string, string> | undefined) ?? {};
+      axiosConfig.headers = { ...axiosConfig.headers, ...extra, [name]: value };
+      return;
+    }
 
     const algorithm = String(sig.algorithm ?? 'sha256');
     const encoding = String(sig.encoding ?? 'hex') === 'base64' ? 'base64' : 'hex';
@@ -993,10 +1344,21 @@ export class RestEngine {
     const headerName = String(sig.headerName ?? 'Signature');
 
     const extended = usesExtendedHmac(sig, credentialParams);
-    const timestamp =
-      extended && String(sig.timestampFormat ?? 's') === 'ms'
-        ? String(Date.now())
-        : String(Math.floor(Date.now() / 1000));
+    const timestamp = extended
+      ? hmacTimestamp(
+          sig.timestampFormat,
+          sig.timestampOffsetSeconds === undefined
+            ? undefined
+            : Date.now() + timestampOffsetMs(sig.timestampOffsetSeconds),
+        )
+      : String(Math.floor(Date.now() / 1000));
+    // Opt-in (see the comment above): the signature lives in the JSON body or
+    // in the form body, a plain digest replaces the HMAC, a random nonce joins
+    // the key. All are false or undefined for a signature written before them.
+    const bodyPlacement = extended && String(sig.placement ?? 'header') === 'body';
+    const formPlacement = extended && String(sig.placement ?? 'header') === 'form';
+    const digestMode = extended && sig.mode !== undefined && signatureMode(sig.mode) === 'digest';
+    const nonce = extended && sig.nonceLength !== undefined ? signatureNonce(sig.nonceLength) : undefined;
     if (extended) {
       // Static and credential parameters first, so the query below (and the
       // signature over it) includes them. A tool's own parameter of the same
@@ -1009,24 +1371,55 @@ export class RestEngine {
         }
       }
       Object.assign(added, credentialParams ?? {});
-      if (sig.timestampParam) added[String(sig.timestampParam)] = timestamp;
+      if (sig.timestampParam && !bodyPlacement && !formPlacement) added[String(sig.timestampParam)] = timestamp;
       // A retry signs again: the previous signature is not part of the query.
       const previous = { ...((axiosConfig.params as Record<string, unknown>) ?? {}) };
       if (String(sig.placement ?? 'header') === 'query') delete previous[String(sig.paramName ?? 'sign')];
       axiosConfig.params = { ...previous, ...added };
+    }
+    // Body placement: the static fields and the timestamp join the tool's own
+    // fields before anything is signed, so the string below covers the body
+    // that goes out.
+    if (bodyPlacement) {
+      axiosConfig.data = signedBodyFields(
+        axiosConfig.data,
+        sig,
+        timestamp,
+        String(axiosConfig.method ?? 'GET').toUpperCase(),
+      );
+    }
+    // Form placement: the same for a form-urlencoded body. The fields signed
+    // below (`${form.NAME}`, `${body}`) are the ones that go out.
+    let formFields: URLSearchParams | undefined;
+    if (formPlacement) {
+      formFields = signedFormFields(
+        axiosConfig,
+        sig,
+        timestamp,
+        String(axiosConfig.method ?? 'GET').toUpperCase(),
+      );
+      axiosConfig.data = formFields.toString();
+      if (!hasHeader(axiosConfig.headers, 'content-type')) {
+        axiosConfig.headers = { ...axiosConfig.headers, 'Content-Type': 'application/x-www-form-urlencoded' };
+      }
     }
 
     // The body as it will actually go out. An object body is serialized the
     // way axios will serialize it, so the bytes signed are the bytes sent —
     // signing a different rendering is the classic way an HMAC integration
     // fails with a message about the key.
+    // A multipart body is left out of the string when the signature says so
+    // (TikTok Shop signs uploads without their body): its bytes, with their
+    // boundary, are not known here, and JSON of a FormData is never right.
     const data = axiosConfig.data;
     const body =
       data === undefined || data === null
         ? ''
-        : typeof data === 'string'
-          ? data
-          : JSON.stringify(data);
+        : extended && sig.excludeMultipartBody === true && data instanceof FormData
+          ? ''
+          : typeof data === 'string'
+            ? data
+            : JSON.stringify(data);
 
     // Query params are set separately on axiosConfig and appended later, so
     // fold them in here or they are absent from a signature that covers them.
@@ -1058,13 +1451,19 @@ export class RestEngine {
           apiPath: apiPathOf(url, config.baseUrl),
           body,
           timestamp,
+          nonce,
           query: params,
+          form: formFields,
           sortedParams: () =>
-            sortedParamsString(
-              params,
-              formBodyOf(axiosConfig),
-              String(sig.placement ?? 'header') === 'query' ? signParam : undefined,
-            ),
+            bodyPlacement
+              ? sortedBodyParamsString(axiosConfig.data as Record<string, unknown>, signParam)
+              : sortedParamsString(
+                  params,
+                  formBodyOf(axiosConfig),
+                  String(sig.placement ?? 'header') === 'query' || formPlacement ? signParam : undefined,
+                ),
+          sortedQuery: () =>
+            sortedQueryString(params, String(sig.placement ?? 'header') === 'query' ? signParam : undefined),
         })
       : String(sig.template ?? '${method}\n${url}\n${body}\n${timestamp}')
           .replace(/\\n/g, '\n')
@@ -1074,12 +1473,39 @@ export class RestEngine {
           .replace(/\$\{body\}/g, body)
           .replace(/\$\{timestamp\}/g, timestamp);
 
-    const rawDigest = createHmac(algorithm, secret)
-      .update(canonical, 'utf8')
-      .digest(encoding as 'hex' | 'base64');
-    const digest = extended && String(sig.encoding) === 'hex-upper' ? rawDigest.toUpperCase() : rawDigest;
+    const rawDigest = digestMode
+      ? createHash(algorithm)
+          .update(canonical, 'utf8')
+          .digest(encoding as 'hex' | 'base64')
+      : createHmac(algorithm, nonce === undefined ? secret : secret.replace(/\$\{nonce\}/g, () => nonce))
+          .update(canonical, 'utf8')
+          .digest(encoding as 'hex' | 'base64');
+    const digest =
+      extended && String(sig.encoding) === 'hex-upper'
+        ? rawDigest.toUpperCase()
+        : extended && String(sig.encoding) === 'hex-base64'
+          ? Buffer.from(rawDigest, 'utf8').toString('base64')
+          : rawDigest;
 
     const extra = (sig.extraHeaders as Record<string, string> | undefined) ?? {};
+    const headerTemplate = signatureHeaderTemplate(sig);
+    if (bodyPlacement) {
+      axiosConfig.data = { ...(axiosConfig.data as Record<string, unknown>), [signParam]: digest };
+      axiosConfig.headers = { ...axiosConfig.headers, ...extra };
+      if (sig.timestampHeader) {
+        (axiosConfig.headers as Record<string, string>)[String(sig.timestampHeader)] = timestamp;
+      }
+      return;
+    }
+    if (formPlacement && formFields) {
+      formFields.append(signParam, digest);
+      axiosConfig.data = formFields.toString();
+      axiosConfig.headers = { ...axiosConfig.headers, ...extra };
+      if (sig.timestampHeader) {
+        (axiosConfig.headers as Record<string, string>)[String(sig.timestampHeader)] = timestamp;
+      }
+      return;
+    }
     if (extended && String(sig.placement ?? 'header') === 'query') {
       axiosConfig.params = { ...params, [signParam]: digest };
       axiosConfig.paramsSerializer = serializeRepeatedParams;
@@ -1092,7 +1518,7 @@ export class RestEngine {
     axiosConfig.headers = {
       ...axiosConfig.headers,
       ...extra,
-      [headerName]: digest,
+      [headerName]: extended && headerTemplate !== undefined ? renderSignatureHeader(headerTemplate, digest, nonce) : digest,
     };
     if (sig.timestampHeader) {
       (axiosConfig.headers as Record<string, string>)[
@@ -1118,6 +1544,67 @@ export class RestEngine {
       throw new Error('Shopee connectors need the Shopee token service, which is not available here.');
     }
     return this.shopeeTokens.getShopParams(config);
+  }
+
+  /**
+   * The seller's access token an IOP call signs and sends (`access_token`),
+   * renewed first when it is about to expire. Only for `authType: HMAC`
+   * with `authConfig.tokenProvider: "iop"`; see iop-token.service.ts.
+   */
+  private async iopCredentialParams(config: {
+    baseUrl: string;
+    authConfig?: Record<string, unknown>;
+    connectorId?: string;
+  }): Promise<Record<string, string>> {
+    if (!this.iopTokens) {
+      throw new Error('IOP connectors (Lazada, Miravia, AliExpress seller) need the IOP token service, which is not available here.');
+    }
+    return this.iopTokens.getCredentialParams(config);
+  }
+
+  /**
+   * The config a SHEIN call signs with: the shop's openKeyId and secretKey
+   * filled into `${openKeyId}` / `${secretKey}` of the signature block. Only
+   * for `authType: HMAC` with `authConfig.tokenProvider: "shein"`; see
+   * shein-token.service.ts.
+   */
+  private sheinSigningConfig<T extends { authType: string; authConfig?: Record<string, unknown>; connectorId?: string }>(
+    config: T,
+  ): T {
+    if (!this.sheinTokens) {
+      throw new Error('SHEIN connectors need the SHEIN token service, which is not available here.');
+    }
+    return this.sheinTokens.signingConfig(config);
+  }
+
+  /**
+   * A TikTok Shop call's credentials, renewed first when the token is about
+   * to expire: the access token goes into the `x-tts-access-token` header
+   * (TikTok does not sign it), and the shop cipher is returned as the
+   * credential query parameter the signature covers, except on the paths
+   * where TikTok refuses one. Only for `authType: HMAC` with
+   * `authConfig.tokenProvider: "tiktok-shop"`.
+   */
+  private async tiktokShopCredentials(
+    config: { baseUrl: string; authType: string; authConfig?: Record<string, unknown>; connectorId?: string },
+    axiosConfig: AxiosRequestConfig,
+  ): Promise<Record<string, string>> {
+    if (!this.tiktokShopTokens) {
+      throw new Error('TikTok Shop connectors need the TikTok Shop token service, which is not available here.');
+    }
+    return this.applyTikTokShopCredentials(axiosConfig, await this.tiktokShopTokens.getShopCredentials(config));
+  }
+
+  /** Sets the access token header; returns the credential query parameters for this path. */
+  private applyTikTokShopCredentials(
+    axiosConfig: AxiosRequestConfig,
+    creds: { accessToken: string; shopCipher?: string },
+  ): Record<string, string> {
+    axiosConfig.headers = { ...axiosConfig.headers, 'x-tts-access-token': creds.accessToken };
+    const pathname = pathnameOf(String(axiosConfig.url ?? ''));
+    return creds.shopCipher && shopCipherApplies(pathname, String(axiosConfig.method ?? 'GET'))
+      ? { shop_cipher: creds.shopCipher }
+      : {};
   }
 
   private applyOAuth1Signature(
@@ -1314,9 +1801,193 @@ export function usesExtendedHmac(
     sig.queryParams !== undefined ||
     sig.timestampFormat !== undefined ||
     sig.encoding === 'hex-upper' ||
-    /\$\{(sortedParams|apiPath)\}/.test(String(sig.template ?? '')) ||
-    credentialParams !== undefined
+    /\$\{(sortedParams|sortedQuery|apiPath)\}/.test(String(sig.template ?? '')) ||
+    credentialParams !== undefined ||
+    // Plain digest, body placement, nonce and header template (Temu, SHEIN).
+    sig.mode !== undefined ||
+    sig.bodyParams !== undefined ||
+    sig.nonceLength !== undefined ||
+    signatureHeaderTemplate(sig) !== undefined ||
+    sig.encoding === 'hex-base64' ||
+    // Form placement, timestamp offset, route without the slash (Apaczka).
+    sig.timestampOffsetSeconds !== undefined ||
+    /\$\{(apiPathNoSlash|form\.[^{}]+)\}/.test(String(sig.template ?? ''))
   );
+}
+
+/**
+ * `signature.timestampOffsetSeconds` in milliseconds: a whole number of
+ * seconds from -86400 to 86400; anything else is a configuration error.
+ */
+export function timestampOffsetMs(seconds: unknown): number {
+  const n = Number(seconds);
+  if (typeof seconds !== 'number' || !Number.isInteger(n) || n < -86400 || n > 86400) {
+    throw new Error('This connector\'s signature.timestampOffsetSeconds must be a whole number from -86400 to 86400.');
+  }
+  return n * 1000;
+}
+
+/**
+ * The form fields of a call signed with `placement: "form"`, before the
+ * signature is added: the tool's own fields (an
+ * application/x-www-form-urlencoded body, or none), then
+ * `signature.bodyParams`, then the timestamp under `timestampParam`. A
+ * static field or the timestamp replaces a tool's field of the same name,
+ * and the signature of an earlier attempt is dropped, so a retry signs the
+ * same fields again.
+ */
+export function signedFormFields(
+  axiosConfig: AxiosRequestConfig,
+  sig: Record<string, unknown>,
+  timestamp: string,
+  method: string,
+): URLSearchParams {
+  if (!REQUEST_BODY_METHODS.has(method)) {
+    throw new Error(
+      `This connector signs inside the form body (signature.placement "form"), which a ${method} request does not have. Use POST for this tool.`,
+    );
+  }
+  const data = axiosConfig.data;
+  let fields: URLSearchParams;
+  if (data === undefined || data === null || data === '') {
+    fields = new URLSearchParams();
+  } else if (data instanceof URLSearchParams) {
+    fields = new URLSearchParams(data);
+  } else if (typeof data === 'string' && isFormContentType(axiosConfig)) {
+    fields = new URLSearchParams(data);
+  } else {
+    throw new Error(
+      'This connector signs inside the form body (signature.placement "form"), so the tool must send an application/x-www-form-urlencoded body (bodyEncoding "form-urlencoded"): not JSON, XML or a file upload.',
+    );
+  }
+  const replace = (name: string, value: string) => {
+    fields.delete(name);
+    fields.append(name, value);
+  };
+  fields.delete(String(sig.paramName ?? 'sign'));
+  const statics = sig.bodyParams;
+  if (statics && typeof statics === 'object' && !Array.isArray(statics)) {
+    for (const [k, v] of Object.entries(statics as Record<string, unknown>)) {
+      if (v !== undefined && v !== null) replace(k, String(v));
+    }
+  }
+  if (sig.timestampParam) replace(String(sig.timestampParam), timestamp);
+  return fields;
+}
+
+/** Whether the request's Content-Type is application/x-www-form-urlencoded. */
+function isFormContentType(axiosConfig: AxiosRequestConfig): boolean {
+  const headers = (axiosConfig.headers ?? {}) as Record<string, unknown>;
+  const contentType = Object.entries(headers).find(([k]) => k.toLowerCase() === 'content-type')?.[1];
+  return String(contentType ?? '').toLowerCase().includes('application/x-www-form-urlencoded');
+}
+
+/**
+ * `signature.headerTemplate` of a digest signature: counted only when it
+ * names `${signature}`. (A signed-JWT signature has a `headerTemplate` of its
+ * own, with `${jwt}`, and never reaches the digest code.)
+ */
+function signatureHeaderTemplate(sig: Record<string, unknown>): string | undefined {
+  const template = sig.headerTemplate;
+  return typeof template === 'string' && template.includes('${signature}') ? template : undefined;
+}
+
+/** `signature.mode`: 'hmac' or 'digest'; anything else is a configuration error. */
+function signatureMode(mode: unknown): 'hmac' | 'digest' {
+  if (mode === 'hmac' || mode === 'digest') return mode;
+  throw new Error('This connector\'s signature.mode must be "hmac" or "digest".');
+}
+
+const NONCE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+
+/**
+ * `${nonce}`: a random string of `length` characters (A-Z a-z 0-9), drawn
+ * anew for every signature. 1 to 64 characters.
+ */
+export function signatureNonce(length: unknown): string {
+  const n = Number(length);
+  if (!Number.isInteger(n) || n < 1 || n > 64) {
+    throw new Error('This connector\'s signature.nonceLength must be a whole number from 1 to 64.');
+  }
+  let out = '';
+  for (let i = 0; i < n; i++) out += NONCE_ALPHABET[randomInt(NONCE_ALPHABET.length)];
+  return out;
+}
+
+/**
+ * The header value of `signature.headerTemplate`: `${signature}` is the
+ * digest, `${nonce}` the random string of this signature ('' without
+ * `nonceLength`). One pass, so neither value is read again as a variable.
+ */
+export function renderSignatureHeader(template: string, signature: string, nonce: string | undefined): string {
+  return template.replace(/\$\{(signature|nonce)\}/g, (_m, name: string) =>
+    name === 'signature' ? signature : (nonce ?? ''),
+  );
+}
+
+/**
+ * The JSON body of a call signed with `placement: "body"`, before the
+ * signature is added: the tool's own fields, then `signature.bodyParams`,
+ * then the timestamp under `timestampParam` (a JSON number for Unix seconds
+ * and milliseconds, text for ISO 8601). The signature of an earlier attempt
+ * is dropped, so a retry signs the same fields again.
+ */
+export function signedBodyFields(
+  data: unknown,
+  sig: Record<string, unknown>,
+  timestamp: string,
+  method: string,
+): Record<string, unknown> {
+  if (!REQUEST_BODY_METHODS.has(method)) {
+    throw new Error(
+      `This connector signs inside the JSON body (signature.placement "body"), which a ${method} request does not have. Use POST for this tool.`,
+    );
+  }
+  const plain =
+    data !== null &&
+    typeof data === 'object' &&
+    (Object.getPrototypeOf(data) === Object.prototype || Object.getPrototypeOf(data) === null);
+  if (data !== undefined && data !== null && !plain) {
+    throw new Error(
+      'This connector signs inside the JSON body (signature.placement "body"), so the tool must send a JSON object: not text, a list, a form or a file upload.',
+    );
+  }
+  const body: Record<string, unknown> = { ...((data as Record<string, unknown> | null | undefined) ?? {}) };
+  delete body[String(sig.paramName ?? 'sign')];
+  const statics = sig.bodyParams;
+  if (statics && typeof statics === 'object' && !Array.isArray(statics)) {
+    for (const [k, v] of Object.entries(statics as Record<string, unknown>)) {
+      if (v !== undefined && v !== null) body[k] = v;
+    }
+  }
+  if (sig.timestampParam) {
+    body[String(sig.timestampParam)] = String(sig.timestampFormat ?? 's') === 'iso' ? timestamp : Number(timestamp);
+  }
+  return body;
+}
+
+/**
+ * `${sortedParams}` for `placement: "body"`: the top-level fields of the JSON
+ * body, sorted by name (code unit order) and concatenated as name + value
+ * with no separators. A string contributes its text as it is; any other value
+ * its JSON text as `JSON.stringify` writes it, which is the text the body
+ * itself carries for that value: no spaces, object keys in the order sent,
+ * numbers in their shortest form (`1`, `19.9`), `true`, `false`, `null`. The
+ * signature field is left out, and so is a field JSON would not send
+ * (`undefined`); an empty string is sent, so its name is signed.
+ *
+ * This is Temu's Partner API signature string (their Python sample:
+ * `json.dumps(v, ensure_ascii=False, separators=(',', ':'))` with the outer
+ * quotes of a string removed).
+ */
+export function sortedBodyParamsString(body: Record<string, unknown>, excludeKey?: string): string {
+  return Object.entries(body ?? {})
+    .filter(([k]) => k !== excludeKey)
+    .map(([k, v]): [string, string | undefined] => [k, typeof v === 'string' ? v : JSON.stringify(v)])
+    .filter((pair): pair is [string, string] => pair[1] !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([k, v]) => `${k}${v}`)
+    .join('');
 }
 
 /**
@@ -1367,6 +2038,41 @@ export function sortedParamsString(
     .join('');
 }
 
+/**
+ * `${sortedQuery}`: the query parameters as sent, sorted by name (code unit
+ * order) and written as `name=value` pairs joined with `&`, each name and
+ * value percent-encoded per RFC 3986 (only `A-Z a-z 0-9 - . _ ~` stay as they
+ * are). The signature parameter is left out; empty values are kept, since
+ * they are sent. No body is included. This is the Rocket SellerCenter
+ * signature string (Falabella Seller Center: PHP `rawurlencode`, `ksort`,
+ * `implode('&')`). An array or object contributes the pairs the query
+ * serializer sends for it.
+ */
+export function sortedQueryString(query: Record<string, unknown>, excludeKey?: string): string {
+  return flattenParams(query)
+    .filter(([k]) => k !== excludeKey)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([k, v]) => `${rfc3986(k)}=${rfc3986(v)}`)
+    .join('&');
+}
+
+/** RFC 3986 percent-encoding: encodeURIComponent plus `! ' ( ) *`. */
+function rfc3986(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+/**
+ * The timestamp an extended HMAC signature uses: Unix seconds (default),
+ * milliseconds (`ms`) or ISO 8601 in UTC without fractions (`iso`,
+ * `2026-11-06T07:00:00+00:00`).
+ */
+export function hmacTimestamp(format: unknown, now: number = Date.now()): string {
+  const f = String(format ?? 's');
+  if (f === 'ms') return String(now);
+  if (f === 'iso') return new Date(now).toISOString().replace(/\.\d{3}Z$/, '+00:00');
+  return String(Math.floor(now / 1000));
+}
+
 /** The path of a URL without its query; the input as given when it is relative. */
 function pathnameOf(url: string): string {
   try {
@@ -1392,22 +2098,38 @@ export function renderExtendedHmacTemplate(
     apiPath?: string;
     body: string;
     timestamp: string;
+    /** The random string of this signature; undefined without `nonceLength`. */
+    nonce?: string;
     query: Record<string, unknown>;
     /** Computed only when the template asks for it. */
     sortedParams?: () => string;
+    /** Computed only when the template asks for it. */
+    sortedQuery?: () => string;
+    /**
+     * The form fields of a signature with `placement: "form"`, for
+     * `${form.NAME}`; undefined for every other placement.
+     */
+    form?: URLSearchParams;
   },
 ): string {
   return template
     .replace(/\\n/g, '\n')
     .replace(
-      /\$\{(method|url|path|pathname|apiPath|body|timestamp|sortedParams|query\.([^{}]+))\}/g,
-      (_m, name: string, q?: string) => {
+      /\$\{(method|url|path|pathname|apiPathNoSlash|apiPath|body|timestamp|sortedParams|sortedQuery|nonce|query\.([^{}]+)|form\.([^{}]+))\}/g,
+      (match: string, name: string, q?: string, f?: string) => {
+        // `${nonce}` is a variable only for a signature with `nonceLength`;
+        // without it the text stays as written, as it always has.
+        if (name === 'nonce') return vars.nonce === undefined ? match : vars.nonce;
+        // `${form.NAME}` likewise only for placement "form".
+        if (f !== undefined) return vars.form === undefined ? match : (vars.form.get(f) ?? '');
+        if (name === 'apiPathNoSlash') return (vars.apiPath ?? vars.pathname).replace(/^\/+/, '');
         if (q !== undefined) {
           const v = vars.query[q];
           if (v === undefined || v === null) return '';
           return Array.isArray(v) ? v.map(String).join(',') : String(v);
         }
         if (name === 'sortedParams') return vars.sortedParams ? vars.sortedParams() : '';
+        if (name === 'sortedQuery') return vars.sortedQuery ? vars.sortedQuery() : '';
         if (name === 'apiPath') return vars.apiPath ?? vars.pathname;
         return String(vars[name as 'method' | 'url' | 'path' | 'pathname' | 'body' | 'timestamp']);
       },
@@ -1793,11 +2515,19 @@ function missingTemplateParams(
  * the parameter's value, XML-escaped; a missing one becomes empty. No quoting
  * rules apply, unlike the JSON renderer: the template is markup and the value
  * lands in element text or an attribute either way.
+ *
+ * A template that uses optional or repeated blocks (`${?name}…${/name}`,
+ * `${*items}…${/items}`) is rendered by xml-body-template.util.ts; one that
+ * does not is rendered here, as before. `locked` holds values the engine
+ * supplies itself (`loginToken`), which win over the call's parameters.
  */
 export function renderXmlBodyTemplate(
   template: string,
   params: Record<string, unknown>,
+  locked?: Record<string, unknown>,
 ): string {
+  if (hasXmlTemplateBlocks(template)) return renderXmlTemplateBlocks(template, params, locked);
+  if (locked) params = { ...params, ...locked };
   return template.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name: string) => {
     if (!Object.prototype.hasOwnProperty.call(params, name)) return '';
     const value = params[name];
@@ -1862,26 +2592,94 @@ export function buildOauth2TokenHeader(
 
 /**
  * Inject the bearer header (and any extraHeaders) for a LOGIN_TOKEN connector.
- * Both the main header and extraHeaders support `${token}` / `${aud}` placeholders.
+ * Both the main header and extraHeaders support `${token}` / `${aud}` placeholders,
+ * and `${uuid}`: a new random UUID for every request (Walmart wants a fresh
+ * WM_QOS.CORRELATION_ID on each call).
+ *
+ * With `tokenPlacement: "body"` the token travels in the request body (Fnac
+ * Darty: an attribute of every XML request), so the token header is not
+ * sent. extraHeaders, which the adapter wrote out itself, still are.
  */
 export function injectLoginTokenHeaders(
   axiosConfig: AxiosRequestConfig,
   authConfig: LoginTokenAuthConfig,
   token: string,
   aud?: string,
-): void {
+): string | undefined {
   const headerName = authConfig.headerName || 'Authorization';
   const headerTemplate = authConfig.headerTemplate || 'Bearer ${token}';
-  const interpolate = (s: string): string =>
-    s.replace(/\$\{token\}/g, token).replace(/\$\{aud\}/g, aud || '');
+  const interpolate = loginTokenHeaderInterpolator(token, aud);
+  const replaced = loginTokenHeaderCollision(axiosConfig.headers, authConfig);
 
-  axiosConfig.headers = {
-    ...axiosConfig.headers,
-    [headerName]: interpolate(headerTemplate),
-  };
+  const current = (axiosConfig.headers ?? {}) as Record<string, unknown>;
+  // The token header wins over a connector header of the same name, in any
+  // spelling (axios would otherwise keep whichever came last).
+  const others = Object.fromEntries(
+    Object.entries(current).filter(([name]) => name.toLowerCase() !== headerName.toLowerCase()),
+  );
+  axiosConfig.headers = (
+    authConfig.tokenPlacement === 'body'
+      ? { ...current }
+      : { ...others, [headerName]: interpolate(headerTemplate) }
+  ) as AxiosRequestConfig['headers'];
   for (const [k, v] of Object.entries(authConfig.extraHeaders || {})) {
-    axiosConfig.headers[k] = interpolate(String(v));
+    axiosConfig.headers![k] = interpolate(String(v));
   }
+  return replaced;
+}
+
+/**
+ * The name of a header already on the request (set on the connector or the
+ * tool) that the Login → Token header would replace, matched without regard
+ * to case. Undefined with `tokenPlacement: "body"` (no token header) or when
+ * nothing collides.
+ */
+export function loginTokenHeaderCollision(
+  headers: AxiosRequestConfig['headers'] | Record<string, unknown> | undefined,
+  authConfig: LoginTokenAuthConfig | undefined,
+): string | undefined {
+  if (!headers || typeof headers !== 'object' || authConfig?.tokenPlacement === 'body') return undefined;
+  const wanted = (authConfig?.headerName || 'Authorization').toLowerCase();
+  return Object.keys(headers).find((name) => name.toLowerCase() === wanted);
+}
+
+/**
+ * Add a hint to a refused call (HTTP 401/403, or an errorWhen rule that gave
+ * one) of a Login → Token connector whose token header replaced a connector
+ * header of the same name: the API may have needed that header. A hint the
+ * error already carries (a failed login's own) is kept, with this one added.
+ */
+export function withLoginHeaderCollisionHint(error: unknown, collision: string | undefined): unknown {
+  if (!collision || !error || typeof error !== 'object') return error;
+  const e = error as { response?: { status?: unknown }; status?: unknown; hint?: unknown };
+  const status = error instanceof ResponseBodyError ? error.status : e.response?.status;
+  if (status !== 401 && status !== 403) return error;
+  const note =
+    `The connector sets a "${collision}" header, and the Login → Token header (authConfig.headerName, default Authorization) replaces it on every call. ` +
+    'If the API needs that header as well, send the token in another header (headerName / headerTemplate), or move the value to the headers for the login request when only the login needs it.';
+  e.hint = typeof e.hint === 'string' && e.hint ? `${e.hint} ${note}` : note;
+  return error;
+}
+
+/**
+ * Whether a failed call says, in its body, that the token was refused: an
+ * `errorWhen` rule with status 401 matched a 2xx answer (the error is then a
+ * ResponseBodyError), or matches the body of an HTTP error answer. Fnac Darty
+ * answers an expired token with an XML `<error code="ERR_098">` and no 401.
+ * Used only when the connector sets `authConfig.refreshOnBody401`.
+ */
+export function bodyReports401(error: unknown, errorWhen: unknown): boolean {
+  if (error instanceof ResponseBodyError) return error.status === 401;
+  if (!(error instanceof AxiosError) || !error.response) return false;
+  try {
+    assertNoResponseBodyError(
+      parseXmlBody(error.response as { data: unknown; headers?: Record<string, unknown> }),
+      errorWhen,
+    );
+  } catch (matched) {
+    return matched instanceof ResponseBodyError && matched.status === 401;
+  }
+  return false;
 }
 
 /**
@@ -2012,24 +2810,13 @@ const PROXY_ERROR_HINTS: Record<string, string> = {
  * Anything that is not declared as XML, or fails to parse, is returned as
  * axios delivered it — a JSON API is never touched.
  */
-const xmlParser = new XMLParser({
-  ignoreAttributes: false,
-  attributeNamePrefix: '',
-  removeNSPrefix: true,
-  parseTagValue: false,
-  parseAttributeValue: false,
-  trimValues: true,
-});
-
 export function parseXmlBody(response: {
   data: unknown;
   headers?: Record<string, unknown>;
 }): unknown {
   const { data } = response;
   if (typeof data !== 'string') return data;
-  const contentType = String(response.headers?.['content-type'] ?? '').toLowerCase();
-  const declaredXml = /(^|[/+])xml([;\s]|$)/.test(contentType);
-  if (!declaredXml) return data;
+  if (!isXmlContentType(response.headers?.['content-type'])) return data;
   try {
     const parsed = xmlParser.parse(data);
     // fast-xml-parser hands back an empty object for non-XML text; keep the

@@ -1,6 +1,8 @@
 import {
+  BadGatewayException,
   ConflictException,
   ForbiddenException,
+  HttpException,
   Injectable,
   Logger,
   NotFoundException,
@@ -10,12 +12,41 @@ import { RedisService } from '../common/redis.service';
 import { RolesService } from '../roles/roles.service';
 import { KgStaticService } from './kg-static.service';
 import { memberContributes } from './kg-learning.service';
-import {
-  folderVisibility,
-  type FolderAccess,
-} from '../knowledge-folders/knowledge-folders.service';
+import { type FolderAccess } from '../knowledge-folders/knowledge-folders.service';
 import { KgObservationalService } from './kg-observational.service';
 import { KgLlmService } from './kg-llm.service';
+import { skillVisibility } from './kg-skill.service';
+
+/**
+ * Graph nodes as a caller whose roles limit tools may read them.
+ *
+ * A connector is in a caller's scope as soon as their roles allow one of its
+ * tools, and its nodes name every tool that reads or writes the entity. Left
+ * as they are, kg_how_to_obtain and the knowledge-graph resource told a member
+ * which tools exist beyond their role. So each node keeps only the allowed
+ * tool names, and a node whose tools are all denied is dropped (with its
+ * edges, since both ends of an edge must be in scope): the caller cannot reach
+ * that entity. A node no tool names (curated by hand) stays.
+ *
+ * `allowed` null or undefined means the roles limit nothing: unchanged.
+ */
+export function narrowToAllowedTools<T extends { toolNames: unknown }>(
+  nodes: T[],
+  allowed: ReadonlySet<string> | null | undefined,
+): T[] {
+  if (!allowed) return nodes;
+  const out: T[] = [];
+  for (const node of nodes) {
+    const names = Array.isArray(node.toolNames) ? (node.toolNames as string[]) : [];
+    if (names.length === 0) {
+      out.push(node);
+      continue;
+    }
+    const kept = names.filter((name) => allowed.has(name));
+    if (kept.length > 0) out.push({ ...node, toolNames: kept });
+  }
+  return out;
+}
 
 @Injectable()
 export class KgService {
@@ -77,10 +108,15 @@ export class KgService {
       enabled,
       llmEnabled,
       llmAvailable: this.llmSvc.globallyAvailable(),
+      // Whether the scheduled job that reads `autoExtend` runs on this
+      // instance (KG_LLM_CRON_ENABLED). Without it the switch does nothing,
+      // so the dashboard does not offer it.
+      scheduledAvailable: this.llmSvc.scheduledAvailable(),
       captureIntent,
       // Scheduled AI extension of graph + skills from captured intents.
       autoExtend,
-      // Auto-apply generated skills at/above the confidence threshold.
+      // Auto-apply skills learned from fixed errors once seen often enough.
+      // Skills a model generates always wait for review.
       skillAutoApply,
       // Auto-apply high-confidence AI-suggested graph connections (no extra AI cost —
       // it only changes the status of edges the enrichment pass already produced).
@@ -128,6 +164,12 @@ export class KgService {
     if (this.redis.isConnected) await this.redis.expire(lockKey, 120);
     try {
       return await this.llmSvc.enrich(organizationId, { force: true });
+    } catch (error) {
+      if (error instanceof HttpException) throw error;
+      // Model or transport failure (e.g. a reply that is not valid JSON):
+      // nothing was written, so tell the user to retry instead of a raw 500.
+      this.logger.warn(`KG LLM enrich failed for ${organizationId}: ${(error as Error)?.message?.slice(0, 200)}`);
+      throw new BadGatewayException('The AI model did not return a usable answer. Please try again.');
     } finally {
       if (this.redis.isConnected) await this.redis.del(lockKey);
     }
@@ -498,7 +540,16 @@ export class KgService {
   async lookup(
     organizationId: string,
     query: string,
-    opts?: { connectorIds?: string[]; mcpServerId?: string; folders?: FolderAccess | null },
+    opts?: {
+      connectorIds?: string[];
+      mcpServerId?: string;
+      folders?: FolderAccess | null;
+      /**
+       * Names of the tools the caller's roles allow, when roles limit them
+       * (see `narrowToAllowedTools`). null or absent narrows nothing.
+       */
+      allowedToolNames?: ReadonlySet<string> | null;
+    },
   ) {
     const scope = opts?.connectorIds
       ? { connectorId: { in: opts.connectorIds.length ? opts.connectorIds : ['__none__'] } }
@@ -508,17 +559,20 @@ export class KgService {
     const q = (query || '').toLowerCase().trim().replace(/\s+/g, '_');
     if (!q) return { query, entities: [], howToObtain: [], relatedTo: [], skills };
 
-    const nodes = await this.prisma.kgNode.findMany({
-      where: { organizationId, ...scope },
-      select: {
-        id: true,
-        entity: true,
-        label: true,
-        description: true,
-        fields: true,
-        toolNames: true,
-      },
-    });
+    const nodes = narrowToAllowedTools(
+      await this.prisma.kgNode.findMany({
+        where: { organizationId, ...scope },
+        select: {
+          id: true,
+          entity: true,
+          label: true,
+          description: true,
+          fields: true,
+          toolNames: true,
+        },
+      }),
+      opts?.allowedToolNames,
+    );
     const byId = new Map(nodes.map((n) => [n.id, n]));
     const nodeIds = new Set(nodes.map((n) => n.id));
     const label = (id: string) => byId.get(id)?.label ?? '?';
@@ -592,6 +646,8 @@ export class KgService {
       mcpServerId?: string;
       serverName?: string;
       folders?: FolderAccess | null;
+      /** As in lookup(): the tool names the caller's roles allow, or null. */
+      allowedToolNames?: ReadonlySet<string> | null;
     },
   ): Promise<string> {
     const MAX_ENTITIES = 150;
@@ -606,7 +662,7 @@ export class KgService {
       'to another. Use it to plan a chain of tool calls. For a single entity or parameter, ' +
       'the kg_how_to_obtain tool gives the same information on demand.';
 
-    const [nodes, skills] = await Promise.all([
+    const [allNodes, skills] = await Promise.all([
       opts.connectorIds.length
         ? this.prisma.kgNode.findMany({
             where: { organizationId, connectorId: { in: opts.connectorIds } },
@@ -628,6 +684,7 @@ export class KgService {
         folders: opts.folders,
       }),
     ]);
+    const nodes = narrowToAllowedTools(allNodes, opts.allowedToolNames);
 
     if (nodes.length === 0) {
       return [
@@ -720,8 +777,9 @@ export class KgService {
         organizationId,
         status: 'applied',
         ...(or.length ? { OR: or } : {}),
-        // Skills in folders limited to roles the caller lacks stay out.
-        AND: [folderVisibility(opts?.folders)],
+        // Skills in folders limited to roles the caller lacks stay out, and
+        // a member's draft is served to that member only (whatever its folder).
+        AND: [skillVisibility(opts?.folders)],
       },
       select: { id: true, title: true, whenToUse: true },
       take: 25,

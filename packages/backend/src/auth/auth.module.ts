@@ -16,6 +16,7 @@ import { RolesGuard } from './roles.guard';
 import { PrismaOAuthStore } from './prisma-oauth.store';
 import { ClientCredentialsMiddleware } from './client-credentials.middleware';
 import { RefreshTokenRevocationMiddleware } from './refresh-token-revocation.middleware';
+import { CrossWorkspaceRefusalStore } from './cross-workspace-refusal.store';
 import { UsersModule } from '../users/users.module';
 import { SettingsModule } from '../settings/settings.module';
 import { McpServersModule } from '../mcp-servers/mcp-servers.module';
@@ -31,6 +32,7 @@ import { SocialAuthController } from './social/social-auth.controller';
 import { CloudOnlyGuard } from '../common/cloud-only.guard';
 
 import { RecentSignInService } from './recent-sign-in.service';
+import { EmailVerificationService } from './email-verification.service';
 import { RecentSignInController } from './recent-sign-in.controller';
 @Global()
 @Module({
@@ -68,6 +70,7 @@ import { RecentSignInController } from './recent-sign-in.controller';
     RecoveryCodesService,
     SsoEnforcementService,
     RecentSignInService,
+    EmailVerificationService,
     JwtStrategy,
     McpAuthGuard,
     McpAuthMiddleware,
@@ -76,10 +79,13 @@ import { RecentSignInController } from './recent-sign-in.controller';
     PrismaOAuthStore,
     ClientCredentialsMiddleware,
     RefreshTokenRevocationMiddleware,
+    // Shared by the MCP endpoint (writes) and the refresh middleware (reads).
+    CrossWorkspaceRefusalStore,
   ],
   exports: [
     AuthService,
     RecentSignInService,
+    EmailVerificationService,
     RecoveryCodesService,
     SsoEnforcementService,
     McpAuthGuard,
@@ -89,6 +95,7 @@ import { RecentSignInController } from './recent-sign-in.controller';
     PrismaOAuthStore,
     ClientCredentialsMiddleware,
     RefreshTokenRevocationMiddleware,
+    CrossWorkspaceRefusalStore,
     SocialProviderRegistry,
     JwtModule,
   ],

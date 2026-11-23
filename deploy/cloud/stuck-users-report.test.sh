@@ -9,13 +9,15 @@
 #   KEEP_MAIL=1 bash deploy/cloud/stuck-users-report.test.sh   # print the mail
 #
 # Scenarios:
-#   1. --print renders all five sections, marks every org NEW on a first run,
+#   1. --print renders all six sections, marks every org NEW on a first run,
 #      groups stuck orgs by cause and lists only "other" and company-address
 #      orgs, counts the funnel of this week's and last week's cohorts and the
 #      Etsy apps waiting for approval, scrubs error texts, and touches neither
 #      the state nor the mailbox;
 #   2. with no recipient configured the report goes to stdout and the state
 #      file records the stuck orgs;
+#      Orgs whose successful calls were deleted (older than the retention)
+#      but left a first-success marker are not stuck;
 #   3. the next run calls them STILL STUCK, and counts the one that has since
 #      had a successful call as unstuck;
 #   4. with REPORT_TO and SMTP_* set, the mail arrives over STARTTLS with the
@@ -80,7 +82,11 @@ select v.id, v.id, t0.now - v.age, t0.now from t0, (values
   -- Etsy apps
   ('org_etsy_wait', interval '40 days'), -- refused this week, still pending
   ('org_etsy_ok',   interval '50 days'), -- refused 9 days ago, approved this week
-  ('org_etsy_old',  interval '60 days')  -- seen pending by the watcher 20 days ago
+  ('org_etsy_old',  interval '60 days'), -- seen pending by the watcher 20 days ago
+  -- only errors this week; their successes are older than the retention and
+  -- deleted, but a stored marker says they had one: not stuck
+  ('org_pruned_s',  interval '150 days'), -- org_settings first_successful_call_at
+  ('org_pruned_u',  interval '160 days')  -- a member's first_successful_invocation_at
 ) v(id, age);
 
 insert into users (id, email, organization_id, email_marketing_opt_out, created_at, updated_at)
@@ -100,11 +106,26 @@ from (values
   ('org_stuck_f', 'kim@acme.example', false),
   ('org_etsy_wait', 'lena@example.com', false),
   ('org_etsy_ok',   'mike@example.com', false),
-  ('org_etsy_old',  'olga@example.com', false)
+  ('org_etsy_old',  'olga@example.com', false),
+  ('org_pruned_s',  'paul@example.com', false),
+  ('org_pruned_u',  'quinn@example.com', false)
 ) v(org, email, optout) join organizations o on o.id = v.org;
 
 insert into organization_members (id, user_id, organization_id, role)
 select 'm_' || organization_id, id, organization_id, 'ADMIN' from users;
+
+insert into org_settings (id, organization_id, key, value, updated_at)
+select 'os_pruned_s', 'org_pruned_s', 'first_successful_call_at', to_char(t0.now - interval '140 days', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), t0.now
+from t0;
+update organization_members m set joined_at = t0.now - interval '160 days' from t0
+where m.organization_id = 'org_pruned_u';
+update users u set first_successful_invocation_at = t0.now - interval '130 days' from t0 where u.id = 'u_org_pruned_u';
+-- org_stuck_b stays stuck: its second member's stamp predates joining it (a
+-- call made in another workspace), so it says nothing about org_stuck_b.
+insert into users (id, email, email_marketing_opt_out, first_successful_invocation_at, created_at, updated_at)
+select 'u_rita', 'rita@example.com', false, t0.now - interval '25 days', t0.now - interval '30 days', t0.now from t0;
+insert into organization_members (id, user_id, organization_id, role, joined_at)
+select 'm_rita_b', 'u_rita', 'org_stuck_b', 'EDITOR', t0.now - interval '20 days' from t0;
 
 insert into connectors (id, user_id, organization_id, name, type, base_url, config, auth_config, updated_at)
 select v.id, 'u_' || v.org, v.org, v.name, 'REST', 'https://api.example.test',
@@ -125,7 +146,9 @@ from t0, (values
   ('c_e_odd',    'org_stuck_e', 'Odd API', null),
   ('c_f_lan',    'org_stuck_f', 'Intranet', null),
   ('c_w_etsy',   'org_etsy_wait', 'Etsy', 'etsy'),
-  ('c_k_etsy',   'org_etsy_ok',   'Etsy', 'etsy')
+  ('c_k_etsy',   'org_etsy_ok',   'Etsy', 'etsy'),
+  ('c_ps_api',   'org_pruned_s',  'Pruned S API', null),
+  ('c_pu_api',   'org_pruned_u',  'Pruned U API', null)
 ) v(id, org, name, slug);
 
 insert into mcp_tools (id, connector_id, name, description, parameters, endpoint_mapping, updated_at)
@@ -151,7 +174,9 @@ insert into plan values
   ('c_d_ai',      2, 'ERROR', 'Insufficient credits: request failed with status 402', 4),
   ('c_e_odd',     2, 'ERROR', 'The provider answered something odd', 4),
   ('c_f_lan',     2, 'ERROR', 'connect ECONNREFUSED 10.0.0.1:443', 4),
-  ('c_k_etsy',    1, 'SUCCESS', null, 24);
+  ('c_k_etsy',    1, 'SUCCESS', null, 24),
+  ('c_ps_api',    2, 'ERROR', 'Bad credentials', 5),
+  ('c_pu_api',    2, 'ERROR', 'Bad credentials', 5);
 
 insert into tool_invocations (id, tool_id, user_id, organization_id, connector_id, input, output, status, error, created_at)
 select 'ti_' || p.c || '_' || p.h0 || '_' || g, 't_' || p.c, c.user_id, c.organization_id, p.c,
@@ -179,7 +204,13 @@ from t0, (values
   ('etsy_app_approved_notified', 'org_etsy_ok', '{"connectorId":"c_k_etsy"}', interval '1 day'),
   -- not the pending answer: another status, another adapter
   ('setup_verify_failed', 'org_happy',   '{"adapterSlug":"etsy","kind":"invalid_input","status":400}', interval '1 day'),
-  ('setup_verify_failed', 'org_happy',   '{"adapterSlug":"shopify","kind":"auth_failed","status":403}', interval '1 day')
+  ('setup_verify_failed', 'org_happy',   '{"adapterSlug":"shopify","kind":"auth_failed","status":403}', interval '1 day'),
+  -- setup checks (section 6): an adapter-side 500 not through, a 400 fixed by a
+  -- verified setup after it, a 404 on a connector that has called since
+  ('setup_verify_failed', 'org_stuck_e', '{"adapterSlug":"odoo","kind":"upstream_error","status":500,"error":"The target API returned a server error (500). (Invalid field customer_rank on res.partner, see https://odoo.example/web?db=SEEKRIT-DB)"}', interval '2 days'),
+  ('setup_verify_failed', 'org_stuck_e', '{"adapterSlug":"odoo","kind":"upstream_error","status":500,"error":"The target API returned a server error (500). (Invalid field customer_rank on res.partner, see https://odoo.example/web?db=SEEKRIT-DB)"}', interval '1 day'),
+  ('setup_verify_failed', 'org_stuck_a', '{"adapterSlug":"reddit","kind":"bad_request","status":400,"error":"Bad body"}', interval '4 days'),
+  ('setup_verify_failed', 'org_happy',   '{"adapterSlug":"github","kind":"not_found","status":404,"error":"Not Found"}', interval '6 days')
 ) v(event, org, meta, age);
 SQL
 
@@ -191,7 +222,18 @@ echo "1. --print on a first run"
 printf 'DOMAIN=cloud.example.test\n' > "$ENVF"
 run --print > "$WORK/r1.txt" 2>/dev/null
 R="$WORK/r1.txt"
-has   "$R" "SUMMARY: 6 new stuck orgs (0 still stuck), 1 connector failing for everyone (+1 under 20 %), 1 of 3 signups without a connector." "summary line"
+has   "$R" "SUMMARY: 6 new stuck orgs (0 still stuck), 1 connector failing for everyone (+1 under 20 %), 1 of 3 signups without a connector, 2 workspaces stuck at a setup check (1 possibly the adapter)." "summary line"
+# Section 6: setup checks. odoo (500, judy) not through and listed; reddit
+# fixed by the verified setup after it; github fixed by a successful call; shopify 403
+# counted, not listed; etsy left to section 5.
+has   "$R" "6. SETUP CHECKS THAT FAIL" "setup checks section"
+has   "$R" "2 of 4 workspace(s) with a failed check are not through; 1 of them with an error that may be ours." "setup checks totals"
+has   "$R" "odoo: 1 workspace(s) failed the check, 1 not through since; 2 failed checks: upstream_error 500 ×2" "adapter-side failure per adapter"
+has   "$R" "2× The target API returned a server error (500). (Invalid field customer_rank on res.partner, see https://odoo.example/web?…" "provider words kept, query string scrubbed"
+has   "$R" "judy@gmail.com — 2 failed, last" "workspace listed even on free mail when the error may be ours"
+has   "$R" "shopify: 1 workspace(s) failed the check, 1 not through since; 1 failed checks: auth_failed 403 ×1" "credential failure counted"
+if sed -n '/^6\. /,/^--$/p' "$R" | grep -q "carol@example.net"; then bad "credential failure not listed by workspace"; else ok "credential failure not listed by workspace"; fi
+if sed -n '/^6\. /,/^--$/p' "$R" | grep -qE "^  (reddit|github|etsy):"; then bad "fixed setups and Etsy not in section 6"; else ok "fixed setups and Etsy not in section 6"; fi
 has   "$R" "[NEW] alice@example.com [opt-out]" "stuck org A, NEW, opt-out flagged"
 has   "$R" "[NEW] bob@example.org" "stuck org B, NEW"
 has   "$R" "Active this week: 6 (6 new, 0 still stuck). Active in the last 30 days: 7. All time: 7." "30-day and all-time context"
@@ -226,6 +268,9 @@ if sed -n '/^2\. /,/^3\. /p' "$R" | grep -q "My ERP"; then bad "... but a single
 hasnt "$R" "GitHub (github)" "healthy connector not listed"
 hasnt "$R" "Vinted" "connector quiet this week not listed"
 hasnt "$R" "erin@" "org that once succeeded is not stuck"
+hasnt "$R" "paul@" "org whose success rows were deleted, with a first_successful_call_at setting, is not stuck"
+hasnt "$R" "quinn@" "org whose success rows were deleted, with a member's first-success stamp, is not stuck"
+has   "$R" "bob@example.org, rita@example.com" "a member stamped before joining does not make the org unstuck"
 has   "$R" "3 signed up [4]" "signup count"
 has   "$R" "frank@example.com" "signup without connector listed"
 has   "$R" "grace@example.com" "signup without calls listed"

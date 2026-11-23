@@ -82,6 +82,7 @@ function buildConnectors(stored: Record<string, any> = {}, overrides: { harParse
     { checkCanCreateConnector: jest.fn() } as any,
     { attachToDefaultServer: jest.fn().mockResolvedValue(null) } as any,
     { isCloud: () => true } as any,
+    { recentEvents: jest.fn().mockResolvedValue([]) } as any,
   );
   return { controller, connectorsService, prisma, connector };
 }
@@ -502,7 +503,8 @@ describe('catalog install', () => {
     const { data } = prisma.connector.create.mock.calls[0][0];
     expect(data.baseUrl).toBe('https://api.telegram.org/bot{{TELEGRAM_BOT_TOKEN}}');
     expect(data.config.baseUrlBaseline).toBe('https://api.telegram.org/bot{{TELEGRAM_BOT_TOKEN}}');
-    expect(data.envVars).toEqual({ TELEGRAM_BOT_TOKEN: TG });
+    // The optional default chat left out is stored empty, as the form does (#1774).
+    expect(data.envVars).toEqual({ TELEGRAM_BOT_TOKEN: TG, TELEGRAM_DEFAULT_CHAT_ID: '' });
   });
 
   it('still resolves non-secret address variables', () => {
@@ -626,5 +628,92 @@ describe('logs', () => {
       'GET https://api.telegram.org/bot[REDACTED]/getMe',
     );
     expect(stripQuery('https://api.example.com/v1/users/123')).toBe('https://api.example.com/v1/users/123');
+  });
+});
+
+describe('a webhook URL as base URL (Bitrix24)', () => {
+  const CODE = ['k2bx', 'a8g5', 'n4gh', 'vqgo'].join('');
+  const URL_TYPED = `https://portal.bitrix24.com/rest/1/${CODE}/`;
+  const URL_STORED = 'https://portal.bitrix24.com/rest/1/{{BITRIX_CRM_WEBHOOK_TOKEN}}/';
+
+  it('create: stores {{VAR}} and an encrypted variable, and answers without the code', async () => {
+    const { controller, connectorsService } = buildConnectors();
+    const out: any = await controller.create(req(), { name: 'Bitrix CRM', type: 'REST' as any, baseUrl: URL_TYPED });
+    const data = connectorsService.create.mock.calls[0][2];
+    expect(data.baseUrl).toBe(URL_STORED);
+    expect(data.envVars).toEqual({ BITRIX_CRM_WEBHOOK_TOKEN: CODE });
+    expect(out.baseUrl).toBe(URL_STORED);
+    expect(out.maskedEnvVars).toEqual(['BITRIX_CRM_WEBHOOK_TOKEN']);
+    expect(out.secretsNotice).toMatch(/BITRIX_CRM_WEBHOOK_TOKEN/);
+    expect(JSON.stringify(out)).not.toContain(CODE);
+  });
+
+  it('update: a retyped webhook URL moves the same way', async () => {
+    const { controller, connectorsService } = buildConnectors({ name: 'Bitrix CRM', baseUrl: URL_STORED, envVars: {} });
+    await controller.update(req(), 'c1', { baseUrl: URL_TYPED } as any);
+    const data = connectorsService.update.mock.calls[0][1];
+    expect(data.baseUrl).toBe(URL_STORED);
+    expect(data.envVars).toEqual({ BITRIX_CRM_WEBHOOK_TOKEN: CODE });
+  });
+
+  it('update: an older connector saved with the masked URL keeps its code, now in a variable', async () => {
+    const { controller, connectorsService } = buildConnectors({ name: 'Bitrix CRM', baseUrl: URL_TYPED, envVars: {} });
+    const out: any = await controller.update(req(), 'c1', {
+      name: 'Bitrix CRM',
+      baseUrl: 'https://portal.bitrix24.com/rest/1/********/',
+    } as any);
+    const data = connectorsService.update.mock.calls[0][1];
+    expect(data.baseUrl).toBe(URL_STORED);
+    expect(data.envVars).toEqual({ BITRIX_CRM_WEBHOOK_TOKEN: CODE });
+    expect(JSON.stringify(out)).not.toContain(CODE);
+  });
+
+  it('update: a URL edited around the mask is refused, without saving anything', async () => {
+    const { controller, connectorsService } = buildConnectors({ name: 'Bitrix CRM', baseUrl: URL_TYPED, envVars: {} });
+    await expect(
+      controller.update(req(), 'c1', { baseUrl: 'https://other.bitrix24.com/rest/1/********/' } as any),
+    ).rejects.toThrow(/hidden secret/);
+    expect(connectorsService.update).not.toHaveBeenCalled();
+  });
+
+  it('a tool call through the stored connector still goes to the URL as typed', async () => {
+    const tool = {
+      id: 't1',
+      connectorId: 'c1',
+      organizationId: 'org1',
+      name: 'crm_deal_list',
+      description: 'x',
+      parameters: { type: 'object', properties: {} },
+      connectorType: 'REST',
+      connectorConfig: {
+        baseUrl: URL_STORED,
+        authType: 'NONE',
+        envVars: { BITRIX_CRM_WEBHOOK_TOKEN: CODE },
+      },
+      endpointMapping: { method: 'POST', path: 'crm.deal.list.json' },
+    } as RegisteredTool;
+    const execute = jest.fn().mockResolvedValue({ result: [] });
+    const executor = new DynamicMcpTools(
+      { getTool: () => tool, getToolForOrg: () => tool } as any,
+      { logInvocation: jest.fn().mockResolvedValue(undefined) } as any,
+      { get: jest.fn().mockResolvedValue(null), set: jest.fn() } as any,
+      { checkLicenseActive: jest.fn() } as any,
+      { isCloud: () => false } as any,
+      {} as any,
+      { execute } as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      { scheduleObservationalIngest: jest.fn() } as any,
+      { recentEvents: jest.fn().mockResolvedValue([]) } as any,
+    );
+
+    const res = await executor.executeTool('crm_deal_list', {});
+
+    expect(res.isError).toBeFalsy();
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute.mock.calls[0][0].baseUrl).toBe(URL_TYPED);
+    expect(execute.mock.calls[0][1].path).toBe('crm.deal.list.json');
   });
 });

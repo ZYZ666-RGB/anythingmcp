@@ -10,8 +10,10 @@ import { useAuth } from '@/lib/auth-context';
 import {
   adapters,
   connectors,
+  planLimitOf,
   productEvents,
   type AdapterSetupInfo,
+  type PlanLimitError,
   type EnvVarDescriptor,
   type SetupGuideStep,
   type VerifyResult,
@@ -21,13 +23,17 @@ import { Card } from '@/components/ui/card';
 import { Button, buttonVariants } from '@/components/ui/button';
 import { ConnectorLogo } from '@/components/connector-logo';
 import { isTrialLimitMessage, TrialLimitNotice } from '@/lib/trial-limit';
+import { PlanLimitNotice } from '@/components/plan-swap-dialog';
 import { cn } from '@/lib/utils';
 import { fileSearchSetupPath } from '@/lib/file-search-catalog';
 import { copyText } from '@/lib/clipboard';
 import { returnAssistant } from '@/lib/return-assistant';
+import { deviceKind } from '@/lib/paywall-tracking';
 import { addressFix, isPlainAddressField, switchSetupHref, withMissingScheme, type AddressFix } from '@/lib/address-fix';
 import { GuideIntro, GuideStepper, GuideStepView, GuideWaitPanel, StuckLink } from '@/components/connector-setup/setup-guide';
 import { SetupSuccess } from '@/components/connector-setup/setup-success';
+import { NetworkNote } from '@/components/connector-setup/network-note';
+import { WooCommerceOneClick, type WooCommerceScope } from '@/components/connector-setup/woocommerce-one-click';
 
 /**
  * Guided setup of a catalog connector, in one place: what to enter (grouped,
@@ -46,6 +52,10 @@ import { SetupSuccess } from '@/components/connector-setup/setup-success';
  *                   start a field with this value, e.g. the Odoo address and
  *                   database from the AnythingMCP module in Odoo. Addresses and
  *                   settings only: a credential is never read from a link.
+ *   source=<slug>   where the setup was opened from, kept on the setup events
+ *                   (odoo_module: the AnythingMCP module in Odoo's Settings)
+ *   wc=done         back from WooCommerce's key approval ("Connect with one
+ *                   click"); WooCommerce adds success=1|0 and user_id=<state>
  *   replaces=<id>   opened from "Switch to …" on another connector's setup
  *                   (an Odoo below 19 on the JSON-2 connector): once this one
  *                   is saved, that connector is deleted if it is still not
@@ -82,6 +92,14 @@ function SetupContent() {
   const replaces = params.get('replaces');
   const back = returnAssistant(params.get('from'));
   const backFromProvider = params.get('step') === 'done';
+  // Back from approving a WooCommerce key on the shop ("Connect with one click").
+  const isWooCommerce = slug === 'woocommerce';
+  const wooReturn = isWooCommerce && params.get('wc') === 'done';
+  // Where the setup was opened from, for the setup events only (`source=odoo_module`:
+  // the AnythingMCP module in Odoo's Settings). A short slug, or nothing.
+  const sourceParam = params.get('source') ?? '';
+  const source = /^[a-z0-9_]{1,32}$/.test(sourceParam) ? sourceParam : undefined;
+  const fromSource = useMemo((): Record<string, string> => (source ? { source } : {}), [source]);
   // Values handed over in the link (prefill.<NAME>), applied once the fields are known.
   const handed = useMemo(
     () =>
@@ -98,10 +116,12 @@ function SetupContent() {
   const [values, setValues] = useState<Record<string, string>>({});
   const [revealed, setRevealed] = useState<Record<string, boolean>>({});
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
-  const [phase, setPhase] = useState<Phase>(backFromProvider ? 'working' : 'form');
+  const [phase, setPhase] = useState<Phase>(backFromProvider || wooReturn ? 'working' : 'form');
   const [error, setError] = useState('');
+  // The install refused at the plan's limit (Cloud): "Pause one or upgrade".
+  const [planLimit, setPlanLimit] = useState<PlanLimitError | null>(null);
   const [verifyFailed, setVerifyFailed] = useState<VerifyResult | null>(null);
-  const [result, setResult] = useState<{ connectorId: string; sample?: string; verified: boolean } | null>(null);
+  const [result, setResult] = useState<{ connectorId: string; sample?: string; verified: boolean; note?: string } | null>(null);
   const [redirectUri, setRedirectUri] = useState<string | null>(null);
   /** Secrets the existing connector already holds: shown as set, may stay empty. */
   const [storedSecrets, setStoredSecrets] = useState<string[]>([]);
@@ -124,6 +144,42 @@ function SetupContent() {
     error: '',
   });
   const lastProviderCheck = useRef(0);
+  // TikTok Shop: whether this server has its own app (then the seller's App
+  // key, App secret and Service ID stay empty), and whether the user chose
+  // their own app anyway. Unknown until asked: the fields show meanwhile.
+  const isTikTokShop = slug === 'tiktok-shop';
+  const [tiktokPlatform, setTiktokPlatform] = useState<{ available: boolean; redirectUrl: string } | null>(null);
+  const [ownTikTokApp, setOwnTikTokApp] = useState(false);
+  const serverTikTokApp = isTikTokShop && tiktokPlatform?.available === true && !ownTikTokApp;
+  // WooCommerce: whether this server offers the one-click key (flag on and a
+  // public https server), the permission chosen, and the check after the return.
+  const [wooOneClick, setWooOneClick] = useState(false);
+  const [wooScope, setWooScope] = useState<WooCommerceScope>('read');
+  const [wooChecking, setWooChecking] = useState(wooReturn);
+  // A one-click error is shown with the other setup errors, below the key
+  // fields: bump this to scroll it into view, so the click does not look ignored.
+  const [revealErrorTick, setRevealErrorTick] = useState(0);
+  const errorRef = useRef<HTMLParagraphElement | null>(null);
+  // Instagram: sign in with Facebook (adapter `instagram`) or Instagram
+  // (`instagram-login`), which fills in the token and account id, or paste a
+  // token. Signing in needs a Meta app: the server's when it has one,
+  // otherwise the user's own (its id and secret are then required).
+  const metaFlavour: 'facebook' | 'instagram' | null =
+    slug === 'instagram' ? 'facebook' : slug === 'instagram-login' ? 'instagram' : null;
+  const [metaPlatform, setMetaPlatform] = useState<{
+    facebook: boolean;
+    unified?: boolean;
+    instagram: boolean;
+    redirectUrl: string;
+  } | null>(null);
+  const [metaMode, setMetaMode] = useState<'signin' | 'paste'>('signin');
+  const [ownMetaApp, setOwnMetaApp] = useState(false);
+  const metaSignIn = metaFlavour !== null && metaMode === 'signin';
+  const serverMetaApp = metaSignIn && metaPlatform?.[metaFlavour!] === true && !ownMetaApp;
+  const metaAppVars = metaFlavour === 'facebook' ? META_FACEBOOK_APP_VARS : META_INSTAGRAM_APP_VARS;
+  // The `instagram` connector signs in with Instagram or Facebook (Unified
+  // Login) or, with an older app, Facebook only; `instagram-login` with Instagram.
+  const metaProvider = metaFlavour === 'instagram' ? 'Instagram' : 'Instagram / Facebook';
 
   /** This setup's address for a saved connector, keeping the other parameters (from=…). */
   const withConnector = useCallback(
@@ -166,7 +222,7 @@ function SetupContent() {
           })
           .catch(() => {});
       }
-      if (backFromProvider) {
+      if (backFromProvider || wooReturn) {
         setStepIndex(steps.length - 1);
         return;
       }
@@ -192,7 +248,7 @@ function SetupContent() {
         } catch {}
         if (!started.current && !seen) {
           started.current = true;
-          productEvents.track('setup_started', token, { adapterSlug: slug, kind: d.setupKind });
+          productEvents.track('setup_started', token, { adapterSlug: slug, kind: d.setupKind, device: deviceKind(), ...fromSource });
         }
       })
       .catch((e: Error) => setLoadError(e.message || t('notAvailable')));
@@ -203,16 +259,121 @@ function SetupContent() {
         .then((c) => {
           const env = (c?.envVars ?? {}) as Record<string, string>;
           setValues((v) => ({ ...Object.fromEntries(Object.entries(env).filter(([, x]) => x)), ...v }));
+          // A TikTok Shop connector that has an App key of its own keeps its app.
+          if (env.TIKTOK_SHOP_APP_KEY) setOwnTikTokApp(true);
+          // An Instagram connector with an app of its own keeps its app.
+          if (env.META_APP_ID || env.INSTAGRAM_APP_ID) setOwnMetaApp(true);
           setStoredSecrets(Array.isArray(c?.maskedEnvVars) ? c.maskedEnvVars : []);
         })
         .catch(() => {});
     }
-  }, [token, slug, existingId, progressKey, backFromProvider, t, handed, router, withConnector]);
+  }, [token, slug, existingId, progressKey, backFromProvider, wooReturn, t, handed, router, withConnector, fromSource]);
 
   useEffect(() => {
-    if (!token || info?.setupKind !== 'oauth_browser') return;
+    if (!token || !isTikTokShop) return;
+    connectors
+      .tiktokShopPlatform(token)
+      .then(setTiktokPlatform)
+      .catch(() => setTiktokPlatform({ available: false, redirectUrl: '' }));
+  }, [token, isTikTokShop]);
+
+  useEffect(() => {
+    if (!token || !isWooCommerce) return;
+    connectors
+      .woocommerceOneClick(token)
+      .then((r) => setWooOneClick(r.available === true))
+      .catch(() => setWooOneClick(false));
+  }, [token, isWooCommerce]);
+
+  // Back from WooCommerce's key approval: the shop has posted the key to the
+  // server, which checks it on the shop before storing it. Ask how it ended,
+  // every 2 seconds for a minute.
+  useEffect(() => {
+    if (!wooReturn || !existingId || !token) return;
+    const state = params.get('user_id') ?? '';
+    const stop = (message: string) => {
+      setWooChecking(false);
+      setError(message);
+      setPhase('form');
+      setRevealErrorTick((n) => n + 1);
+    };
+    if (params.get('success') === '0') {
+      stop(t('wooOneClick.denied'));
+      return;
+    }
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const startedAt = Date.now();
+    const tick = async () => {
+      try {
+        let status: string;
+        let message: string | undefined;
+        if (state) {
+          const r = await connectors.woocommerceOneClickStatus(existingId, state, token);
+          status = r.status;
+          message = r.message;
+        } else {
+          // A return address without the state (stripped on the way): the
+          // connector's own status is the only clue.
+          const c = await connectors.get(existingId, token);
+          status = c?.setupStatus === 'ready' ? 'ready' : 'pending';
+        }
+        if (cancelled) return;
+        if (status === 'ready') {
+          setWooChecking(false);
+          setResult({ connectorId: existingId, verified: true });
+          setPhase('done');
+          productEvents.track('setup_completed', token, { adapterSlug: slug, kind: 'one_click', verified: true, ...fromSource });
+          return;
+        }
+        if (status === 'failed') {
+          productEvents.track('setup_verify_failed', token, { adapterSlug: slug, kind: 'one_click', ...fromSource });
+          stop(t('wooOneClick.failed', { message: message ?? '' }));
+          return;
+        }
+      } catch {
+        // Asked again on the next tick.
+      }
+      if (cancelled) return;
+      if (Date.now() - startedAt > 60_000) {
+        stop(t('wooOneClick.timeout'));
+        return;
+      }
+      timer = setTimeout(() => void tick(), 2000);
+    };
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [wooReturn, existingId, token, params, slug, t, fromSource]);
+
+  useEffect(() => {
+    if (!token || !metaFlavour) return;
+    connectors
+      .metaPlatform(token)
+      .then(setMetaPlatform)
+      .catch(() => setMetaPlatform({ facebook: false, instagram: false, redirectUrl: '' }));
+  }, [token, metaFlavour]);
+
+  // A seller at an IOP gateway (Lazada, Miravia, AliExpress seller) registers
+  // this server's IOP callback on the app instead of the OAuth one.
+  const isIop = info?.connector.authType === 'HMAC' && info.connector.authConfig?.tokenProvider === 'iop';
+  // A SHEIN shop likewise, with SHEIN's store authorization.
+  const isShein = info?.connector.authType === 'HMAC' && info.connector.authConfig?.tokenProvider === 'shein';
+  useEffect(() => {
+    if (!token) return;
+    if (isIop) {
+      connectors.iopRedirectUri(token).then((r) => setRedirectUri(r.redirectUri)).catch(() => {});
+      return;
+    }
+    if (isShein) {
+      connectors.sheinRedirectUri(token).then((r) => setRedirectUri(r.redirectUri)).catch(() => {});
+      return;
+    }
+    if (info?.setupKind !== 'oauth_browser') return;
     connectors.oauthRedirectUri(token).then((r) => setRedirectUri(r.redirectUri)).catch(() => {});
-  }, [token, info?.setupKind]);
+  }, [token, info?.setupKind, isIop, isShein]);
 
   // Back from the provider: the authorization is stored; show the outcome.
   useEffect(() => {
@@ -226,7 +387,7 @@ function SetupContent() {
           // does not check the shared secret), so only a call to the API tells.
           // A refusal sends the user back to the keys, not to "is ready".
           if (test && test.ok === false && test.kind === 'auth_failed') {
-            productEvents.track('setup_verify_failed', token, { adapterSlug: slug, kind: 'after_authorization' });
+            productEvents.track('setup_verify_failed', token, { adapterSlug: slug, kind: 'after_authorization', ...fromSource });
             setVerifyFailed({ ok: false, kind: 'auth_failed', message: test.message } as VerifyResult);
             setError('');
             setPhase('form');
@@ -234,7 +395,7 @@ function SetupContent() {
           }
           setResult({ connectorId: existingId, verified: test?.ok === true });
           setPhase('done');
-          productEvents.track('setup_completed', token, { adapterSlug: slug, kind: 'oauth_browser', verified: test?.ok === true });
+          productEvents.track('setup_completed', token, { adapterSlug: slug, kind: 'oauth_browser', verified: test?.ok === true, ...fromSource });
         } else {
           setError(t('authIncomplete'));
           setPhase('form');
@@ -244,11 +405,31 @@ function SetupContent() {
         setError(e.message);
         setPhase('form');
       });
-  }, [backFromProvider, existingId, token, slug, t]);
+  }, [backFromProvider, existingId, token, slug, t, fromSource]);
 
-  const fields = useMemo(() => info?.envVars ?? [], [info]);
-  const visibleFields = fields.filter((f) => !f.advanced);
-  const advancedFields = fields.filter((f) => f.advanced);
+  // TikTok Shop's app variables are optional in the catalog (empty means the
+  // server's app). Without a server app, or with the user's own app chosen,
+  // they are required here; with the server's app they are hidden and sent
+  // empty.
+  // Signing in to Instagram fills in the token and account id, so those are
+  // hidden then, and the app id and secret are required unless the server
+  // has its own app (then they are hidden too).
+  const fields = useMemo(
+    () =>
+      (info?.envVars ?? []).map((f) =>
+        (isTikTokShop && TIKTOK_SHOP_APP_VARS.includes(f.name) && !serverTikTokApp) ||
+        (metaSignIn && !serverMetaApp && metaAppVars.includes(f.name) && f.name !== 'META_CONFIG_ID')
+          ? { ...f, required: true }
+          : f,
+      ),
+    [info, isTikTokShop, serverTikTokApp, metaSignIn, serverMetaApp, metaAppVars],
+  );
+  const hiddenField = (name: string) =>
+    (serverTikTokApp && TIKTOK_SHOP_APP_VARS.includes(name)) ||
+    (metaSignIn && META_SIGN_IN_VARS.includes(name)) ||
+    (serverMetaApp && metaAppVars.includes(name));
+  const visibleFields = fields.filter((f) => !f.advanced && !hiddenField(f.name));
+  const advancedFields = fields.filter((f) => f.advanced && !hiddenField(f.name));
 
   const guide = mode === 'guide' ? info?.setupGuide : undefined;
   const guideSteps = useMemo(() => info?.setupGuide?.steps ?? [], [info]);
@@ -296,7 +477,11 @@ function SetupContent() {
     Object.fromEntries(
       fields
         // An address typed without https:// gets it when the pattern wants it.
-        .map((f) => [f.name, withMissingScheme(f, (values[f.name] ?? '').trim())] as const)
+        // A hidden TikTok Shop app field goes empty: the server's app is used.
+        // The token and account id a sign-in fills in are not sent at all: an
+        // empty value must not touch what a sign-in stored.
+        .filter((f) => !(metaSignIn && META_SIGN_IN_VARS.includes(f.name)))
+        .map((f) => [f.name, hiddenField(f.name) ? '' : withMissingScheme(f, (values[f.name] ?? '').trim())] as const)
         .filter(([name, v]) => connectorId || v !== '' || !fields.find((f) => f.name === name)?.required),
     ) as Record<string, string>;
 
@@ -324,12 +509,24 @@ function SetupContent() {
   /** Client-side checks: required fields and patterns (of `only`, in a guide step). */
   const validate = (only?: string[]): boolean => {
     const errs: Record<string, string> = {};
+    // A value of the wrong shape, as opposed to a required field left empty.
+    let wrongShape = false;
     for (const f of only ? fields.filter((x) => only.includes(x.name)) : fields) {
+      if (hiddenField(f.name)) continue;
       const v = withMissingScheme(f, (values[f.name] ?? '').trim());
-      if (f.required && !f.advanced && !v && !storedSecrets.includes(f.name)) errs[f.name] = t('field.required');
-      else if (v && f.pattern) {
+      // A value the check finds by itself (an Odoo database name) may stay empty.
+      if (f.required && !f.advanced && !f.lookedUp && !v && !storedSecrets.includes(f.name)) errs[f.name] = t('field.required');
+      else if (f.options?.length) {
+        // A fixed list of choices: anything else (a value stored before the
+        // list existed, one handed over in a link) is not accepted.
+        if (v && !f.options.some((o) => o.value === v)) {
+          errs[f.name] = t('field.chooseOne');
+          wrongShape = true;
+        }
+      } else if (v && f.pattern) {
         try {
           if (!new RegExp(f.pattern).test(v)) {
+            wrongShape = true;
             // Say what to change when the pattern tells it; the adapter's own words otherwise.
             const fix = isPlainAddressField(f) ? addressFix(f.pattern, v) : undefined;
             errs[f.name] = fix
@@ -342,8 +539,22 @@ function SetupContent() {
       }
     }
     setFieldErrors(errs);
-    if (Object.keys(errs).length > 0) showStepOf(Object.keys(errs));
-    return Object.keys(errs).length === 0;
+    const refused = Object.keys(errs);
+    if (refused.length > 0) {
+      // Nothing reaches the server from here, so without this event a key
+      // the page itself keeps refusing would be invisible. Names only.
+      const step = mode === 'guide' && stepIndex >= 0 ? info?.setupGuide?.steps[stepIndex] : undefined;
+      if (token) {
+        productEvents.track('setup_fields_refused', token, {
+          adapterSlug: slug,
+          kind: wrongShape ? 'format' : 'required',
+          field: refused.slice(0, 8).join(','),
+          ...(step ? { step: step.id, index: stepIndex + 1 } : {}),
+        });
+      }
+      showStepOf(refused);
+    }
+    return refused.length === 0;
   };
 
   /**
@@ -368,9 +579,12 @@ function SetupContent() {
     }
   };
 
-  /** Create the connector, or store the values on the existing one. Returns its id. */
-  const save = async (): Promise<string> => {
-    const creds = credentials();
+  /**
+   * Create the connector, or store the values on the existing one. Returns its id.
+   * `fix`: values the check corrected (an Odoo database name), saved over what was typed.
+   */
+  const save = async (fix?: Record<string, string>): Promise<string> => {
+    const creds = { ...credentials(), ...(fix ?? {}) };
     if (connectorId) {
       await connectors.updateEnvVars(connectorId, creds, token!);
       return connectorId;
@@ -406,7 +620,7 @@ function SetupContent() {
     try {
       const id = await save();
       if (!existingId) router.replace(withConnector(id));
-      const check = await adapters.verify(slug, token, credentials(), id);
+      const check = await adapters.verify(slug, token, credentials(), id, source);
       if (check.ok === false && check.kind !== 'auth_failed') {
         if (check.missing?.length) {
           setFieldErrors(Object.fromEntries(check.missing.map((m) => [m, t('field.required')])));
@@ -434,14 +648,14 @@ function SetupContent() {
     lastProviderCheck.current = Date.now();
     setProviderCheck((c) => ({ ...c, checking: true, error: '' }));
     try {
-      const check = await adapters.verify(slug, token, {}, connectorId);
+      const check = await adapters.verify(slug, token, {}, connectorId, source);
       setProviderReady(check.ok !== false);
       // Not a refusal of the keys (a value missing, the provider down): say so.
       setProviderCheck({ checking: false, at: new Date(), error: check.ok === false && check.kind !== 'auth_failed' ? check.message : '' });
     } catch (e: any) {
       setProviderCheck((c) => ({ checking: false, at: c.at, error: e?.message || t('genericError') }));
     }
-  }, [token, connectorId, slug, t]);
+  }, [token, connectorId, slug, t, source]);
 
   // On the wait step: check when it opens and whenever the user comes back
   // to the tab (from Etsy's page, or the next day), at most once a minute.
@@ -464,6 +678,7 @@ function SetupContent() {
 
   const fail = (e: any) => {
     setPhase('form');
+    setPlanLimit(planLimitOf(e));
     setError(e?.message || t('genericError'));
   };
 
@@ -473,16 +688,31 @@ function SetupContent() {
     setVerifyFailed(null);
     setPhase('working');
     try {
+      // Instagram: save, then sign in with Facebook or Instagram; the sign-in
+      // stores the token and the account id, and Meta checks the app.
+      if (metaSignIn) {
+        const id = await save();
+        const returnTo = `/connectors/setup/${slug}?connector=${id}&step=done${back ? `&from=${back.id}` : ''}`;
+        const auth = await connectors.metaAuthorize(id, token, returnTo);
+        if (!auth.authorizationUrl) throw new Error(auth.error || t('authStartFailed'));
+        productEvents.track('oauth_started', token, { adapterSlug: slug });
+        window.location.href = auth.authorizationUrl;
+        return;
+      }
       // Checked before anything else, the browser sign-in included: an app
       // the provider does not accept yet (Etsy: still Pending, or the wrong
       // shared secret) used to send the user to an error page at the
       // provider that they never came back from.
       const check =
-        info.setupKind === 'none' ? null : await adapters.verify(slug, token, credentials(), connectorId ?? undefined);
+        info.setupKind === 'none' ? null : await adapters.verify(slug, token, credentials(), connectorId ?? undefined, source);
+      // The check found the right value itself (an Odoo database name the
+      // address names): it goes into the field and is saved with the rest.
+      const fix = check && check.ok !== null ? check.corrected : undefined;
+      if (fix) setValues((v) => ({ ...v, ...fix }));
       // Keys refused at the end of a guide with a wait step (a connector
       // finished from the chat, a step skipped): keep them and wait there.
       if (check && check.ok === false && check.kind === 'auth_failed' && waitStepAt >= 0) {
-        const id = await save();
+        const id = await save(fix);
         if (!existingId) router.replace(withConnector(id));
         lastProviderCheck.current = Date.now();
         setProviderReady(false);
@@ -511,7 +741,7 @@ function SetupContent() {
           // the new values on it instead of installing a second one.
           try {
             await save();
-            productEvents.track('setup_saved_draft', token, { adapterSlug: slug, kind: 'app_pending' });
+            productEvents.track('setup_saved_draft', token, { adapterSlug: slug, kind: 'app_pending', ...fromSource });
           } catch {
             // Not saved (plan limit): the provider's answer is shown as before.
           }
@@ -523,7 +753,7 @@ function SetupContent() {
       // A Shopee shop is authorized right after the keys are saved, through
       // Shopee's own signed link.
       if (slug === 'shopee') {
-        const id = await save();
+        const id = await save(fix);
         const returnTo = `/connectors/setup/${slug}?connector=${id}&step=done${back ? `&from=${back.id}` : ''}`;
         const auth = await connectors.shopeeAuthorize(id, token, returnTo);
         if (!auth.authorizationUrl) throw new Error(auth.error || t('authStartFailed'));
@@ -531,8 +761,38 @@ function SetupContent() {
         window.location.href = auth.authorizationUrl;
         return;
       }
+      // A TikTok shop likewise, through TikTok Shop's seller authorization link.
+      if (slug === 'tiktok-shop') {
+        const id = await save(fix);
+        const returnTo = `/connectors/setup/${slug}?connector=${id}&step=done${back ? `&from=${back.id}` : ''}`;
+        const auth = await connectors.tiktokShopAuthorize(id, token, returnTo);
+        if (!auth.authorizationUrl) throw new Error(auth.error || t('authStartFailed'));
+        productEvents.track('oauth_started', token, { adapterSlug: slug });
+        window.location.href = auth.authorizationUrl;
+        return;
+      }
+      // A seller at an IOP gateway likewise, through the gateway's authorize page.
+      if (isIop) {
+        const id = await save(fix);
+        const returnTo = `/connectors/setup/${slug}?connector=${id}&step=done${back ? `&from=${back.id}` : ''}`;
+        const auth = await connectors.iopAuthorize(id, token, returnTo);
+        if (!auth.authorizationUrl) throw new Error(auth.error || t('authStartFailed'));
+        productEvents.track('oauth_started', token, { adapterSlug: slug });
+        window.location.href = auth.authorizationUrl;
+        return;
+      }
+      // A SHEIN shop likewise, through SHEIN's store authorization page.
+      if (isShein) {
+        const id = await save(fix);
+        const returnTo = `/connectors/setup/${slug}?connector=${id}&step=done${back ? `&from=${back.id}` : ''}`;
+        const auth = await connectors.sheinAuthorize(id, token, returnTo);
+        if (!auth.authorizationUrl) throw new Error(auth.error || t('authStartFailed'));
+        productEvents.track('oauth_started', token, { adapterSlug: slug });
+        window.location.href = auth.authorizationUrl;
+        return;
+      }
       if (info.setupKind === 'oauth_browser') {
-        const id = await save();
+        const id = await save(fix);
         const returnTo = `/connectors/setup/${slug}?connector=${id}&step=done${back ? `&from=${back.id}` : ''}`;
         const auth = await connectors.oauthAuthorize(id, token, returnTo);
         if (!auth.authorizationUrl) throw new Error(auth.error || t('authStartFailed'));
@@ -540,14 +800,72 @@ function SetupContent() {
         window.location.href = auth.authorizationUrl;
         return;
       }
-      const id = await save();
-      setResult({ connectorId: id, sample: check && check.ok ? check.sample : undefined, verified: check?.ok === true });
+      const id = await save(fix);
+      setResult({
+        connectorId: id,
+        sample: check && check.ok ? check.sample : undefined,
+        verified: check?.ok === true,
+        note: check && check.ok ? check.note : undefined,
+      });
       setPhase('done');
-      productEvents.track('setup_completed', token, { adapterSlug: slug, kind: info.setupKind, verified: check?.ok === true });
+      productEvents.track('setup_completed', token, {
+        adapterSlug: slug,
+        kind: info.setupKind,
+        verified: check?.ok === true,
+        ...(fix ? { corrected: Object.keys(fix).join(',') } : {}),
+        ...fromSource,
+      });
     } catch (e) {
       fail(e);
     }
   };
+
+  /**
+   * WooCommerce "Connect with one click": save the shop address (a draft when
+   * new), then send the browser to the shop, where the merchant approves a key
+   * that WooCommerce posts to the server. The paste fields stay the fallback.
+   */
+  const connectOneClick = async () => {
+    if (!token || !validate([WOOCOMMERCE_URL_VAR])) return;
+    setError('');
+    setVerifyFailed(null);
+    setPhase('working');
+    try {
+      const id = await save();
+      const auth = await connectors.woocommerceAuthorize(id, wooScope, token, back?.id);
+      productEvents.track('oauth_started', token, { adapterSlug: slug, kind: 'one_click', scope: wooScope, ...fromSource });
+      window.location.href = auth.authorizationUrl;
+    } catch (e) {
+      fail(e);
+      setRevealErrorTick((n) => n + 1);
+    }
+  };
+
+  // The error box may mount a few renders later (the page is still loading the
+  // connector when the return from the shop is handled), so keep the request
+  // until the box exists, and scroll after the layout has settled. No cleanup:
+  // this effect runs on every render, and a cleanup would cancel the scroll.
+  const revealedTick = useRef(0);
+  useEffect(() => {
+    if (revealErrorTick === revealedTick.current || !errorRef.current) return;
+    revealedTick.current = revealErrorTick;
+    const el = errorRef.current;
+    setTimeout(() => {
+      if (el.isConnected) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 150);
+  });
+
+  /** The one-click panel, where the WooCommerce key fields are asked for. */
+  const oneClickPanel = (show: boolean) =>
+    isWooCommerce && show && (wooOneClick || wooChecking) ? (
+      <WooCommerceOneClick
+        scope={wooScope}
+        onScope={setWooScope}
+        onConnect={() => void connectOneClick()}
+        disabled={phase === 'working'}
+        checking={wooChecking}
+      />
+    ) : null;
 
   /** Keep what was entered without checking it; the connector stays hidden from MCP until complete. */
   const saveAnyway = async (draft: boolean) => {
@@ -556,7 +874,7 @@ function SetupContent() {
     setPhase('working');
     try {
       const id = await save();
-      productEvents.track(draft ? 'setup_saved_draft' : 'setup_saved_unverified', token, { adapterSlug: slug });
+      productEvents.track(draft ? 'setup_saved_draft' : 'setup_saved_unverified', token, { adapterSlug: slug, ...fromSource });
       router.push(`/connectors/${id}`);
     } catch (e) {
       fail(e);
@@ -583,6 +901,11 @@ function SetupContent() {
             <GuideStepper steps={info.setupGuide.steps} current={info.setupGuide.steps.length + 1} />
           </div>
         )}
+        {result.note && (
+          <p role="status" className="mb-4 rounded-[9px] bg-[var(--t-info-bg)] px-3 py-2 text-sm text-[var(--t-info-fg)]">
+            {result.note}
+          </p>
+        )}
         <SetupSuccess
           name={info.name}
           icon={info.icon}
@@ -602,8 +925,9 @@ function SetupContent() {
   // sign-in is all there is (Notion, Helium 10). One that needs an app of
   // the user's asks for its client ID like any other OAuth connector.
   const selfRegisteringBridge = info.connector.type === 'MCP' && info.envVars.every((v) => !v.required);
-  const primaryLabel =
-    info.setupKind === 'none'
+  const primaryLabel = metaSignIn
+    ? t('metaLogin.signIn', { provider: metaProvider })
+    : info.setupKind === 'none'
       ? t('actions.install', { name: info.name })
       : isOAuth
         ? t('actions.saveAndSignIn', { name: info.name.split(' ')[0] })
@@ -668,10 +992,18 @@ function SetupContent() {
         </div>
       )}
       {error && (
-        isTrialLimitMessage(error) ? (
+        planLimit && planLimit.message === error ? (
+          <PlanLimitNotice limit={planLimit} />
+        ) : isTrialLimitMessage(error) ? (
           <TrialLimitNotice message={error} />
         ) : (
-          <p role="alert" className="rounded-[9px] bg-[var(--t-danger-bg)] px-3 py-2 text-sm text-[var(--t-danger-fg)]">{error}</p>
+          <p
+            ref={errorRef}
+            role="alert"
+            className="rounded-[9px] bg-[var(--t-danger-bg)] px-3 py-2 text-sm text-[var(--t-danger-fg)]"
+          >
+            {error}
+          </p>
         )
       )}
     </>
@@ -680,47 +1012,90 @@ function SetupContent() {
   const renderField = (f: EnvVarDescriptor) => {
     const id = `field-${f.name}`;
     const show = revealed[f.name] === true;
+    // A fixed list of choices (one API host per country) is a select.
+    const options = f.options?.length ? f.options : null;
+    const chosen = values[f.name] ?? '';
     return (
       <div key={f.name}>
         <label htmlFor={id} className="mb-1 block text-sm font-medium text-[var(--text)]">
           {f.label}
           {!f.required && <span className="ml-1 font-normal text-[var(--text-3)]">{t('field.optional')}</span>}
+          {f.required && f.lookedUp && (
+            <span className="ml-1 font-normal text-[var(--text-3)]">{t('field.lookedUp')}</span>
+          )}
         </label>
-        <div className="relative">
-          <input
+        {options ? (
+          <select
             id={id}
-            // API credentials, never the person's own login: a non-login name
-            // and the password managers' opt-outs stop a browser from filling
-            // the signed-in user's e-mail and password in here.
             name={`amcp-connector-var-${f.name}`}
-            type={f.secret && !show ? 'password' : 'text'}
-            autoComplete={f.secret ? 'new-password' : 'off'}
-            data-1p-ignore
-            data-lpignore="true"
-            data-bwignore="true"
-            data-form-type="other"
-            spellCheck={false}
-            value={values[f.name] ?? ''}
-            placeholder={storedSecrets.includes(f.name) ? t('field.stored') : (f.example ?? '')}
-            onChange={(e) => setValues((v) => ({ ...v, [f.name]: e.target.value }))}
-            onBlur={() => completeAddress(f)}
+            autoComplete="off"
+            value={chosen}
+            onChange={(e) => {
+              const value = e.target.value;
+              setValues((v) => ({ ...v, [f.name]: value }));
+              setFieldErrors((errs) => {
+                if (!errs[f.name]) return errs;
+                const next = { ...errs };
+                delete next[f.name];
+                return next;
+              });
+            }}
             aria-invalid={!!fieldErrors[f.name]}
             className={cn(
-              'w-full rounded-[9px] border bg-[var(--surface)] px-3 py-2 text-[16px] text-[var(--text)] placeholder:text-[var(--text-3)] focus:outline-none sm:text-sm',
+              'w-full rounded-[9px] border bg-[var(--surface)] px-3 py-2 text-[16px] focus:outline-none sm:text-sm',
+              chosen ? 'text-[var(--text)]' : 'text-[var(--text-3)]',
               fieldErrors[f.name] ? 'border-[var(--danger)]' : 'border-[var(--border)] focus:border-[var(--border-strong)]',
-              f.secret && 'pr-16',
             )}
-          />
-          {f.secret && (
-            <button
-              type="button"
-              onClick={() => setRevealed((r) => ({ ...r, [f.name]: !show }))}
-              className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-[var(--text-3)] hover:text-[var(--text)]"
-            >
-              {show ? t('field.hide') : t('field.show')}
-            </button>
-          )}
-        </div>
+          >
+            {/* Nothing chosen yet; an optional choice can also be taken back. */}
+            {(!chosen || !f.required) && (
+              <option value="">{storedSecrets.includes(f.name) ? t('field.stored') : t('field.choose')}</option>
+            )}
+            {/* A value from before the list existed stays visible until one is chosen. */}
+            {chosen && !options.some((o) => o.value === chosen) && <option value={chosen}>{chosen}</option>}
+            {options.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <div className="relative">
+            <input
+              id={id}
+              // API credentials, never the person's own login: a non-login name
+              // and the password managers' opt-outs stop a browser from filling
+              // the signed-in user's e-mail and password in here.
+              name={`amcp-connector-var-${f.name}`}
+              type={f.secret && !show ? 'password' : 'text'}
+              autoComplete={f.secret ? 'new-password' : 'off'}
+              data-1p-ignore
+              data-lpignore="true"
+              data-bwignore="true"
+              data-form-type="other"
+              spellCheck={false}
+              value={values[f.name] ?? ''}
+              placeholder={storedSecrets.includes(f.name) ? t('field.stored') : (f.example ?? '')}
+              onChange={(e) => setValues((v) => ({ ...v, [f.name]: e.target.value }))}
+              onBlur={() => completeAddress(f)}
+              aria-invalid={!!fieldErrors[f.name]}
+              className={cn(
+                'w-full rounded-[9px] border bg-[var(--surface)] px-3 py-2 text-[16px] text-[var(--text)] placeholder:text-[var(--text-3)] focus:outline-none sm:text-sm',
+                fieldErrors[f.name] ? 'border-[var(--danger)]' : 'border-[var(--border)] focus:border-[var(--border-strong)]',
+                f.secret && 'pr-16',
+              )}
+            />
+            {f.secret && (
+              <button
+                type="button"
+                onClick={() => setRevealed((r) => ({ ...r, [f.name]: !show }))}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-[var(--text-3)] hover:text-[var(--text)]"
+              >
+                {show ? t('field.hide') : t('field.show')}
+              </button>
+            )}
+          </div>
+        )}
         {fieldErrors[f.name] && <p className="mt-1 text-xs text-[var(--danger)]">{fieldErrors[f.name]}</p>}
         {(f.help || f.link) && (
           <p className="mt-1 text-xs text-[var(--text-3)]">
@@ -765,6 +1140,10 @@ function SetupContent() {
                 : null
             }
             onSkip={() => setStepIndex(guide.steps.length - 1)}
+            // Back to choose another app, or none for now: the welcome
+            // wizard it was picked in (`?back=welcome`), else the dashboard
+            // (which sends a workspace without connectors to the wizard).
+            onBack={() => router.push(params.get('back') === 'welcome' ? '/welcome' : '/')}
           />
         </Card>
       );
@@ -824,9 +1203,13 @@ function SetupContent() {
           total={guide.steps.length}
           redirectUri={redirectUri}
           actionUrl={actionUrl && /^https:\/\/[^/\s]+/.test(actionUrl) ? actionUrl : null}
+          onActionOpened={() => {
+            if (token) productEvents.track('setup_step_action_opened', token, { adapterSlug: slug, step: step.id, index: at + 1 });
+          }}
           confirmed={!!confirmed[step.id]}
           onConfirm={(v) => setConfirmed((c) => ({ ...c, [step.id]: v }))}
         >
+          {oneClickPanel(stepFields.some((f) => f.name === WOOCOMMERCE_KEY_VAR))}
           {(stepFields.length > 0 || extraFields.length > 0) && (
             <div className="space-y-3">{[...stepFields, ...extraFields].map(renderField)}</div>
           )}
@@ -906,6 +1289,8 @@ function SetupContent() {
           </div>
         )}
 
+        {info.requiresIpAllowlist && <NetworkNote ips={info.egressIps ?? []} name={info.name} required />}
+
         {isOAuth && selfRegisteringBridge && (
           <div className="rounded-[9px] border border-[var(--border)] bg-[var(--surface-2)] p-3 text-sm text-[var(--text-2)]">
             <p>{t('oauth.selfRegistering', { name: info.name.split(' ')[0] })}</p>
@@ -930,14 +1315,100 @@ function SetupContent() {
           <p className="text-sm text-[var(--text-2)]">{t('noInput')}</p>
         )}
 
+        {metaFlavour && (
+          <div className="rounded-[9px] border border-[var(--border)] bg-[var(--surface-2)] p-3 text-sm text-[var(--text-2)]">
+            <div className="flex flex-col gap-1">
+              {(['signin', 'paste'] as const).map((mode) => (
+                <label key={mode} className="flex items-center gap-2 text-[var(--text)]">
+                  <input
+                    type="radio"
+                    name="meta-mode"
+                    checked={metaMode === mode}
+                    onChange={() => {
+                      setMetaMode(mode);
+                      setFieldErrors({});
+                    }}
+                  />
+                  {mode === 'signin'
+                    ? t('metaLogin.modeSignIn', { provider: metaProvider })
+                    : t('metaLogin.modePaste')}
+                </label>
+              ))}
+            </div>
+            {metaSignIn && metaPlatform?.[metaFlavour] && (
+              <>
+                <p className="mt-2">{t('metaLogin.serverApp')}</p>
+                <label className="mt-2 flex items-center gap-2 text-[var(--text)]">
+                  <input
+                    type="checkbox"
+                    checked={ownMetaApp}
+                    onChange={(e) => {
+                      setOwnMetaApp(e.target.checked);
+                      setFieldErrors({});
+                    }}
+                  />
+                  {t('metaLogin.useOwn')}
+                </label>
+              </>
+            )}
+            {metaSignIn && !serverMetaApp && metaPlatform?.redirectUrl && (
+              <>
+                <p className="mt-2 text-xs">{t('metaLogin.ownHint')}</p>
+                <div className="mt-1 flex items-center gap-2">
+                  <code className="flex-1 overflow-x-auto rounded bg-[var(--surface)] px-2 py-1 font-mono text-xs text-[var(--text)]">
+                    {metaPlatform.redirectUrl}
+                  </code>
+                  <Button size="sm" variant="secondary" onClick={() => void copyText(metaPlatform.redirectUrl)}>
+                    {t('copy')}
+                  </Button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {isTikTokShop && tiktokPlatform?.available && (
+          <div className="rounded-[9px] border border-[var(--border)] bg-[var(--surface-2)] p-3 text-sm text-[var(--text-2)]">
+            <p>{t('tiktokShopApp.serverApp')}</p>
+            <label className="mt-2 flex items-center gap-2 text-[var(--text)]">
+              <input
+                type="checkbox"
+                checked={ownTikTokApp}
+                onChange={(e) => {
+                  setOwnTikTokApp(e.target.checked);
+                  setFieldErrors({});
+                }}
+              />
+              {t('tiktokShopApp.useOwn')}
+            </label>
+            {ownTikTokApp && tiktokPlatform.redirectUrl && (
+              <>
+                <p className="mt-2 text-xs">{t('tiktokShopApp.ownHint')}</p>
+                <div className="mt-1 flex items-center gap-2">
+                  <code className="flex-1 overflow-x-auto rounded bg-[var(--surface)] px-2 py-1 font-mono text-xs text-[var(--text)]">
+                    {tiktokPlatform.redirectUrl}
+                  </code>
+                  <Button size="sm" variant="secondary" onClick={() => void copyText(tiktokPlatform.redirectUrl)}>
+                    {t('copy')}
+                  </Button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
         {GROUPS.map((kind) => {
           const group = visibleFields.filter((f) => f.kind === kind);
           if (group.length === 0) return null;
           return (
-            <fieldset key={kind} className="space-y-3">
-              <legend className="mb-1 text-xs font-semibold uppercase tracking-[0.06em] text-[var(--text-3)]">{t(`groups.${kind}`)}</legend>
-              {group.map(renderField)}
-            </fieldset>
+            <div key={kind} className="space-y-3">
+              {/* After the shop address, before the key fields it replaces. */}
+              {kind === 'credential' && oneClickPanel(group.some((f) => f.name === WOOCOMMERCE_KEY_VAR))}
+              <fieldset className="space-y-3">
+                <legend className="mb-1 text-xs font-semibold uppercase tracking-[0.06em] text-[var(--text-3)]">{t(`groups.${kind}`)}</legend>
+                {group.map(renderField)}
+              </fieldset>
+            </div>
           );
         })}
 
@@ -965,6 +1436,8 @@ function SetupContent() {
             {t('draftHint')}
           </p>
         )}
+
+        {!info.requiresIpAllowlist && <NetworkNote ips={info.egressIps ?? []} name={info.name} />}
       </Card>
 
       {info.instructions && (
@@ -980,6 +1453,18 @@ function SetupContent() {
     </div>
   );
 }
+
+/** The seller's own TikTok Shop app, as the catalog adapter names its variables. */
+const TIKTOK_SHOP_APP_VARS: readonly string[] = ['TIKTOK_SHOP_APP_KEY', 'TIKTOK_SHOP_APP_SECRET', 'TIKTOK_SHOP_SERVICE_ID'];
+
+/** The WooCommerce adapter's shop address and consumer key variables (one-click key). */
+const WOOCOMMERCE_URL_VAR = 'WOOCOMMERCE_URL';
+const WOOCOMMERCE_KEY_VAR = 'WOOCOMMERCE_CONSUMER_KEY';
+/** What an Instagram sign-in fills in; hidden on the form while signing in. */
+const META_SIGN_IN_VARS: readonly string[] = ['INSTAGRAM_ACCESS_TOKEN', 'INSTAGRAM_ACCOUNT_ID'];
+/** The app of your own for each Instagram sign-in, as the catalog adapters name it. */
+const META_FACEBOOK_APP_VARS: readonly string[] = ['META_APP_ID', 'META_APP_SECRET', 'META_CONFIG_ID'];
+const META_INSTAGRAM_APP_VARS: readonly string[] = ['INSTAGRAM_APP_ID', 'INSTAGRAM_APP_SECRET'];
 
 /** A setup page's draft that the "Switch to …" button may replace: old adapter → new adapter. */
 const REPLACEABLE_DRAFTS: Readonly<Record<string, string>> = { odoo: 'odoo-jsonrpc' };

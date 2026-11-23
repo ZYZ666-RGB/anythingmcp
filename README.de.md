@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/badges/banner.de.png" alt="AnythingMCP verbindet Claude, ChatGPT, Copilot und Gemini mit ERP-, E-Commerce-, REST-, SOAP- und SQL-Systemen und mit deinen Fileservern: 694 Connectors, dazu Firmengedächtnis, Skills und Dateisuche." width="100%" />
+  <img src="https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/badges/banner.de.png" alt="AnythingMCP verbindet Claude, ChatGPT, Copilot und Gemini mit ERP-, E-Commerce-, REST-, SOAP- und SQL-Systemen und mit deinen Fileservern: 958 Connectors, dazu Firmengedächtnis, Skills und Dateisuche." width="100%" />
 </p>
 
 <h1 align="center">AnythingMCP: das Open-Source-MCP-Gateway, das zum Gehirn deines Unternehmens wird</h1>
@@ -11,6 +11,7 @@
       <img src="https://api.star-history.com/badge?repo=HelpCode-ai/anythingmcp&type=trending" alt="GitHub Trending Repository of the Day" height="64" />
     </picture>
   </a>
+  <a href="https://www.producthunt.com/products/anythingmcp?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-anythingmcp" target="_blank" rel="noopener noreferrer"><img alt="AnythingMCP - Open-source MCP gateway and company brain | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1321607&amp;theme=light&amp;t=1795006241059"></a>
 </p>
 
 <p align="center">
@@ -20,11 +21,12 @@
 <p align="center">
   <strong>AnythingMCP ist ein quelloffenes, selbst gehostetes MCP-Gateway, das Claude, ChatGPT, Copilot und Gemini mit der Software deines Unternehmens und mit den Dokumenten auf deinen Fileservern verbindet, ohne dass du einen MCP-Server programmierst.</strong><br/>
   Auf dem Gateway baut es das Gehirn deines Unternehmens auf: einen Knowledge Graph, der zeigt, wie deine Systeme zusammenhängen, dazu KI-Skills und ein Firmengedächtnis. Jeder KI-Client nutzt dasselbe, jeweils begrenzt durch die Rolle der Person.<br/>
-  692 fertige Connectors mit über 12.000 Tools, darunter SAP, Odoo, weclapp und Amazon Seller; 35 davon kommen ohne API-Schlüssel aus.
+  731 fertige Connectors mit über 12.000 Tools, darunter SAP, Odoo, weclapp und Amazon Seller; 51 davon kommen ohne API-Schlüssel aus.
 </p>
 
 <p align="center">
   <a href="https://claude.ai/directory/anythingmcp"><img src="https://img.shields.io/badge/Claude-im%20offiziellen%20Verzeichnis-D97757?logo=claude&logoColor=white&labelColor=0b1220" alt="Im offiziellen Claude-Verzeichnis gelistet"></a>
+  <a href="https://chatgpt.com/plugins/plugin_asdk_app_6ade03541ce08191b35bbad1dc5b4121"><img src="https://img.shields.io/badge/ChatGPT-im%20Plugin--Verzeichnis-10A37F?logo=openai&logoColor=white&labelColor=0b1220" alt="Im ChatGPT-Plugin-Verzeichnis gelistet"></a>
   <a href="https://github.com/HelpCode-ai/anythingmcp/stargazers"><img src="https://img.shields.io/github/stars/HelpCode-ai/anythingmcp?style=flat&logo=github&logoColor=white&color=2563eb&labelColor=0b1220" alt="GitHub Stars"></a>
   <a href="https://github.com/HelpCode-ai/anythingmcp/releases"><img src="https://img.shields.io/github/v/release/HelpCode-ai/anythingmcp?include_prereleases&color=2563eb&labelColor=0b1220" alt="Release"></a>
   <a href="https://github.com/HelpCode-ai/anythingmcp/blob/main/LICENSE"><img src="https://img.shields.io/badge/open%20source-AGPL--3.0-2563eb?labelColor=0b1220" alt="Open source, AGPL-3.0"></a>
@@ -36,7 +38,7 @@
 </p>
 
 <p align="center">
-  <a href="https://cloud.anythingmcp.com/login?mode=register"><strong>Die Cloud 7 Tage kostenlos testen</strong></a> · <a href="https://claude.ai/directory/anythingmcp">Zu Claude hinzufügen</a> · <a href="#run-it-yourself">Selbst betreiben</a> · <a href="docs/guides.md">Doku</a> · <a href="https://anythingmcp.com/de/guides">Connector-Anleitungen</a> · <a href="https://github.com/HelpCode-ai/anythingmcp/discussions">Discussions</a>
+  <a href="https://cloud.anythingmcp.com/login?mode=register"><strong>Die Cloud 7 Tage kostenlos testen</strong></a> · <a href="https://claude.ai/directory/anythingmcp">Zu Claude hinzufügen</a> · <a href="https://chatgpt.com/plugins/plugin_asdk_app_6ade03541ce08191b35bbad1dc5b4121">Zu ChatGPT hinzufügen</a> · <a href="#run-it-yourself">Selbst betreiben</a> · <a href="docs/guides.md">Doku</a> · <a href="https://anythingmcp.com/de/guides">Connector-Anleitungen</a> · <a href="https://github.com/HelpCode-ai/anythingmcp/discussions">Discussions</a>
 </p>
 
 **Eine Frage in Claude, beantwortet aus Etsy, SAP und einer Logistik-API.**
@@ -53,7 +55,7 @@ Ein Gateway reicht Aufrufe weiter. Ein Firmengehirn weiß außerdem, wo deine Do
 
 | | Was es macht | Edition |
 |---|---|---|
-| **Jedes System, ein Endpunkt** | 694 Connectors aus dem Katalog oder deine eigene REST-/OpenAPI-, SOAP-, GraphQL-, OData-, SQL-, IMAP/SMTP- oder MCP-Quelle. Tools werden zur Laufzeit registriert. [Connectors](#connect-any-api-soap-service-or-database) | Alle |
+| **Jedes System, ein Endpunkt** | 958 Connectors aus dem Katalog oder deine eigene REST-/OpenAPI-, SOAP-, GraphQL-, OData-, SQL-, IMAP/SMTP- oder MCP-Quelle. Tools werden zur Laufzeit registriert. [Connectors](#connect-any-api-soap-service-or-database) | Alle |
 | **File Search** | Indexiert SFTP, FTP/FTPS, WebDAV (Nextcloud, NAS), S3 oder eine Netzwerkfreigabe: jede PDF-Seite, Excel-Zeilen mit ihren Spaltennamen, Word, PowerPoint, Outlook-Mails mit Anhängen. Die KI antwortet mit Datei, Seite und Datum. [File Search](docs/connectors/file-search.md) | Cloud; selbst gehostet Enterprise |
 | **File Share** | Befristete Download-Links für Dateien aus deinen Ordnern oder für Dateien, die die KI erstellt (einen CSV-Export, einen Bericht), intern oder öffentlich, mit Ablaufdatum und Widerruf. [File Share](docs/connectors/file-search.md) | Cloud; selbst gehostet Enterprise |
 | **Firmengedächtnis** | Fakten und Vorlieben, in einem KI-Client gespeichert und in jedem anderen wiedergefunden: einmal in Claude gesagt, von Copilot genutzt. Persönlicher und firmenweiter Bereich, mit Ordnern und Rollengrenzen. [Gedächtnis](docs/memory.md) | Enterprise |
@@ -138,7 +140,7 @@ Tools werden zur Laufzeit registriert, ohne Neustart. `{{VAR}}`-Werte pro Connec
 
 ## Connector-Katalog
 
-694 Adapter mit über 12.000 Tools. Zu jedem gibt es eine Einrichtungsanleitung auf [anythingmcp.com/de/guides](https://anythingmcp.com/de/guides), in sieben Sprachen.
+958 Adapter mit über 12.000 Tools. Zu jedem gibt es eine Einrichtungsanleitung auf [anythingmcp.com/de/guides](https://anythingmcp.com/de/guides), in sieben Sprachen.
 
 | Kategorie | Beispiele |
 |---|---|
@@ -250,8 +252,8 @@ Alles läuft auf deiner Infrastruktur, du entscheidest also, was sie verlässt. 
 
 Derselbe MCP-Server funktioniert in jedem Client, der MCP spricht; du baust einen Connector also nur einmal:
 
-- **Claude.** Trag die Server-URL als **benutzerdefinierten Connector** unter *Customize → Connectors* ein; danach funktioniert er in Claude.ai, Claude Desktop und Claude Code. OAuth 2.0 wird direkt unterstützt. Mit AnythingMCP Cloud geht es auch mit einem Klick über das [Claude-Verzeichnis](https://claude.ai/directory/anythingmcp). [Claude einrichten](docs/integrations/claude.md)
-- **ChatGPT.** Apps in ChatGPT basieren auf MCP. Füge den Server in ChatGPT unter *Plugins* hinzu (*+ → Add custom MCP server*) oder nutze ihn als Tool-Schicht einer Apps-SDK-App. [ChatGPT einrichten](docs/integrations/chatgpt.md)
+- **Claude.** Trag die Server-URL als **benutzerdefinierten Connector** unter **Plugins** (in manchen Tarifen noch **Customize**) → **Connectors** ein; danach funktioniert er in Claude.ai, Claude Desktop und Claude Code. OAuth 2.0 wird direkt unterstützt. Mit AnythingMCP Cloud geht es auch mit einem Klick über das [Claude-Verzeichnis](https://claude.ai/directory/anythingmcp). [Claude einrichten](docs/integrations/claude.md)
+- **ChatGPT.** Apps in ChatGPT basieren auf MCP. Füge den Server in ChatGPT unter *Plugins* hinzu (*Add → Add custom MCP server*) oder nutze ihn als Tool-Schicht einer Apps-SDK-App. [ChatGPT einrichten](docs/integrations/chatgpt.md)
 - **Meta Muse.** Öffne in Muse *Settings → Connectors → Add custom connector*, füge die Server-URL ein und melde dich bei AnythingMCP an. [Muse einrichten](docs/integrations/muse.md)
 - **Copilot, Gemini, Cursor** und andere MCP-Clients: [Anleitungen zur Client-Einrichtung](docs/guides.md).
 

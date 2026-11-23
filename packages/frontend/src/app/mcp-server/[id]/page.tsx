@@ -5,7 +5,11 @@ import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { useTranslations } from 'next-intl';
 import { useAuth } from '@/lib/auth-context';
-import { mcpServers, connectors as connectorsApi, mcpKeys, productEvents, server as serverApi } from '@/lib/api';
+import { useMemberVisibility } from '@/lib/use-member-visibility';
+import { useNotAvailableRedirect } from '@/components/member-route-guard';
+import { mcpServers, connectors as connectorsApi, mcpKeys, productEvents, server as serverApi, planLimitOf } from '@/lib/api';
+import { atPlanCap, pausedByPlanSets, usePlanUsage } from '@/lib/use-plan-fit';
+import { PausedByPlanBadge, PlanSwapDialog } from '@/components/plan-swap-dialog';
 import { AppShell } from '@/components/app-shell';
 import { Button, buttonVariants } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -15,7 +19,7 @@ import { ConnectionCheck } from '@/components/connection-check';
 import { FirstSuccessOffer } from '@/components/first-success-offer';
 import { copyText } from '@/lib/clipboard';
 import { getApiOrigin } from '@/lib/origin';
-import { CLAUDE_ADD_CONNECTOR_URL, CLAUDE_DIRECTORY_URL } from '@/lib/marketing';
+import { CHATGPT_DIRECTORY_URL, CLAUDE_ADD_CONNECTOR_URL, CLAUDE_DIRECTORY_URL } from '@/lib/marketing';
 import { INSPECTOR_URL, inspectorCommand } from '@/lib/inspector-url';
 import {
   cursorDeepLink as buildCursorDeepLink,
@@ -33,6 +37,15 @@ export default function McpServerDetailPage() {
   const isCloud = deploymentMode === 'cloud';
   const router = useRouter();
   const t = useTranslations('mcpServer');
+  // A restricted member is told nothing about a server they do not own: the
+  // API answers the 404 of an unknown id, and the page sends them back to
+  // their list with the note every refused page shows, instead of a shell
+  // around "not found".
+  const { restrictedForMe } = useMemberVisibility();
+  const notAvailable = useNotAvailableRedirect();
+  // Cloud: paused by the last automatic downgrade, and the swap at the cap.
+  const { usage: planUsage, reload: reloadPlanUsage } = usePlanUsage();
+  const [swapMax, setSwapMax] = useState<number | null | undefined>(undefined);
 
   const [server, setServer] = useState<any>(null);
   // Bumped a moment after the first request arrives, so the card-trial offer
@@ -122,6 +135,11 @@ export default function McpServerDetailPage() {
     serverApi.info().then((info) => setMcpAuthMode(info?.mcpAuthMode || '')).catch(() => {});
   }, []);
 
+  const notHers = !loading && !server && restrictedForMe;
+  useEffect(() => {
+    if (notHers) notAvailable('/mcp-server');
+  }, [notHers, notAvailable]);
+
   const apiUrl = getApiOrigin();
 
   const handleSave = async () => {
@@ -144,10 +162,20 @@ export default function McpServerDetailPage() {
 
   const handleToggleActive = async () => {
     if (!token || !id || !server) return;
+    const activating = !server.isActive;
+    // Turning one on at the plan's cap: pause another first (swap dialog).
+    if (activating && atPlanCap(planUsage, 'mcpServers')) {
+      setSwapMax(planUsage?.mcpServers.max ?? null);
+      return;
+    }
     try {
-      const updated = await mcpServers.update(id, { isActive: !server.isActive }, token);
+      const updated = await mcpServers.update(id, { isActive: activating }, token);
       setServer((prev: any) => ({ ...prev, ...updated }));
-    } catch {}
+      reloadPlanUsage();
+    } catch (err) {
+      const limit = planLimitOf(err);
+      if (limit?.axis === 'mcpServers') setSwapMax(limit.max || null);
+    }
   };
 
   const saveAssignments = (next: Set<string>) => {
@@ -260,6 +288,8 @@ export default function McpServerDetailPage() {
     );
   }
 
+  if (!server && restrictedForMe) return null;
+
   if (!server) {
     return (
       <AppShell backTo={{ label: t('back'), href: '/mcp-server' }} title={t('notFoundTitle')}>
@@ -280,7 +310,7 @@ export default function McpServerDetailPage() {
   // IMPORTANT: Claude *Desktop* does NOT accept this — its
   // claude_desktop_config.json only spawns local stdio commands, so a remote
   // http/url entry is silently skipped ("not a valid MCP server
-  // configuration"). For Claude Desktop use Customize → Connectors, or
+  // configuration"). For Claude Desktop use Plugins (or Customize) → Connectors, or
   // the mcp-remote bridge (claudeDesktopBridge* below).
   const claudeConfigOAuth = `{
   "mcpServers": {
@@ -466,6 +496,31 @@ export default function McpServerDetailPage() {
       </div>
     ) : null;
 
+  // On Cloud only: AnythingMCP's plugin in ChatGPT's plugin directory. It
+  // queries company databases, so for those it is the quickest way; the
+  // custom MCP server below reaches every connector on this server.
+  // The ChatGPT Plugin Directory listing serves company databases only, so it
+  // is offered only for a server whose assigned connectors are all databases.
+  const databasesOnly =
+    assignedConnectors.length > 0 && assignedConnectors.every((c) => c.type === 'DATABASE');
+  const chatgptDirectoryNote = () =>
+    isCloud && databasesOnly ? (
+      <div className="space-y-2 rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] p-3" data-testid="chatgpt-directory">
+        <p className="text-[13px] font-semibold text-[var(--text)]">
+          {t('chatgptDirectory.title')}
+        </p>
+        {/* Secondary: the main button below opens Plugins for the custom MCP server. */}
+        <a
+          href={CHATGPT_DIRECTORY_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          className={cn(buttonVariants({ variant: 'secondary', size: 'md' }))}
+        >
+          {t('chatgptDirectory.open')}
+        </a>
+      </div>
+    ) : null;
+
   const renderModalContent = (clientId: string) => {
     switch (clientId) {
       case 'cursor':
@@ -580,6 +635,7 @@ export default function McpServerDetailPage() {
       case 'chatgpt':
         return (
           <div className="space-y-4">
+            {chatgptDirectoryNote()}
             <p className="text-[13px] leading-[1.55] text-[var(--text-2)]">
               {t.rich('modal.chatgptStep1', rich)}<br />
               {t.rich('modal.chatgptStep2', rich)}<br />
@@ -707,6 +763,22 @@ Auth: OAuth`;
         </div>
       }
     >
+      {swapMax !== undefined && (
+        <PlanSwapDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setSwapMax(undefined);
+          }}
+          axis="mcpServers"
+          target={{ id: server.id, name: server.name }}
+          max={swapMax}
+          onDone={() => {
+            setServer((prev: any) => ({ ...prev, isActive: true }));
+            reloadPlanUsage();
+          }}
+        />
+      )}
+
       {/* Server identity header */}
       <div className="mb-[18px] flex flex-wrap items-start justify-between gap-3">
         <div className="flex items-center gap-[13px]">
@@ -719,9 +791,13 @@ Auth: OAuth`;
           <div>
             <div className="flex items-center gap-[9px]">
               <span className="text-[18px] font-semibold tracking-[-0.02em]">{server.name}</span>
-              <StatusPill tone={server.isActive ? 'success' : 'neutral'} dot={server.isActive ? 'var(--ok)' : 'var(--text-3)'}>
-                {server.isActive ? t('active') : t('inactive')}
-              </StatusPill>
+              {!server.isActive && pausedByPlanSets(planUsage).mcpServers.has(server.id) ? (
+                <PausedByPlanBadge />
+              ) : (
+                <StatusPill tone={server.isActive ? 'success' : 'neutral'} dot={server.isActive ? 'var(--ok)' : 'var(--text-3)'}>
+                  {server.isActive ? t('active') : t('inactive')}
+                </StatusPill>
+              )}
             </div>
             <div className="mt-0.5 break-all font-mono text-[12.5px] text-[var(--text-3)]">{endpointUrl}</div>
           </div>

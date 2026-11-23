@@ -81,7 +81,7 @@ describe('EmailService', () => {
     // Downloads and tool calls at their floors; no GitHub star count.
     expect(mail.html).not.toContain('stars on GitHub');
     expect(mail.html).toContain('200,000+');
-    expect(mail.html).toContain('1M+');
+    expect(mail.html).toContain('2M+');
   });
 
   describe('Reply-To of the system SMTP', () => {
@@ -266,14 +266,17 @@ describe('EmailService', () => {
     expect(mail.headers['List-Unsubscribe-Post']).toBeUndefined();
   });
 
-  it('sends trial lifecycle notices with the user’s usage and no unsubscribe', async () => {
+  it('sends trial lifecycle notices with the user’s usage and a one-click unsubscribe', async () => {
     const { service } = make();
     await service.sendTrialLifecycleEmail('a@b.com', 'Ada', 'warn3', { connectors: 2, successfulCalls: 41, daysLeft: 3 });
     const mail = sent();
     expect(mail.subject).toBe('Your AnythingMCP trial ends in 3 days');
     expect(mail.html).toContain('41');
     expect(mail.text).toContain('2 connectors set up, 41 successful tool calls');
-    expect(mail.headers).toBeUndefined();
+    expect(mail.headers['List-Unsubscribe-Post']).toBe('List-Unsubscribe=One-Click');
+    const url = new URL(mail.headers['List-Unsubscribe'].slice(1, -1));
+    expect(url.pathname).toBe('/api/public/unsubscribe');
+    expect(mail.text).toContain(url.toString());
   });
 
   it('logs the recipient masked, never the full address', async () => {
@@ -367,7 +370,7 @@ describe('EmailService', () => {
     const { service } = make({ cloud: false });
     await service.sendPasswordResetEmail('a@b.com', 'https://mcp.example.com/reset?t=1');
     const mail = sent();
-    expect(mail.html).not.toMatch(/Frankfurt|DPA|Claude Directory|AI tool calls/);
+    expect(mail.html).not.toMatch(/Frankfurt|DPA|Claude Directory|ChatGPT Plugin Directory|AI tool calls/);
     expect(mail.html).toContain('Open source');
   });
 
@@ -427,6 +430,79 @@ describe('EmailService', () => {
       const { service } = make({ cloud: false, user: google });
       await service.sendActivationReminderEmail('a@b.com', 'Ada', '/connectors/c1');
       expect(sent().text).not.toContain('continueWith');
+    });
+  });
+
+  describe('app approved: the email and its reminder', () => {
+    const input = {
+      name: 'Ada',
+      providerName: 'Etsy',
+      connectorPath: '/connectors/c1?signin=1',
+      prompt: 'Show my last 10 Etsy orders',
+      promptUrl: 'https://claude.ai/new?q=Show%20my%20last%2010%20Etsy%20orders',
+    };
+    afterEach(() => {
+      delete process.env.FRONTEND_URL;
+    });
+
+    it('sends the first one as a transactional email whose link starts the sign-in', async () => {
+      const { service } = make();
+      await expect(service.sendAppApprovedEmail('a@b.com', { ...input, trialDaysAdded: 7 }, 'org-1')).resolves.toBe(true);
+      const mail = sent();
+      expect(mail.subject).toBe('Etsy approved your app');
+      expect(mail.headers).toBeUndefined();
+      expect(mail.text).toContain('Finish the Etsy sign-in: https://cloud.anythingmcp.com/connectors/c1?signin=1');
+      expect(mail.text).toContain('We added 7 days to your trial so you can try it.');
+      expect(mail.text).toContain('we remind you once');
+    });
+
+    it('keeps the sign-in link whole through the dashboard sign-in of a Google account', async () => {
+      const { service } = make({ user: { id: 'user-1', email: 'A@b.com', socialIdentities: [{ provider: 'google' }] } });
+      await service.sendAppApprovedEmail('a@b.com', input, 'org-1');
+      await service.sendAppApprovedReminderEmail('a@b.com', input, 'org-1');
+      const link = `https://cloud.anythingmcp.com/login?continueWith=google&redirect=${encodeURIComponent('/connectors/c1?signin=1')}`;
+      expect(sendMail.mock.calls[0][0].text).toContain(link);
+      expect(sendMail.mock.calls[1][0].text).toContain(link);
+      // What /login reads back is the same path, flag included.
+      expect(new URL(link).searchParams.get('redirect')).toBe('/connectors/c1?signin=1');
+    });
+
+    it('sends the reminder as a nudge, with the one-click unsubscribe', async () => {
+      const { service } = make();
+      await expect(service.sendAppApprovedReminderEmail('a@b.com', input, 'org-1')).resolves.toBe(true);
+      const mail = sent();
+      expect(mail.subject).toBe('Your Etsy sign-in is still open');
+      expect(mail.text).toContain('Finish the Etsy sign-in: https://cloud.anythingmcp.com/connectors/c1?signin=1');
+      expect(mail.headers['List-Unsubscribe-Post']).toBe('List-Unsubscribe=One-Click');
+      const url = new URL(mail.headers['List-Unsubscribe'].slice(1, -1));
+      expect(url.origin).toBe('https://cloud.anythingmcp.com');
+      expect(url.pathname).toBe('/api/public/unsubscribe');
+      expect(verifyUnsubscribe('user-1', url.searchParams.get('t'), process.env.JWT_SECRET!)).toBe(true);
+      expect(mail.text).toContain(url.toString());
+    });
+
+    it('on a self-hosted instance, links and unsubscribes at its own address', async () => {
+      process.env.FRONTEND_URL = 'https://mcp.example.org/';
+      const { service } = make({ cloud: false });
+      await service.sendAppApprovedReminderEmail('a@b.com', input, 'org-1');
+      const mail = sent();
+      expect(mail.text).toContain('Finish the Etsy sign-in: https://mcp.example.org/connectors/c1?signin=1');
+      expect(mail.headers['List-Unsubscribe']).toMatch(/^<https:\/\/mcp\.example\.org\/api\/public\/unsubscribe\?u=user-1&t=/);
+      expect(mail.text).not.toContain('cloud.anythingmcp.com');
+    });
+
+    it('answers false without SMTP, and logs the recipient masked', async () => {
+      delete process.env.SMTP_HOST;
+      const lines: string[] = [];
+      const spy = jest.spyOn(Logger.prototype, 'warn').mockImplementation((message: unknown) => void lines.push(String(message)));
+      try {
+        const { service } = make();
+        await expect(service.sendAppApprovedReminderEmail('ada.lovelace@example.com', input, 'org-1')).resolves.toBe(false);
+        expect(sendMail).not.toHaveBeenCalled();
+        expect(lines.join('\n')).not.toContain('ada.lovelace@');
+      } finally {
+        spy.mockRestore();
+      }
     });
   });
 

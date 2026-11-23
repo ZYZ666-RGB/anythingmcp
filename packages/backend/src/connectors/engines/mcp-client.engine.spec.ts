@@ -1,6 +1,8 @@
 import {
+  MAX_TOOL_LIST_PAGES,
   McpClientEngine,
   assertNotThisServer,
+  explainToolListPageCap,
   explainMcpConnectError,
   isUnauthorized,
 } from './mcp-client.engine';
@@ -33,6 +35,7 @@ describe('McpClientEngine endpoint resolution', () => {
     listTools: jest.Mock;
     close: jest.Mock;
   };
+  let transport: { terminateSession: jest.Mock };
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -42,7 +45,9 @@ describe('McpClientEngine endpoint resolution', () => {
       listTools: jest.fn().mockResolvedValue({ tools: [] }),
       close: jest.fn().mockResolvedValue(undefined),
     };
+    transport = { terminateSession: jest.fn().mockResolvedValue(undefined) };
     MockedClient.mockImplementation(() => client);
+    MockedTransport.mockImplementation(() => transport);
     engine = new McpClientEngine({} as unknown as OAuth2TokenService);
   });
 
@@ -50,6 +55,89 @@ describe('McpClientEngine endpoint resolution', () => {
     baseUrl,
     authType: 'NONE',
     headers: {} as Record<string, string>,
+  });
+
+  describe('session cleanup', () => {
+    it('terminates the session before locally closing the client', async () => {
+      await engine.execute(config('https://mcp.example.com'), { method: 'echo', path: '/mcp' }, {});
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(transport.terminateSession).toHaveBeenCalledTimes(1);
+      expect(transport.terminateSession.mock.invocationCallOrder[0]).toBeLessThan(client.close.mock.invocationCallOrder[0]);
+    });
+
+    it('preserves the original tool error when session termination also fails', async () => {
+      const original = new Error('tool failed');
+      client.callTool.mockRejectedValueOnce(original);
+      transport.terminateSession.mockRejectedValueOnce(new Error('cleanup failed'));
+      await expect(engine.execute(config('https://mcp.example.com'), { method: 'echo', path: '/mcp' }, {})).rejects.toBe(original);
+      expect(transport.terminateSession).toHaveBeenCalledTimes(1);
+      expect(client.close).toHaveBeenCalledTimes(1);
+    });
+
+    it('closes locally even when connecting fails and remote termination fails', async () => {
+      const original = new Error('connect failed');
+      client.connect.mockRejectedValueOnce(original);
+      transport.terminateSession.mockRejectedValueOnce(new Error('transport already aborted'));
+      await expect(engine.execute(config('https://mcp.example.com'), { method: 'echo', path: '/mcp' }, {})).rejects.toBe(original);
+      expect(client.close).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['execute', 'listTools'] as const)('returns from %s before a hanging cleanup reaches its deadline', async (operation) => {
+      jest.useFakeTimers();
+      try {
+        transport.terminateSession.mockReturnValue(new Promise<void>(() => undefined));
+        const call = operation === 'execute'
+          ? engine.execute(config('https://mcp.example.com'), { method: 'echo', path: '/mcp' }, {})
+          : engine.listTools(config('https://mcp.example.com'));
+        const settled = jest.fn();
+        const outcome = call.then(settled);
+        await jest.advanceTimersByTimeAsync(0);
+        expect(settled).toHaveBeenCalledWith(operation === 'execute' ? { content: [] } : []);
+        await outcome;
+        expect(client.close).not.toHaveBeenCalled();
+        await jest.advanceTimersByTimeAsync(5_000);
+        expect(client.close).toHaveBeenCalledTimes(1);
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it.each(['execute', 'listTools'] as const)('rejects %s without waiting for hanging cleanup', async (operation) => {
+      jest.useFakeTimers();
+      try {
+        const original = new Error('upstream request failed');
+        if (operation === 'execute') client.callTool.mockRejectedValueOnce(original);
+        else client.listTools.mockRejectedValueOnce(original);
+        transport.terminateSession.mockReturnValue(new Promise<void>(() => undefined));
+        const call = operation === 'execute'
+          ? engine.execute(config('https://mcp.example.com'), { method: 'echo', path: '/mcp' }, {})
+          : engine.listTools(config('https://mcp.example.com'));
+        const rejected = jest.fn();
+        const outcome = call.catch(rejected);
+        await jest.advanceTimersByTimeAsync(0);
+        expect(rejected).toHaveBeenCalledWith(original);
+        await outcome;
+        expect(client.close).not.toHaveBeenCalled();
+        await jest.advanceTimersByTimeAsync(5_000);
+        expect(client.close).toHaveBeenCalledTimes(1);
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('clears the cleanup timer on success even when local close fails', async () => {
+      jest.useFakeTimers();
+      try {
+        client.close.mockRejectedValueOnce(new Error('local close failed'));
+        await expect(engine.execute(config('https://mcp.example.com'), { method: 'echo', path: '/mcp' }, {})).resolves.toEqual({ content: [] });
+        expect(transport.terminateSession).toHaveBeenCalledTimes(1);
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
   });
 
   describe('execute', () => {
@@ -102,6 +190,88 @@ describe('McpClientEngine endpoint resolution', () => {
       );
 
       expect(mockedAssertSafeOutboundUrl).toHaveBeenCalledWith(baseUrl);
+    });
+  });
+
+  describe('fixed arguments (config.mcpFixedArguments)', () => {
+    const fixed = { meta: { 'ucp-agent': { profile: 'https://agent.example.test/ucp-agent.json' } } };
+
+    it("sends the caller's own arguments object when the connector fixes nothing", async () => {
+      const params = { catalog: { query: 'tent' } };
+      await engine.execute(config('https://shop.example.test/api/ucp/mcp'), { method: 'search_catalog', path: '/mcp' }, params);
+
+      expect(client.callTool).toHaveBeenCalledTimes(1);
+      expect(client.callTool.mock.calls[0][0].arguments).toBe(params);
+    });
+
+    it('merges them into the arguments of the call, without touching what the caller passed', async () => {
+      const params = { catalog: { query: 'tent' } };
+      await engine.execute(
+        { ...config('https://shop.example.test/api/ucp/mcp'), fixedArguments: fixed },
+        { method: 'search_catalog', path: '/mcp' },
+        params,
+      );
+
+      expect(client.callTool).toHaveBeenCalledWith({
+        name: 'search_catalog',
+        arguments: { catalog: { query: 'tent' }, meta: { 'ucp-agent': { profile: 'https://agent.example.test/ucp-agent.json' } } },
+      });
+      expect(params).toEqual({ catalog: { query: 'tent' } });
+    });
+
+    it('lets the fixed value win over what the caller sent, and keeps the rest of the object', async () => {
+      await engine.execute(
+        { ...config('https://shop.example.test/api/ucp/mcp'), fixedArguments: fixed },
+        { method: 'complete_checkout', path: '/mcp' },
+        { id: 'chk_1', meta: { 'idempotency-key': 'k-1', 'ucp-agent': { profile: 'https://other.example.test/p.json' } } },
+      );
+
+      expect(client.callTool.mock.calls[0][0].arguments).toEqual({
+        id: 'chk_1',
+        meta: { 'idempotency-key': 'k-1', 'ucp-agent': { profile: 'https://agent.example.test/ucp-agent.json' } },
+      });
+    });
+
+    it('sends no Authorization header to a server that needs no credentials (NONE)', async () => {
+      await engine.execute(
+        { ...config('https://shop.example.test/api/ucp/mcp'), fixedArguments: fixed },
+        { method: 'search_catalog', path: '/mcp' },
+        {},
+      );
+      await engine.listTools(config('https://shop.example.test/api/ucp/mcp'));
+
+      for (const call of MockedTransport.mock.calls) {
+        expect(Object.keys(call[1].requestInit.headers).map((h) => h.toLowerCase())).not.toContain('authorization');
+      }
+      expect(transportUrl(1)).toBe('https://shop.example.test/api/ucp/mcp');
+    });
+
+    it('sends them again on the retry after a renewed OAuth2 token', async () => {
+      const tokens = {
+        getAccessToken: jest.fn().mockResolvedValue('expired'),
+        renewAfterRejection: jest.fn().mockResolvedValue('renewed'),
+      };
+      engine = new McpClientEngine(tokens as unknown as OAuth2TokenService);
+      client.callTool.mockRejectedValueOnce(
+        Object.assign(new Error('Error POSTing to endpoint: {"error":"invalid_token"}'), { data: { status: 401 } }),
+      );
+
+      await engine.execute(
+        {
+          baseUrl: 'https://shop.example.test/mcp',
+          authType: 'OAUTH2',
+          authConfig: { tokenUrl: 'https://shop.example.test/token', refreshToken: 'rt' },
+          connectorId: 'c1',
+          fixedArguments: { channel: 'amcp' },
+        },
+        { method: 'search', path: '/mcp' },
+        { q: 'tent', channel: 'model' },
+      );
+
+      expect(client.callTool).toHaveBeenCalledTimes(2);
+      for (const call of client.callTool.mock.calls) {
+        expect(call[0]).toEqual({ name: 'search', arguments: { q: 'tent', channel: 'amcp' } });
+      }
     });
   });
 
@@ -171,22 +341,42 @@ describe('McpClientEngine endpoint resolution', () => {
   });
 
   describe('tools/list pagination', () => {
-    it('follows nextCursor until the server stops sending one', async () => {
-      client.listTools
-        .mockResolvedValueOnce({ tools: [{ name: 'a', inputSchema: {} }], nextCursor: 'p2' })
-        .mockResolvedValueOnce({ tools: [{ name: 'b', inputSchema: {} }], nextCursor: 'p3' })
-        .mockResolvedValueOnce({ tools: [{ name: 'c', inputSchema: {} }] });
+    it('lets the SDK walk every page with our page cap (issue #1791)', async () => {
+      client.listTools.mockResolvedValueOnce({
+        tools: [
+          { name: 'a', inputSchema: {} },
+          { name: 'b', inputSchema: {} },
+        ],
+      });
 
       const tools = await engine.listTools(config('https://mcp.atlassian.com/v2/mcp'));
 
-      expect(tools.map((t) => t.name)).toEqual(['a', 'b', 'c']);
-      expect(client.listTools.mock.calls).toEqual([[undefined], [{ cursor: 'p2' }], [{ cursor: 'p3' }]]);
+      expect(tools.map((t) => t.name)).toEqual(['a', 'b']);
+      // No cursor: the SDK aggregates all pages itself (client >= 2.4).
+      expect(client.listTools.mock.calls).toEqual([[]]);
+      expect(MockedClient.mock.calls[0][1]).toEqual({ listMaxPages: MAX_TOOL_LIST_PAGES });
+      expect(MAX_TOOL_LIST_PAGES).toBe(50);
     });
 
-    it('stops at a ceiling when a server never stops paginating', async () => {
-      client.listTools.mockResolvedValue({ tools: [{ name: 'x', inputSchema: {} }], nextCursor: 'again' });
-      const tools = await engine.listTools(config('https://mcp.example.com/mcp'));
-      expect(tools).toHaveLength(50);
+    it('explains a server that lists more pages than the cap', async () => {
+      client.listTools.mockRejectedValueOnce(
+        Object.assign(new Error('tools/list: exceeded listMaxPages (50); server pagination did not terminate'), {
+          code: 'LIST_PAGINATION_EXCEEDED',
+        }),
+      );
+
+      await expect(engine.listTools(config('https://mcp.example.com/mcp'))).rejects.toThrow(
+        /more than 50 pages, so discovery stopped/,
+      );
+      expect(client.close).toHaveBeenCalled();
+    });
+
+    it('passes other discovery errors through unchanged', async () => {
+      const boom = new Error('upstream 502');
+      client.listTools.mockRejectedValueOnce(boom);
+      await expect(engine.listTools(config('https://mcp.example.com/mcp'))).rejects.toBe(boom);
+      expect(explainToolListPageCap(boom)).toBe(boom);
+      expect(explainToolListPageCap(undefined)).toBeUndefined();
     });
   });
 

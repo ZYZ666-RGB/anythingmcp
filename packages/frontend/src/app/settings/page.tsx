@@ -4,14 +4,17 @@ import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { useLocale, useTranslations } from 'next-intl';
 import { useAuth } from '@/lib/auth-context';
-import { users, server, sso, social, knowledgeGraph, ApiError, type LinkableProvider, type MemberLearning, type SocialConnection } from '@/lib/api';
+import { users, server, sso, social, knowledgeGraph, mcpKeys, ApiError, type LinkableProvider, type MemberLearning, type SocialConnection, type McpApiKeyInfo, type McpApiKeyScope } from '@/lib/api';
+import { copyText } from '@/lib/clipboard';
 import { ProviderMark } from '@/components/provider-mark';
 import * as Dialog from '@radix-ui/react-dialog';
 import { useToast } from '@/components/toast';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
+import { LearningProjectsCard } from '@/components/learning-projects-card';
 import { StatusPill } from '@/components/ui/badge';
 import { LanguageSwitcher } from '@/components/language-switcher';
+import { ActiveSubscriptionNotice, subscribedWorkspacesOf, type SubscribedWorkspace } from '@/components/active-subscription-notice';
 
 const AUTH_MODES = ['none', 'legacy', 'oauth2', 'both'] as const;
 
@@ -37,7 +40,17 @@ export default function SettingsPage() {
   const [serverUrl, setServerUrl] = useState('');
   // Cloud only: onboarding tips and offers by email (the drip, win-back).
   const [isCloud, setIsCloud] = useState(false);
+  // Whether server info has answered (or failed): until then isCloud is only a guess.
+  const [deploymentKnown, setDeploymentKnown] = useState(false);
   const [marketingOptOut, setMarketingOptOut] = useState<boolean | null>(null);
+  // Management API keys (scope !== MCP): the credential the amcp CLI uses to
+  // drive /api/*. MCP tool keys stay on the per-server page.
+  const [mgmtKeys, setMgmtKeys] = useState<McpApiKeyInfo[] | null>(null);
+  const [newKeyName, setNewKeyName] = useState('');
+  const [newKeyScope, setNewKeyScope] = useState<McpApiKeyScope>('MANAGEMENT_READ');
+  const [generatedKey, setGeneratedKey] = useState('');
+  const [keyBusy, setKeyBusy] = useState(false);
+  const [keyCopied, setKeyCopied] = useState(false);
   const [marketingSaving, setMarketingSaving] = useState(false);
   const [learning, setLearning] = useState<MemberLearning | null>(null);
   const [learningSaving, setLearningSaving] = useState(false);
@@ -51,6 +64,7 @@ export default function SettingsPage() {
   // A passwordless (social) account confirms deletion with a fresh sign-in.
   const [deleteNeedsReauth, setDeleteNeedsReauth] = useState(false);
   const [blockingOrgs, setBlockingOrgs] = useState<{ id: string; name: string }[] | null>(null);
+  const [subscribedOrgs, setSubscribedOrgs] = useState<SubscribedWorkspace[] | null>(null);
 
   // Connected accounts
   const [linkable, setLinkable] = useState<LinkableProvider[]>([]);
@@ -66,7 +80,7 @@ export default function SettingsPage() {
       setOauthEndpoints(info.oauthEndpoints);
       setServerUrl(info.serverUrl);
       setIsCloud(info.deploymentMode === 'cloud');
-    }).catch(() => {});
+    }).catch(() => {}).finally(() => setDeploymentKnown(true));
   }, []);
 
   useEffect(() => {
@@ -121,7 +135,8 @@ export default function SettingsPage() {
   };
 
   const loadLinkable = () => {
-    if (!token) return;
+    // SSO is self-hosted only: on Cloud the route answers 404, so don't ask.
+    if (!token || !deploymentKnown || isCloud) return;
     // Silently empty when the workspace has no provider: this card should not
     // announce a feature the workspace has not configured.
     sso.myProviders(token).then(setLinkable).catch(() => setLinkable([]));
@@ -141,7 +156,7 @@ export default function SettingsPage() {
   useEffect(() => {
     loadLinkable();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token]);
+  }, [token, deploymentKnown, isCloud]);
 
   useEffect(() => {
     loadSocial();
@@ -249,6 +264,7 @@ export default function SettingsPage() {
     setDeleting(true);
     setDeleteError(null);
     setBlockingOrgs(null);
+    setSubscribedOrgs(null);
     try {
       await users.deleteSelf(
         hasPassword ? { password: deletePassword, confirm: 'DELETE' } : { confirm: 'DELETE' },
@@ -256,12 +272,15 @@ export default function SettingsPage() {
       );
       logout();
     } catch (err: any) {
+      const subscribed = subscribedWorkspacesOf(err);
       if (err instanceof ApiError) {
         if (err.status === 403 && err.body?.code === 'reauth_required') {
           setDeleteNeedsReauth(true);
           setDeleteError(err.message);
         } else if (err.status === 401) {
           setDeleteError(hasPassword ? t('incorrectPassword') : err.message || t('deleteFailed'));
+        } else if (subscribed && subscribed.length > 0) {
+          setSubscribedOrgs(subscribed);
         } else if (err.status === 409 && Array.isArray(err.body?.blockingOrganizations)) {
           setBlockingOrgs(err.body.blockingOrganizations);
           setDeleteError(err.body?.error || t('onlyAdmin'));
@@ -302,6 +321,7 @@ export default function SettingsPage() {
     setDeleteConfirm('');
     setDeleteError(null);
     setBlockingOrgs(null);
+    setSubscribedOrgs(null);
     setDeleting(false);
   };
 
@@ -331,6 +351,70 @@ export default function SettingsPage() {
       setPasswordMsgIsError(true);
       setPasswordMsg(t('error', { message }));
       toast.show({ tone: 'error', title: t('toast.passwordChangeFailed'), description: message });
+    }
+  };
+
+  const km = (key: string, values?: Record<string, string | number>) => t(`apiKeys.management.${key}`, values);
+
+  const loadMgmtKeys = async (tok: string) => {
+    try {
+      const all = await mcpKeys.list(tok);
+      setMgmtKeys(all.filter((k) => k.scope && k.scope !== 'MCP'));
+    } catch {
+      setMgmtKeys([]);
+    }
+  };
+
+  useEffect(() => {
+    if (token) void loadMgmtKeys(token);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token]);
+
+  const handleGenerateMgmtKey = async () => {
+    if (!token || !newKeyName.trim() || keyBusy) return;
+    setKeyBusy(true);
+    try {
+      const result = await mcpKeys.generate(newKeyName.trim(), token, undefined, newKeyScope);
+      setGeneratedKey(result.key);
+      setKeyCopied(false);
+      setNewKeyName('');
+      await loadMgmtKeys(token);
+      toast.show({ tone: 'success', title: km('created_toast') });
+    } catch (err: any) {
+      toast.show({ tone: 'error', title: km('error'), description: err?.message });
+    } finally {
+      setKeyBusy(false);
+    }
+  };
+
+  const handleRevokeMgmtKey = async (id: string) => {
+    if (!token) return;
+    try {
+      await mcpKeys.revoke(id, token);
+      await loadMgmtKeys(token);
+      toast.show({ tone: 'success', title: km('revoked_toast') });
+    } catch (err: any) {
+      toast.show({ tone: 'error', title: km('error'), description: err?.message });
+    }
+  };
+
+  const handleDeleteMgmtKey = async (id: string) => {
+    if (!token || !confirm(km('confirmDelete'))) return;
+    try {
+      await mcpKeys.delete(id, token);
+      await loadMgmtKeys(token);
+      toast.show({ tone: 'success', title: km('deleted_toast') });
+    } catch (err: any) {
+      toast.show({ tone: 'error', title: km('error'), description: err?.message });
+    }
+  };
+
+  const handleCopyGeneratedKey = async () => {
+    if (!generatedKey) return;
+    const ok = await copyText(generatedKey);
+    if (ok) {
+      setKeyCopied(true);
+      setTimeout(() => setKeyCopied(false), 2000);
     }
   };
 
@@ -431,6 +515,9 @@ export default function SettingsPage() {
           )}
         </Card>
       )}
+
+      {/* Learning projects: only for a member an admin started one for. */}
+      {token && <LearningProjectsCard token={token} />}
 
       {/* Change Password */}
       <Card className="p-[22px]">
@@ -639,10 +726,86 @@ export default function SettingsPage() {
         </div>
       </Card>
 
-      {/* MCP API Keys note */}
-      <Card className="p-[22px]">
-        <h3 className="text-sm font-semibold text-[var(--text)] mb-2">{t('apiKeys.title')}</h3>
-        <p className="text-sm text-[var(--text-2)]">
+      {/* Management API keys (amcp CLI) + a note pointing to per-server MCP keys */}
+      <Card className="p-[22px] space-y-4">
+        <div>
+          <h3 className="text-sm font-semibold text-[var(--text)] mb-1">{km('title')}</h3>
+          <p className="text-sm text-[var(--text-2)]">{km('intro')}</p>
+        </div>
+
+        {/* One-time reveal of a freshly generated key */}
+        {generatedKey && (
+          <div className="rounded-[9px] border border-[var(--brand)]/40 bg-[var(--surface-2)] p-3 space-y-2">
+            <p className="text-xs text-[var(--text-2)]">{km('created')}</p>
+            <div className="flex items-center gap-2">
+              <code className="flex-1 break-all rounded-[8px] border border-[var(--border)] bg-[var(--surface)] px-[11px] py-[9px] font-mono text-[12px] text-[var(--text-2)]">{generatedKey}</code>
+              <Button variant="secondary" onClick={handleCopyGeneratedKey}>{keyCopied ? km('copied') : km('copy')}</Button>
+            </div>
+          </div>
+        )}
+
+        {/* Create form */}
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+          <div className="flex-1">
+            <label className={labelClass} htmlFor="mgmt-key-name">{km('name')}</label>
+            <input
+              id="mgmt-key-name"
+              type="text"
+              value={newKeyName}
+              onChange={(e) => setNewKeyName(e.target.value)}
+              placeholder={km('namePlaceholder')}
+              className={inputClass}
+            />
+          </div>
+          <div className="sm:w-56">
+            <label className={labelClass} htmlFor="mgmt-key-scope">{km('scope')}</label>
+            <select
+              id="mgmt-key-scope"
+              value={newKeyScope}
+              onChange={(e) => setNewKeyScope(e.target.value as McpApiKeyScope)}
+              className={inputClass}
+            >
+              <option value="MANAGEMENT_READ">{km('scopeRead')}</option>
+              {user?.role === 'ADMIN' && <option value="MANAGEMENT_ADMIN">{km('scopeAdmin')}</option>}
+            </select>
+          </div>
+          <Button onClick={handleGenerateMgmtKey} disabled={keyBusy || !newKeyName.trim()}>
+            {keyBusy ? km('generating') : km('generate')}
+          </Button>
+        </div>
+        {user?.role !== 'ADMIN' && (
+          <p className="text-xs text-[var(--text-3)]">{km('scopeAdminOnly')}</p>
+        )}
+
+        {/* Existing management keys */}
+        {mgmtKeys && mgmtKeys.length > 0 ? (
+          <ul className="divide-y divide-[var(--border)] rounded-[9px] border border-[var(--border)]">
+            {mgmtKeys.map((k) => (
+              <li key={k.id} className="flex items-center justify-between gap-3 px-3 py-2">
+                <div className="min-w-0">
+                  <p className="truncate text-sm text-[var(--text)]">{k.name}</p>
+                  <p className="text-xs text-[var(--text-3)]">
+                    {k.scope === 'MANAGEMENT_ADMIN' ? km('scopeAdmin') : km('scopeRead')}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  {k.isActive
+                    ? <StatusPill tone="success" dot="var(--ok)">{km('active')}</StatusPill>
+                    : <StatusPill tone="neutral">{km('revoked')}</StatusPill>}
+                  {k.isActive && (
+                    <Button variant="secondary" onClick={() => handleRevokeMgmtKey(k.id)}>{km('revoke')}</Button>
+                  )}
+                  <Button variant="danger" onClick={() => handleDeleteMgmtKey(k.id)}>{km('delete')}</Button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="text-sm text-[var(--text-3)]">{km('empty')}</p>
+        )}
+
+        {/* Per-server MCP tool keys live elsewhere */}
+        <p className="text-xs text-[var(--text-3)] pt-1 border-t border-[var(--border)]">
           {t.rich('apiKeys.body', {
             link: (chunks) => (
               <a href="/mcp-server" className="text-[var(--brand)] hover:underline">{chunks}</a>
@@ -711,6 +874,9 @@ export default function SettingsPage() {
                   autoComplete="off"
                 />
               </div>
+              {subscribedOrgs && (
+                <ActiveSubscriptionNotice workspaces={subscribedOrgs} returnPath="/settings?delete=1" />
+              )}
               {deleteError && !blockingOrgs && (
                 <p className="text-sm text-[var(--danger)]">{deleteError}</p>
               )}

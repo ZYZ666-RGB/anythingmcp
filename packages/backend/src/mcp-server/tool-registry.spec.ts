@@ -43,6 +43,16 @@ describe('ToolRegistry', () => {
       registry.registerTool(tool1);
       registry.registerTool(tool2);
       expect(registry.getToolCount()).toBe(1);
+      expect(registry.countByName('test_tool')).toBe(1);
+      expect(registry.getTool('test_tool')).toBe(tool2);
+    });
+
+    it('moves a tool re-registered under a new name out of the old name', () => {
+      registry.registerTool(makeTool({ id: 'tool-1', name: 'old_name' }));
+      registry.registerTool(makeTool({ id: 'tool-1', name: 'new_name' }));
+      expect(registry.countByName('old_name')).toBe(0);
+      expect(registry.getTool('old_name')).toBeUndefined();
+      expect(registry.getTool('new_name')?.id).toBe('tool-1');
     });
   });
 
@@ -159,4 +169,111 @@ describe('ToolRegistry', () => {
       expect(registry.countByName('shared')).toBe(1);
     });
   });
+
+  describe('organization and connector indexes', () => {
+    const t = (id: string, connectorId: string, organizationId: string) =>
+      makeTool({ id, connectorId, organizationId, name: id });
+
+    it('lists the same tools, in the same order, as filtering the whole registry', () => {
+      const tools = [t('a', 'c1', 'o1'), t('b', 'c2', 'o2'), t('c', 'c3', 'o1'), t('d', 'c1', 'o1')];
+      tools.forEach((x) => registry.registerTool(x));
+      expect(registry.getToolsForOrganization('o1')).toEqual(
+        registry.getAllTools().filter((x) => x.organizationId === 'o1'),
+      );
+      expect(registry.getToolsForConnectors(['c3', 'c1']).map((x) => x.id)).toEqual(['a', 'c', 'd']);
+      expect(registry.getToolsForOrganization('none')).toEqual([]);
+      expect(registry.getToolsForConnectors([])).toEqual([]);
+    });
+
+    it('follows a tool re-registered under another connector or organization', () => {
+      registry.registerTool(t('a', 'c1', 'o1'));
+      registry.registerTool(t('a', 'c2', 'o2'));
+      expect(registry.getToolsForOrganization('o1')).toEqual([]);
+      expect(registry.getToolsForConnectors(['c1'])).toEqual([]);
+      expect(registry.getToolsForOrganization('o2').map((x) => x.connectorId)).toEqual(['c2']);
+    });
+
+    it('keeps the other connectors under a shared name, in order, on unregister', () => {
+      const shared = (id: string, connectorId: string, organizationId: string) =>
+        makeTool({ id, connectorId, organizationId, name: 'shared' });
+      registry.registerTool(shared('a', 'c1', 'o1'));
+      registry.registerTool(shared('b', 'c2', 'o2'));
+      registry.registerTool(shared('c', 'c3', 'o3'));
+      registry.unregisterConnectorTools('c1');
+      expect(registry.countByName('shared')).toBe(2);
+      expect(registry.getTool('shared')?.id).toBe('b');
+      expect(registry.getToolForOrg('shared', 'o3')?.id).toBe('c');
+      expect(registry.getToolForOrg('shared', 'o1')).toBeUndefined();
+      registry.unregisterConnectorTools('c2');
+      registry.unregisterConnectorTools('c3');
+      expect(registry.countByName('shared')).toBe(0);
+      expect(registry.getTool('shared')).toBeUndefined();
+    });
+
+    it('counts tools per connector from the index', () => {
+      registry.registerTool(t('a', 'c1', 'o1'));
+      registry.registerTool(t('b', 'c1', 'o1'));
+      registry.registerTool(t('c', 'c2', 'o2'));
+      expect(registry.countByConnector()).toEqual(new Map([['c1', 2], ['c2', 1]]));
+      registry.unregisterConnectorTools('c1');
+      expect(registry.countByConnector()).toEqual(new Map([['c2', 1]]));
+    });
+
+    it('reloads one connector without walking the rest of the registry', () => {
+      // 200k tools in 20k connectors, about the Cloud registry's shape. A
+      // reload used to scan and re-index all of them: 100 reloads took
+      // seconds. Through the connector index they take milliseconds.
+      //
+      // A wall-clock bound flaked on busy CI runners, so the test checks the
+      // property itself: no reload iterates a registry-wide map (by id, by
+      // name, by organization, the order map) or the shared buckets the
+      // connector's tools sit in (20k tools per name, one organization's).
+      jest.spyOn((registry as any).logger, 'debug').mockImplementation(() => undefined);
+      for (let c = 0; c < 20_000; c++) {
+        for (let i = 0; i < 10; i++) {
+          registry.registerTool(
+            makeTool({ id: `t${c}-${i}`, connectorId: `c${c}`, organizationId: `o${c % 5000}`, name: `tool_${i}` }),
+          );
+        }
+      }
+      const mine = registry.getToolsForConnectors(['c42']);
+      const internals = registry as any;
+      const watched: Map<unknown, unknown>[] = [
+        internals.toolsById,
+        internals.toolsByName,
+        internals.toolsByOrg,
+        internals.order,
+        internals.toolsByOrg.get('o42'),
+        ...mine.map((tool) => internals.toolsByName.get(tool.name)),
+      ];
+      const walks: string[] = [];
+      for (const map of watched) {
+        for (const method of ['keys', 'values', 'entries', 'forEach', Symbol.iterator] as const) {
+          const original = (map as any)[method];
+          (map as any)[method] = function (this: Map<unknown, unknown>, ...args: unknown[]) {
+            walks.push(String(method));
+            return original.apply(this, args);
+          };
+        }
+      }
+      const started = Date.now();
+      for (let n = 0; n < 100; n++) {
+        registry.unregisterConnectorTools('c42');
+        mine.forEach((tool) => registry.registerTool(tool));
+      }
+      if (process.env.REGISTRY_BENCH) console.log(`100 reloads: ${Date.now() - started} ms`);
+      expect(walks).toEqual([]);
+      expect(registry.getToolCount()).toBe(200_000);
+      expect(registry.countByName('tool_3')).toBe(20_000);
+    });
+
+    it('drops a connector\'s tools from both indexes on unregister', () => {
+      registry.registerTool(t('a', 'c1', 'o1'));
+      registry.registerTool(t('b', 'c2', 'o1'));
+      registry.unregisterConnectorTools('c1');
+      expect(registry.getToolsForOrganization('o1').map((x) => x.id)).toEqual(['b']);
+      expect(registry.getToolsForConnectors(['c1', 'c2']).map((x) => x.id)).toEqual(['b']);
+    });
+  });
 });
+

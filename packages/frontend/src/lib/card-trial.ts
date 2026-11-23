@@ -1,5 +1,5 @@
+import type { PlanFit, PlanFits } from './api';
 import { storage } from './storage';
-import { safeRedirect } from './safe-redirect';
 import { startTrialPath } from './checkout-source';
 
 /**
@@ -27,8 +27,15 @@ export interface CloudPlan {
   monthly: number;
   /** EUR incl. VAT per year, on yearly billing. */
   yearly: number;
-  summary: string;
+  /** What the plan includes (the licence's maxConnectors / maxMcpServers / maxUsers). */
+  limits: PlanLimits;
   popular?: boolean;
+}
+
+export interface PlanLimits {
+  connectors: number;
+  mcpServers: number;
+  users: number;
 }
 
 /**
@@ -43,7 +50,7 @@ export const CLOUD_PLANS: readonly CloudPlan[] = [
     name: 'Starter',
     monthly: 19,
     yearly: 190,
-    summary: '5 connectors · 3 MCP servers · 1 user',
+    limits: { connectors: 5, mcpServers: 3, users: 1 },
     popular: true,
   },
   {
@@ -51,7 +58,7 @@ export const CLOUD_PLANS: readonly CloudPlan[] = [
     name: 'Team',
     monthly: 49,
     yearly: 490,
-    summary: '15 connectors · 10 MCP servers · up to 3 users',
+    limits: { connectors: 15, mcpServers: 10, users: 3 },
   },
 ];
 
@@ -63,19 +70,142 @@ export const CLOUD_PLANS: readonly CloudPlan[] = [
  */
 export const DEFAULT_SELECTION: PlanSelection = { plan: 'starter', period: 'monthly' };
 
+/** What a workspace already uses (GET /api/license/usage, current counts). */
+export type WorkspaceUsage = PlanLimits;
+
+/** The limits of `plan` that `usage` goes past, in the order connectors, MCP servers, users. */
+export function limitsExceeded(plan: CloudPlan, usage: WorkspaceUsage): (keyof PlanLimits)[] {
+  return (['connectors', 'mcpServers', 'users'] as const).filter((k) => usage[k] > plan.limits[k]);
+}
+
+/**
+ * The smallest plan the workspace fits in as set up today, or null when it
+ * goes past Team too (Enterprise is quoted, not checked out).
+ */
+export function smallestFittingPlan(usage: WorkspaceUsage): CloudPlanId | null {
+  return CLOUD_PLANS.find((p) => limitsExceeded(p, usage).length === 0)?.id ?? null;
+}
+
+/**
+ * The plan to preselect for a workspace: the one picked on the pricing page,
+ * unless the workspace has outgrown it (then the smallest that fits, Team when
+ * nothing does), keeping the picked billing period.
+ */
+export function selectionForUsage(picked: PlanSelection, usage: WorkspaceUsage | null): PlanSelection {
+  if (!usage || limitsExceeded(planById(picked.plan), usage).length === 0) return picked;
+  return { ...picked, plan: smallestFittingPlan(usage) ?? 'team' };
+}
+
+// ── What changes on a plan (GET /api/license/plan-fit) ──────────────────────
+
+/**
+ * One line of the "What changes with Starter" block: a message key under
+ * `planFit.lines` and its values. The words live in the messages (dashboard)
+ * or in the reactivation page's copy, so the same lines read in every UI
+ * language; numbers stay numbers so each language formats them itself.
+ */
+export type PlanFitLine =
+  | { key: 'connectors'; values: { paused: number; total: number; max: number } }
+  | { key: 'mcpServers' | 'mcpServersChoose'; values: { paused: number; total: number; max: number } }
+  | { key: 'users'; values: { plan: string; max: number; current: number } }
+  | {
+      key: 'fileSearch';
+      values: { maxFolders: number; maxFiles: number; folders: number; files: number };
+    }
+  | { key: 'fileSearchStorage'; values: { maxSize: string; size: string } }
+  | { key: 'codeTools'; values: { max: number; current: number } }
+  | { key: 'inline'; values: Record<string, never> };
+
+/**
+ * What `fit` changes for this workspace, most important first: connectors
+ * and MCP servers that would be paused, users above the plan, File Search
+ * above its limits, saved code tools, inline code. Empty when the workspace
+ * fits the plan. The "you choose which ones" hint is said once, on the first
+ * line that pauses something.
+ */
+export function planFitLines(fit: PlanFit | null | undefined): PlanFitLine[] {
+  if (!fit) return [];
+  const lines: PlanFitLine[] = [];
+  const { connectors, mcpServers, users, fileSearch, code } = fit;
+  if (connectors.over && connectors.max != null) {
+    lines.push({
+      key: 'connectors',
+      values: { paused: connectors.pause.length || connectors.current - connectors.max, total: connectors.current, max: connectors.max },
+    });
+  }
+  if (mcpServers.over && mcpServers.max != null) {
+    lines.push({
+      key: connectors.over ? 'mcpServers' : 'mcpServersChoose',
+      values: { paused: mcpServers.pause.length || mcpServers.current - mcpServers.max, total: mcpServers.current, max: mcpServers.max },
+    });
+  }
+  if (users.over && users.max != null) {
+    lines.push({ key: 'users', values: { plan: planById(fit.plan).name, max: users.max, current: users.current } });
+  }
+  const fs = fileSearch;
+  if ((fs.connectors.over || fs.files.over) && fs.connectors.max != null && fs.files.max != null) {
+    lines.push({
+      key: 'fileSearch',
+      values: { maxFolders: fs.connectors.max, maxFiles: fs.files.max, folders: fs.connectors.current, files: fs.files.current },
+    });
+  } else if (fs.bytes.over && fs.bytes.max != null) {
+    lines.push({ key: 'fileSearchStorage', values: { maxSize: formatStorage(fs.bytes.max), size: formatStorage(fs.bytes.current) } });
+  }
+  if (code.tools.over && code.tools.max != null) {
+    lines.push({ key: 'codeTools', values: { max: code.tools.max, current: code.tools.current } });
+  }
+  if (code.inlineInUse && !code.inlineIncluded) lines.push({ key: 'inline', values: {} });
+  return lines;
+}
+
+/** The plan-fit answer for one plan, or null when the server gave none. */
+export function fitFor(fits: PlanFits | null | undefined, plan: CloudPlanId): PlanFit | null {
+  const fit = fits?.[plan];
+  return fit && typeof fit === 'object' && typeof fit.fits === 'boolean' ? fit : null;
+}
+
+/**
+ * The plan to preselect once the plan fit is known: the picked plan when
+ * everything fits it, otherwise Team when the workspace fits Team (inline
+ * code or File Search can rule Starter out even with few connectors).
+ * Without an answer for the picked plan, nothing changes.
+ */
+export function selectionForFit(picked: PlanSelection, fits: PlanFits | null | undefined): PlanSelection {
+  const fit = fitFor(fits, picked.plan);
+  if (!fit || fit.fits || picked.plan === 'team') return picked;
+  const team = fitFor(fits, 'team');
+  return team?.fits ? { ...picked, plan: 'team' } : picked;
+}
+
+/** Storage as the plans state it (binary units): "500 MB", "2 GB", "1.2 GB". */
+export function formatStorage(bytes: number): string {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = Math.max(0, bytes);
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  const rounded = v >= 100 ? Math.round(v) : Math.round(v * 10) / 10;
+  const text = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+  return `${text} ${units[i]}`;
+}
+
 export function planById(id: CloudPlanId): CloudPlan {
   return CLOUD_PLANS.find((p) => p.id === id) ?? CLOUD_PLANS[1];
 }
 
-/** "19 €", "15.83 €" (non-breaking space, as on the invoice). */
-export function formatEur(amount: number): string {
-  const text = Number.isInteger(amount) ? String(amount) : amount.toFixed(2);
-  return `${text} €`;
-}
+/** UI languages that write decimals with a comma. Chinese and Japanese use a point, like English. */
+const COMMA_DECIMALS = new Set(['de', 'it', 'es', 'ru']);
 
-/** The price line for a plan: "49 €/month" or "490 €/year". */
-export function formatPlanPrice(plan: CloudPlan, period: BillingPeriod): string {
-  return period === 'yearly' ? `${formatEur(plan.yearly)}/year` : `${formatEur(plan.monthly)}/month`;
+/**
+ * "19 €", "15.83 €" (non-breaking space, as on the invoice). With a UI
+ * language that writes decimals with a comma: "15,83 €".
+ */
+export function formatEur(amount: number, locale?: string): string {
+  const text = Number.isInteger(amount) ? String(amount) : amount.toFixed(2);
+  const comma = COMMA_DECIMALS.has((locale ?? '').toLowerCase().split('-')[0]);
+  return `${comma ? text.replace('.', ',') : text} €`;
 }
 
 /** The monthly equivalent of a yearly price, rounded to the cent: 190 → 15.83. */
@@ -296,12 +426,14 @@ export function formatTrialEnd(
   if (!iso) return null;
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return null;
-  return d.toLocaleDateString(locale, {
+  const text = d.toLocaleDateString(locale, {
     day: 'numeric',
     month: style === 'long' ? 'long' : 'short',
     ...(style === 'long' && { year: 'numeric' }),
     ...(timeZone && { timeZone }),
   });
+  // Russian ends a full date with "г." (год): dropped, the date sits before a full stop.
+  return text.replace(/\s*г\.$/, '');
 }
 
 // ── Back to an AI client's authorization ────────────────────────────────────
@@ -315,18 +447,43 @@ export function formatTrialEnd(
  * all end on the same consent page.
  *
  * localStorage, not sessionStorage: Stripe can open in another tab on some
- * mobile browsers. Only the backend's own /auth/ pages qualify.
+ * mobile browsers. Only the backend's own /auth/ pages and /callback qualify.
+ *
+ * Since 22 Nov 2026 the offer is also reachable after approving, from the
+ * "One more step" page (`/start-trial?return=/callback`): never before
+ * Approve again (#842 halved the connections, #843).
  */
 const AUTH_RETURN_KEY = 'amcp_card_trial_return';
 export const AUTH_RETURN_TTL_MS = 30 * 60 * 1000;
 
-export function isAuthorizationPath(path: string | null | undefined): path is string {
-  return typeof path === 'string' && path.startsWith('/auth/') && safeRedirect(path, '') === path;
+/**
+ * The only places the card-trial detour may return to: the consent page and,
+ * after approving, `/callback`, which finishes an authorization paused on the
+ * backend's "One more step" page (its sign-in cookie lasts as long as the
+ * authorization). A fixed list: the value followed is always one of these
+ * constants, never the string that came in.
+ */
+export const AUTHORIZATION_RETURN_PATHS = ['/auth/login', '/callback'] as const;
+export type AuthorizationReturnPath = (typeof AUTHORIZATION_RETURN_PATHS)[number];
+
+/** The fixed return path `path` names, or null. */
+export function authorizationReturnPath(path: string | null | undefined): AuthorizationReturnPath | null {
+  return AUTHORIZATION_RETURN_PATHS.find((p) => p === path) ?? null;
+}
+
+export function isAuthorizationPath(path: string | null | undefined): path is AuthorizationReturnPath {
+  return authorizationReturnPath(path) !== null;
+}
+
+/** A backend page (not a Next route): needs a full navigation. */
+export function isBackendAuthorizationPath(path: string): boolean {
+  return isAuthorizationPath(path);
 }
 
 export function saveAuthorizationReturn(path: string, now: number = Date.now()): void {
-  if (!isAuthorizationPath(path)) return;
-  storage.set(AUTH_RETURN_KEY, JSON.stringify({ path, savedAt: now }));
+  const fixed = authorizationReturnPath(path);
+  if (!fixed) return;
+  storage.set(AUTH_RETURN_KEY, JSON.stringify({ path: fixed, savedAt: now }));
 }
 
 /** The consent page to go back to, or null when none is waiting (or it expired). */
@@ -336,13 +493,9 @@ export function readAuthorizationReturn(now: number = Date.now()): string | null
   try {
     const data = JSON.parse(raw);
     const savedAt = Number(data?.savedAt);
-    if (
-      isAuthorizationPath(data?.path) &&
-      Number.isFinite(savedAt) &&
-      savedAt <= now &&
-      now - savedAt <= AUTH_RETURN_TTL_MS
-    ) {
-      return data.path;
+    const fixed = authorizationReturnPath(data?.path);
+    if (fixed && Number.isFinite(savedAt) && savedAt <= now && now - savedAt <= AUTH_RETURN_TTL_MS) {
+      return fixed;
     }
   } catch {
     /* fall through */

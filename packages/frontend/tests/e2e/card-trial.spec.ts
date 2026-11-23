@@ -6,15 +6,19 @@ import {
   cardTrialEligible,
   decodePlanIntent,
   encodePlanIntent,
-  formatPlanPrice,
+  formatEur,
   formatTrialEnd,
+  limitsExceeded,
   parsePlanIntent,
   purchaseDestination,
+  selectionForUsage,
+  smallestFittingPlan,
   trialRunning,
   yearlyPerMonth,
   yearlySaving,
 } from '../../src/lib/card-trial';
 import { formatLocal, parseLocalPricing } from '../../src/lib/local-currency';
+import { pickPaywallLang } from '../../src/lib/paywall-lang';
 
 /**
  * The card trial on AnythingMCP Cloud: right after sign-up an admin on a
@@ -65,6 +69,31 @@ test.describe('card-trial helpers', () => {
     ).toBe(false);
   });
 
+  test('preselects the smallest plan the workspace fits in', () => {
+    const [starter, team] = CLOUD_PLANS;
+    const small = { connectors: 5, mcpServers: 3, users: 1 };
+    const sixConnectors = { connectors: 6, mcpServers: 1, users: 1 };
+    const fourServers = { connectors: 2, mcpServers: 4, users: 1 };
+    const twoUsers = { connectors: 1, mcpServers: 1, users: 2 };
+    const huge = { connectors: 16, mcpServers: 2, users: 4 };
+    expect(limitsExceeded(starter, small)).toEqual([]);
+    expect(limitsExceeded(starter, sixConnectors)).toEqual(['connectors']);
+    expect(limitsExceeded(starter, huge)).toEqual(['connectors', 'users']);
+    expect(limitsExceeded(team, huge)).toEqual(['connectors', 'users']);
+    expect(smallestFittingPlan(small)).toBe('starter');
+    for (const u of [sixConnectors, fourServers, twoUsers]) expect(smallestFittingPlan(u)).toBe('team');
+    expect(smallestFittingPlan(huge)).toBeNull();
+
+    const starterYearly = { plan: 'starter' as const, period: 'yearly' as const };
+    expect(selectionForUsage(starterYearly, small)).toEqual(starterYearly);
+    expect(selectionForUsage(starterYearly, null)).toEqual(starterYearly);
+    // Outgrown: Team, keeping the period; past Team too, still Team (Enterprise is quoted).
+    expect(selectionForUsage(starterYearly, twoUsers)).toEqual({ plan: 'team', period: 'yearly' });
+    expect(selectionForUsage(starterYearly, huge)).toEqual({ plan: 'team', period: 'yearly' });
+    // A plan picked on the pricing page that fits is kept.
+    expect(selectionForUsage({ plan: 'team', period: 'monthly' }, small)).toEqual({ plan: 'team', period: 'monthly' });
+  });
+
   test('a plan button clicked with a workspace leads to the purchase, not a sign-up', () => {
     const now = Date.UTC(2026, 9, 21, 12);
     const trial = (hours: number) => ({
@@ -99,17 +128,47 @@ test.describe('card-trial helpers', () => {
     expect(cardTrialDisplayEnd(null, now)).toBeNull();
   });
 
+  test('picks an extra paywall language only when the dashboard has none for the browser', () => {
+    // The first browser language either side has decides.
+    expect(pickPaywallLang('', ['es-MX', 'en'])).toBe('es');
+    expect(pickPaywallLang('', ['zh-CN'])).toBe('zh');
+    expect(pickPaywallLang('', ['ja'])).toBe('ja');
+    expect(pickPaywallLang('', ['fr-FR', 'ru-RU'])).toBe('ru');
+    expect(pickPaywallLang('', ['de-DE', 'es'])).toBeNull();
+    expect(pickPaywallLang('', ['en-US', 'es'])).toBeNull();
+    expect(pickPaywallLang('', ['fr-FR'])).toBeNull();
+    expect(pickPaywallLang('', [])).toBeNull();
+    // A language picked in the dashboard always wins.
+    expect(pickPaywallLang('a=1; amcp_locale=en', ['es-ES'])).toBeNull();
+    expect(pickPaywallLang('amcp_locale=it', ['ru'])).toBeNull();
+    // A cookie that is not a dashboard language is ignored.
+    expect(pickPaywallLang('amcp_locale=xx', ['es-ES'])).toBe('es');
+  });
+
   test('formats the trial end and the prices', () => {
     expect(formatTrialEnd('2026-10-07T09:00:00.000Z', 'long', 'UTC')).toBe('7 October 2026');
     expect(formatTrialEnd('2026-10-07T09:00:00.000Z', 'short', 'UTC')).toBe('7 Oct');
     // A translated page passes its UI language.
     expect(formatTrialEnd('2026-10-07T09:00:00.000Z', 'long', 'UTC', 'de')).toBe('7. Oktober 2026');
     expect(formatTrialEnd('2026-10-07T09:00:00.000Z', 'long', 'UTC', 'it')).toBe('7 ottobre 2026');
+    expect(formatTrialEnd('2026-10-07T09:00:00.000Z', 'long', 'UTC', 'es')).toBe('7 de octubre de 2026');
+    // Without the Russian "г." after the year.
+    expect(formatTrialEnd('2026-10-07T09:00:00.000Z', 'long', 'UTC', 'ru')).toBe('7 октября 2026');
+    expect(formatTrialEnd('2026-10-07T09:00:00.000Z', 'long', 'UTC', 'ja')).toBe('2026年10月7日');
     expect(formatTrialEnd('nonsense')).toBeNull();
 
     const [starter, team] = CLOUD_PLANS;
-    expect(formatPlanPrice(team, 'monthly')).toBe('49 €/month');
-    expect(formatPlanPrice(starter, 'yearly')).toBe('190 €/year');
+    expect(formatEur(team.monthly)).toBe('49 €');
+    expect(formatEur(15.83)).toBe('15.83 €');
+    // German and Italian write the decimals with a comma.
+    expect(formatEur(15.83, 'de')).toBe('15,83 €');
+    expect(formatEur(15.83, 'it')).toBe('15,83 €');
+    expect(formatEur(190, 'de')).toBe('190 €');
+    expect(formatEur(15.83, 'es')).toBe('15,83 €');
+    expect(formatEur(15.83, 'ru')).toBe('15,83 €');
+    // Chinese and Japanese write a point, like English.
+    expect(formatEur(15.83, 'zh')).toBe('15.83 €');
+    expect(formatEur(15.83, 'ja')).toBe('15.83 €');
     expect(yearlyPerMonth(starter)).toBe(15.83);
     expect(yearlyPerMonth(team)).toBe(40.83);
     expect(CLOUD_PLANS.map(yearlySaving)).toEqual([38, 98]);
@@ -142,10 +201,18 @@ async function cloudSession(
     priceEstimate?: Record<string, unknown>;
     /** No session in the browser; signing in with the form starts one. */
     signedOut?: boolean;
+    /** GET /license/usage: current counts of the workspace. */
+    usage?: { connectors: number; mcpServers: number; users: number };
+    /** GET /organizations/mine: the workspaces the user belongs to. */
+    orgs?: { id: string; name: string; role: string; joinedAt: string }[];
+    /** GET /license/wall: the ended-trial wall's variant and the workspace's numbers. */
+    wall?: Record<string, unknown> | null;
   } = {},
 ) {
   const user = opts.user ?? ADMIN;
   const posted: unknown[] = [];
+  const switched: unknown[] = [];
+  const events: Array<{ event: string; metadata?: Record<string, unknown> }> = [];
   const origin = test.info().project.use.baseURL ?? 'http://localhost:3100';
   if (!opts.signedOut) await page.context().addCookies([{ name: 'amcp_token', value: 't', url: origin }]);
   await page.addInitScript(
@@ -167,6 +234,10 @@ async function cloudSession(
       return json({ deploymentMode: 'cloud', mcpAuthMode: 'oauth2', hasUsers: true, registrationEnabled: true, ssoProviders: [] });
     }
     if (p === '/api/price-estimate') return json(opts.priceEstimate ?? { currency: null, vat: true });
+    if (p.endsWith('/product-events') && req.method() === 'POST') {
+      events.push(req.postDataJSON());
+      return route.fulfill({ status: 204 });
+    }
     if (p.endsWith('/auth/login') && req.method() === 'POST') return json({ accessToken: 't', user });
     if (p.endsWith('/license/checkout-link') && req.method() === 'POST') {
       const body = req.postDataJSON();
@@ -188,7 +259,18 @@ async function cloudSession(
       );
     }
     if (p.endsWith('/license/usage')) {
-      return json({ plan: 'trial', connectors: { current: 0, max: 2, isOver: false }, mcpServers: { current: 0, max: 2, isOver: false }, users: { current: 1, max: 1, isOver: false }, isOverAny: false });
+      const u = opts.usage ?? { connectors: 0, mcpServers: 0, users: 1 };
+      return json({ plan: 'trial', connectors: { current: u.connectors, max: 2, isOver: false }, mcpServers: { current: u.mcpServers, max: 2, isOver: false }, users: { current: u.users, max: 1, isOver: false }, isOverAny: false });
+    }
+    if (p.endsWith('/license/wall')) return json({ wall: opts.wall ?? null });
+    if (p.endsWith('/organizations/mine')) return json(opts.orgs ?? [{ id: 'o1', name: 'Main', role: 'ADMIN', joinedAt: '2026-10-01' }]);
+    if (p.endsWith('/organizations/current')) {
+      const current = (opts.orgs ?? []).find((o) => o.id === user.organizationId);
+      return json({ id: user.organizationId, name: current?.name ?? 'Main', createdAt: '2026-10-01' });
+    }
+    if (p.endsWith('/organizations/switch') && req.method() === 'POST') {
+      switched.push(req.postDataJSON());
+      return json({ error: 'stubbed' }, 500);
     }
     if (p.endsWith('/adapters/starter-pack')) return json([]);
     if (p.endsWith('/connectors') || p.endsWith('/adapters')) return json([]);
@@ -197,7 +279,7 @@ async function cloudSession(
   await page.route('https://checkout.example.test/**', (route) =>
     route.fulfill({ status: 200, contentType: 'text/html', body: '<h1>Stripe Checkout stub</h1>' }),
   );
-  return { posted };
+  return { posted, switched, events };
 }
 
 test.describe('local currency helpers', () => {
@@ -265,13 +347,15 @@ test.describe('card-trial offer (cloud)', () => {
     // The real end date, never a length the user may no longer have.
     await expect(page.getByText(/^Free until \d{1,2} \w+ \d{4}$/)).toBeVisible();
     await expect(page.getByText(/7-day/)).toHaveCount(0);
-    await expect(page.getByText('€0 today.')).toBeVisible();
+    await expect(page.getByTestId('payment-methods')).toHaveText('€0 today · card, PayPal and other methods');
     // Starter is preselected without an intent from the pricing page.
     await expect(page.getByRole('radio', { name: /Starter/ })).toHaveAttribute('aria-checked', 'true');
 
-    // The skip is a small link, not a button styled as one.
+    // Going on without payment details is a real button, in the corner and under the plans.
+    await expect(page.getByRole('button', { name: 'Try free without payment details' })).toBeVisible();
+    await expect(page.getByText('Without payment details the trial has a lower connector limit.', { exact: false })).toBeVisible();
     const skip = page.getByRole('button', { name: 'Continue without payment details' });
-    await expect(skip).toHaveClass(/text-xs/);
+    await expect(skip).toHaveClass(/border/);
     await skip.click();
 
     // On to the normal onboarding, and not offered again.
@@ -279,6 +363,103 @@ test.describe('card-trial offer (cloud)', () => {
     expect(await page.evaluate(() => localStorage.getItem('amcp_card_trial_prompt:u1'))).toBe('skipped');
     await page.goto('/');
     await expect(page).toHaveURL(/\/welcome$/, { timeout: 15_000 });
+  });
+
+  test('on a phone the plans and both ways on are on the first screen', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await cloudSession(page, { seed: { 'amcp_card_trial_prompt:u1': 'shown' } });
+    await page.goto('/start-trial?source=signup_prompt');
+    await expect(page.getByRole('heading', { name: 'Your free trial' })).toBeVisible();
+    // One sentence instead of the paragraph about the connector limit.
+    await expect(page.getByTestId('trial-intro-short')).toBeVisible();
+    await expect(page.getByText(/connector limit, and you can add/)).toBeHidden();
+    await expect(page.getByTestId('skip-corner')).toBeInViewport();
+    await expect(page.getByRole('radio', { name: /Starter/ })).toBeInViewport();
+  });
+
+  test('opened after approving an AI client, skipping finishes that authorization through /callback', async ({ page }) => {
+    await cloudSession(page, { seed: { 'amcp_card_trial_prompt:u1': 'shown' } });
+    let callbackHit = false;
+    await page.route('**/callback', (route) => {
+      callbackHit = true;
+      return route.fulfill({ status: 200, contentType: 'text/html', body: '<h1>back to the client</h1>' });
+    });
+    await page.goto('/start-trial?source=post_approve&return=%2Fcallback');
+    await expect(page.getByText('Either way, you go straight back')).toBeVisible();
+    await page.getByRole('button', { name: 'Try free without payment details' }).click();
+    await expect.poll(() => callbackHit).toBe(true);
+    await expect(page).toHaveURL(/\/callback$/);
+    // Spent: a later visit does not send anyone to /callback again.
+    expect(await page.evaluate(() => localStorage.getItem('amcp_card_trial_return'))).toBeNull();
+  });
+
+  test('a return address that is not an authorization is ignored', async ({ page }) => {
+    await cloudSession(page, { seed: { 'amcp_card_trial_prompt:u1': 'shown' } });
+    await page.goto('/start-trial?source=post_approve&return=https%3A%2F%2Fevil.example%2F');
+    await expect(page.getByRole('heading', { name: 'Your free trial' })).toBeVisible();
+    expect(await page.evaluate(() => localStorage.getItem('amcp_card_trial_return'))).toBeNull();
+  });
+
+  // The offer is not for everyone who opens it after approving an AI client.
+  // Those exits used to end on the dashboard, with the client never connected:
+  // `?return=` was only read once the offer was about to be shown.
+  for (const [who, opts, failLicence] of [
+    ['a workspace that already has a plan', { license: { plan: 'cloud_starter', status: 'active', expiresAt: null, features: {} } }, false],
+    ['a trial that has ended', { license: { plan: 'trial', status: 'expired', expiresAt: null, trialDaysLeft: 0, features: {} } }, false],
+    ['someone who is not an admin', { user: { ...ADMIN, role: 'EDITOR' } }, false],
+    ['a licence that cannot be read', {}, true],
+  ] as const) {
+    test(`opened after approving an AI client by ${who}, it goes on to /callback, not to the dashboard`, async ({ page }) => {
+      await cloudSession(page, { seed: { 'amcp_card_trial_prompt:u1': 'shown' }, ...opts });
+      if (failLicence) {
+        await page.route('**/api/license/status', (route) => route.fulfill({ status: 500, json: { message: 'Internal Server Error' } }));
+      }
+      let callbackHits = 0;
+      await page.route('**/callback', (route) => {
+        callbackHits += 1;
+        return route.fulfill({ status: 200, contentType: 'text/html', body: '<h1>back to the client</h1>' });
+      });
+      await page.goto('/start-trial?source=post_approve&return=%2Fcallback');
+      await expect(page).toHaveURL(/\/callback$/, { timeout: 15_000 });
+      await expect(page.getByRole('heading', { name: 'back to the client' })).toBeVisible();
+      // Followed once, and spent: nothing sends a later visit there again.
+      expect(callbackHits).toBe(1);
+      expect(await page.evaluate(() => localStorage.getItem('amcp_card_trial_return'))).toBeNull();
+      expect(new URL(page.url()).pathname).toBe('/callback');
+    });
+  }
+
+  test('without a return address, a workspace the offer is not for goes to the dashboard as before', async ({ page }) => {
+    await cloudSession(page, {
+      seed: { 'amcp_card_trial_prompt:u1': 'shown' },
+      license: { plan: 'cloud_starter', status: 'active', expiresAt: null, features: {} },
+    });
+    let callbackHit = false;
+    await page.route('**/callback', (route) => {
+      callbackHit = true;
+      return route.fulfill({ status: 200, contentType: 'text/html', body: '<h1>back to the client</h1>' });
+    });
+    await page.goto('/start-trial?source=post_approve');
+    // The dashboard, which sends a new workspace on to its welcome page.
+    await expect(page).toHaveURL(/\/(welcome)?$/, { timeout: 15_000 });
+    expect(callbackHit).toBe(false);
+    expect(await page.evaluate(() => localStorage.getItem('amcp_card_trial_return'))).toBeNull();
+  });
+
+  test('a signed-out visitor keeps the return address through the sign-in', async ({ page }) => {
+    await cloudSession(page, { signedOut: true });
+    await page.goto('/start-trial?source=post_approve&return=%2Fcallback');
+    await expect(page).toHaveURL(
+      /\/login\?redirect=%2Fstart-trial%3Fsource%3Dpost_approve%26return%3D%252Fcallback$/,
+      { timeout: 15_000 },
+    );
+  });
+
+  test('a skip from the button under the plans counts like the corner one', async ({ page }) => {
+    await cloudSession(page, { seed: { 'amcp_card_trial_prompt:u1': 'shown' } });
+    await page.goto('/start-trial?source=signup_prompt');
+    await page.getByRole('button', { name: 'Try free without payment details' }).click();
+    await expect.poll(() => page.evaluate(() => localStorage.getItem('amcp_card_trial_prompt:u1'))).toBe('skipped');
   });
 
   test('Start free trial opens Checkout for the chosen plan with a trial', async ({ page }) => {
@@ -368,10 +549,13 @@ test.describe('card-trial entry points (cloud)', () => {
     expect(posted).toEqual([{ plan: 'team', billingPeriod: 'monthly', trial: true, source: 'trial_banner' }]);
   });
 
+  const ENDED = { plan: 'trial', status: 'active', expiresAt: new Date(Date.now() - 86_400_000).toISOString(), trialDaysLeft: 0 };
+
   test('after the trial, an admin buys the chosen plan from the licence wall, without a trial', async ({ page }) => {
     const { posted } = await cloudSession(page, {
       seed: SHOWN,
-      license: { plan: 'trial', status: 'active', expiresAt: new Date(Date.now() - 86_400_000).toISOString(), trialDaysLeft: 0 },
+      license: ENDED,
+      wall: { variant: 'control', recap: null },
     });
     await page.goto('/connectors');
     await expect(page.getByRole('heading', { name: 'Your Trial Has Expired' })).toBeVisible({ timeout: 15_000 });
@@ -380,6 +564,93 @@ test.describe('card-trial entry points (cloud)', () => {
     await page.getByRole('button', { name: 'Subscribe to Starter' }).click();
     await expect(page).toHaveURL('https://checkout.example.test/start?intent=i1');
     expect(posted).toEqual([{ plan: 'starter', billingPeriod: 'monthly', trial: false, source: 'trial_ended_wall' }]);
+  });
+
+  test('the ended-trial wall shows the trust line without usage numbers, and sells in place', async ({ page }) => {
+    const { posted } = await cloudSession(page, {
+      seed: SHOWN,
+      license: ENDED,
+      wall: {
+        variant: 'trust',
+        recap: { successfulCalls: 214, connectors: ['Etsy', 'Telegram'], client: 'Claude', blockedSinceEnd: true },
+      },
+    });
+    await page.goto('/connectors');
+    await expect(page.getByRole('heading', { name: 'Keep your AI connected to your apps' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText('Subscribe and Claude keeps working with your connectors.', { exact: false })).toBeVisible();
+    // No usage recap: no call count, no connector names.
+    await expect(page.getByTestId('wall-recap')).toHaveCount(0);
+    await expect(page.getByText(/successful call/)).toHaveCount(0);
+    await expect(page.getByText(/Etsy and Telegram/)).toHaveCount(0);
+    const trust = page.getByTestId('wall-trust');
+    await expect(trust).toContainText('Cancel any time');
+    await expect(trust).toContainText('Secure payment by Stripe');
+    await expect(trust).toContainText('Hosted in Frankfurt');
+    await expect(trust).toContainText('Listed in the Claude Directory');
+    // A Claude workspace sees Claude's listing only.
+    await expect(trust).not.toContainText('ChatGPT');
+    if (process.env.WALL_SHOT) {
+      await page.waitForTimeout(800);
+      await page.screenshot({ path: `${process.env.WALL_SHOT}/wall-trust-desktop.png` });
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.waitForTimeout(400);
+      await page.screenshot({ path: `${process.env.WALL_SHOT}/wall-trust-mobile.png`, fullPage: true });
+      await page.setViewportSize({ width: 1280, height: 800 });
+    }
+    await page.getByRole('button', { name: 'Subscribe to Starter' }).click();
+    await expect(page).toHaveURL('https://checkout.example.test/start?intent=i1');
+    expect(posted).toEqual([{ plan: 'starter', billingPeriod: 'monthly', trial: false, source: 'trial_ended_wall' }]);
+  });
+
+  test('the ended-trial wall reports its clicks as paywall_action', async ({ page }) => {
+    const { events } = await cloudSession(page, {
+      seed: SHOWN,
+      license: ENDED,
+      wall: { variant: 'trust', recap: null },
+    });
+    await page.goto('/connectors');
+    await expect(page.getByRole('heading', { name: 'Keep your AI connected to your apps' })).toBeVisible({ timeout: 15_000 });
+    await page.getByRole('radio', { name: /Team/ }).click();
+    await page.getByRole('radio', { name: /Yearly/ }).click();
+    await page.getByRole('button', { name: 'Subscribe to Team' }).click();
+    await expect(page).toHaveURL(/checkout\.example\.test/);
+    const actions = events.filter((e) => e.event === 'paywall_action').map((e) => e.metadata);
+    const base = { source: 'trial_ended_wall', variant: 'trust', device: 'desktop' };
+    expect(actions).toEqual([
+      { ...base, action: 'shown', plan: 'starter', period: 'monthly' },
+      { ...base, action: 'plan_selected', plan: 'team', period: 'monthly' },
+      { ...base, action: 'period_selected', plan: 'team', period: 'yearly' },
+      { ...base, action: 'subscribe_clicked', plan: 'team', period: 'yearly' },
+    ]);
+  });
+
+  test('a ChatGPT workspace sees the ChatGPT Plugin Directory on the wall, not the Claude Directory', async ({ page }) => {
+    await cloudSession(page, {
+      seed: SHOWN,
+      license: ENDED,
+      wall: {
+        variant: 'trust',
+        recap: { successfulCalls: 12, connectors: ['PostgreSQL'], client: 'ChatGPT', blockedSinceEnd: false },
+      },
+    });
+    await page.goto('/connectors');
+    const trust = page.getByTestId('wall-trust');
+    await expect(trust).toContainText('Listed in the ChatGPT Plugin Directory', { timeout: 15_000 });
+    await expect(trust).not.toContainText('Claude Directory');
+  });
+
+  test('a workspace with no known AI client gets the generic wording and both listings', async ({ page }) => {
+    await cloudSession(page, { seed: SHOWN, license: ENDED, wall: { variant: 'trust', recap: null } });
+    await page.goto('/connectors');
+    await expect(page.getByRole('heading', { name: 'Keep your AI connected to your apps' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText('Subscribe and your AI keeps working with your connectors.', { exact: false })).toBeVisible();
+    await expect(page.getByTestId('wall-recap')).toHaveCount(0);
+    await expect(page.getByTestId('wall-trust')).toBeVisible();
+    // No client known: both listings.
+    await expect(page.getByTestId('wall-trust')).toContainText(
+      'Listed in the Claude and ChatGPT directories',
+    );
+    if (process.env.WALL_SHOT) await page.screenshot({ path: `${process.env.WALL_SHOT}/wall-trust-norecap.png` });
   });
 
   test('a non-admin keeps the plain pricing link in the banner', async ({ page }) => {
@@ -422,7 +693,8 @@ test.describe('an address that had a subscription (cloud)', () => {
     await expect(page.getByText('Your plan starts today and is billed today.')).toBeVisible();
     await expect(page.getByText(/Starter, 19\s€\/month, billed today and then every month\./)).toBeVisible();
     await expect(page.getByText('€0 today', { exact: false })).toHaveCount(0);
-    await expect(page.getByText(/free trial with card/i)).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Start free trial' })).toHaveCount(0);
+    await expect(page.getByTestId('payment-methods')).toHaveText('Card, PayPal and other methods');
 
     await page.getByRole('button', { name: 'Continue to checkout' }).click();
     await expect(page).toHaveURL('https://checkout.example.test/start?intent=i1');
@@ -435,7 +707,7 @@ test.describe('an address that had a subscription (cloud)', () => {
       checkout: () => ({ status: 200, body: { url: 'https://checkout.example.test/start?intent=i9', trial: false } }),
     });
     await page.goto('/start-trial');
-    await page.getByRole('button', { name: 'Start free trial with card' }).click({ timeout: 15_000 });
+    await page.getByRole('button', { name: 'Start free trial' }).click({ timeout: 15_000 });
     await expect(page.getByRole('status')).toContainText('the checkout will charge 19 € today');
     await expect(page).toHaveURL(/\/start-trial$/);
     await expect(page.getByText('Your plan starts today and is billed today.')).toBeVisible();
@@ -476,7 +748,7 @@ test.describe('a plan button clicked by someone already signed in (cloud)', () =
     await expect(page.getByRole('radio', { name: 'Yearly' })).toHaveAttribute('aria-checked', 'true');
     await expect(page.getByText('Create your free account')).toHaveCount(0);
 
-    await page.getByRole('button', { name: 'Start free trial with card' }).click();
+    await page.getByRole('button', { name: 'Start free trial' }).click();
     await expect(page).toHaveURL('https://checkout.example.test/start?intent=i1');
     expect(posted).toEqual([{ plan: 'team', billingPeriod: 'yearly', trial: true, source: 'pricing_signed_in' }]);
   });
@@ -490,7 +762,7 @@ test.describe('a plan button clicked by someone already signed in (cloud)', () =
     await page.goto(REGISTER_STARTER);
     await expect(page).toHaveURL(/\/start-trial\?source=pricing_signed_in$/, { timeout: 15_000 });
     await expect(page.getByRole('heading', { name: 'Keep your workspace running' })).toBeVisible();
-    await expect(page.getByText(/too soon to carry on with a card trial/)).toBeVisible();
+    await expect(page.getByText(/too soon to add a payment method and keep trying for free/)).toBeVisible();
     await expect(page.getByText('Your plan starts today and is billed today.')).toBeVisible();
     await expect(page.getByText(/had an AnythingMCP subscription before/)).toHaveCount(0);
     await expect(page.getByText('€0 today', { exact: false })).toHaveCount(0);
@@ -500,13 +772,55 @@ test.describe('a plan button clicked by someone already signed in (cloud)', () =
     expect(posted).toEqual([{ plan: 'starter', billingPeriod: 'monthly', trial: false, source: 'pricing_signed_in' }]);
   });
 
+  test('the licence wall preselects Team for a workspace that outgrew Starter, and says why', async ({ page }) => {
+    const { posted } = await cloudSession(page, {
+      seed: SHOWN,
+      license: { plan: 'trial', status: 'active', expiresAt: new Date(Date.now() - 86_400_000).toISOString(), trialDaysLeft: 0 },
+      usage: { connectors: 7, mcpServers: 2, users: 2 },
+    });
+    await page.goto('/connectors');
+    await expect(page.getByRole('heading', { name: 'Keep your AI connected to your apps' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('radio', { name: /Team/ })).toHaveAttribute('aria-checked', 'true');
+    await expect(page.getByRole('radio', { name: /Starter/ })).toContainText('This workspace has 7 connectors, 2 users');
+    await expect(page.getByRole('radio', { name: /Team/ })).not.toContainText('This workspace has');
+    await page.getByRole('button', { name: 'Subscribe to Team' }).click();
+    await expect(page).toHaveURL('https://checkout.example.test/start?intent=i1');
+    expect(posted).toEqual([{ plan: 'team', billingPeriod: 'monthly', trial: false, source: 'trial_ended_wall' }]);
+  });
+
+  test('the licence wall lets someone in several workspaces switch to another one', async ({ page }) => {
+    const { switched } = await cloudSession(page, {
+      seed: SHOWN,
+      license: { plan: 'trial', status: 'active', expiresAt: new Date(Date.now() - 86_400_000).toISOString(), trialDaysLeft: 0 },
+      orgs: [
+        { id: 'o1', name: 'test', role: 'ADMIN', joinedAt: '2026-10-20' },
+        { id: 'o2', name: 'Acme', role: 'ADMIN', joinedAt: '2026-09-01' },
+      ],
+    });
+    await page.goto('/connectors');
+    await expect(page.getByRole('heading', { name: 'Keep your AI connected to your apps' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText('Switch to another workspace')).toBeVisible();
+    await page.getByRole('button', { name: /Acme/ }).click();
+    await expect.poll(() => switched).toEqual([{ organizationId: 'o2' }]);
+  });
+
+  test('the licence wall shows no switch to someone in a single workspace', async ({ page }) => {
+    await cloudSession(page, {
+      seed: SHOWN,
+      license: { plan: 'trial', status: 'active', expiresAt: new Date(Date.now() - 86_400_000).toISOString(), trialDaysLeft: 0 },
+    });
+    await page.goto('/connectors');
+    await expect(page.getByRole('heading', { name: 'Keep your AI connected to your apps' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText('Switch to another workspace')).toHaveCount(0);
+  });
+
   test('an ended trial lands on the licence wall with the clicked plan preselected', async ({ page }) => {
     await cloudSession(page, {
       seed: SHOWN,
       license: { plan: 'trial', status: 'active', expiresAt: new Date(Date.now() - 86_400_000).toISOString(), trialDaysLeft: 0 },
     });
     await page.goto('/login?mode=register&plan=cloud_team&period=monthly');
-    await expect(page.getByRole('heading', { name: 'Your Trial Has Expired' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('heading', { name: 'Keep your AI connected to your apps' })).toBeVisible({ timeout: 15_000 });
     await expect(page.getByRole('radio', { name: /Team/ })).toHaveAttribute('aria-checked', 'true');
   });
 
@@ -544,3 +858,269 @@ test.describe('a plan button clicked by someone already signed in (cloud)', () =
     await expect(page.getByText('Create your free account')).toBeVisible({ timeout: 15_000 });
   });
 });
+
+test.describe('the paywall in the UI language (cloud)', () => {
+  const SHOWN = { 'amcp_card_trial_prompt:u1': 'shown' };
+  const ENDED = { plan: 'trial', status: 'active', expiresAt: new Date(Date.now() - 86_400_000).toISOString(), trialDaysLeft: 0 };
+  const shot = async (page: Page, name: string) => {
+    if (!process.env.WALL_SHOT) return;
+    await page.waitForTimeout(800);
+    await page.screenshot({ path: `${process.env.WALL_SHOT}/${name}-desktop.png` });
+    for (const width of [390, 360, 320]) {
+      await page.setViewportSize({ width, height: 844 });
+      await page.waitForTimeout(400);
+      await page.screenshot({ path: `${process.env.WALL_SHOT}/${name}-mobile-${width}.png`, fullPage: true });
+    }
+    await page.setViewportSize({ width: 1280, height: 800 });
+  };
+
+  test.describe('de-DE', () => {
+    test.use({ locale: 'de-DE' });
+
+    test('the ended-trial wall is German throughout, plans and buttons included', async ({ page }) => {
+      const { posted } = await cloudSession(page, {
+        seed: SHOWN,
+        license: ENDED,
+        wall: { variant: 'trust', recap: { successfulCalls: 3, connectors: ['Telegram'], client: 'Claude', blockedSinceEnd: true } },
+      });
+      await page.goto('/connectors');
+      await expect(page.getByRole('heading', { name: 'Halten Sie Ihre KI mit Ihren Apps verbunden' })).toBeVisible({ timeout: 15_000 });
+      await expect(page.getByRole('radio', { name: 'Monatlich' })).toBeVisible();
+      await expect(page.getByRole('radio', { name: /Jährlich · 2 Monate gratis/ })).toBeVisible();
+      const starter = page.getByRole('radio', { name: /Starter/ });
+      await expect(starter).toContainText('Am beliebtesten');
+      await expect(starter).toContainText('5 Connectors · 3 MCP-Server · 1 Nutzer');
+      await expect(starter).toContainText('19 €/Monat');
+      await expect(page.getByRole('radio', { name: /Team/ })).toContainText('15 Connectors · 10 MCP-Server · bis zu 3 Nutzer');
+      await expect(page.getByText('Preise in EUR, inkl. MwSt.')).toBeVisible();
+      await expect(page.getByRole('link', { name: 'Enterprise anfragen' })).toBeVisible();
+      await expect(page.getByRole('link', { name: 'Tarife vergleichen' })).toBeVisible();
+      await expect(page.getByRole('link', { name: 'Lizenzschlüssel eingeben' })).toBeVisible();
+      await expect(page.getByRole('link', { name: 'Konto löschen' })).toBeVisible();
+      // Nothing of the English picker is left.
+      for (const english of ['Most popular', 'Monthly', 'Prices in EUR', 'Compare plans', 'Ask about Enterprise']) {
+        await expect(page.getByText(english, { exact: false })).toHaveCount(0);
+      }
+      await shot(page, 'wall-de');
+      // Yearly: the price per year, and its monthly equivalent with a comma.
+      await page.getByRole('radio', { name: /Jährlich/ }).click();
+      await expect(starter).toContainText('190 €/Jahr');
+      await expect(starter).toContainText('≈ 15,83 €/Monat');
+      await page.getByRole('radio', { name: 'Monatlich' }).click();
+      await page.getByRole('button', { name: 'Starter abonnieren' }).click();
+      await expect(page).toHaveURL('https://checkout.example.test/start?intent=i1');
+      expect(posted).toEqual([{ plan: 'starter', billingPeriod: 'monthly', trial: false, source: 'trial_ended_wall' }]);
+    });
+
+    test('the earlier wall (control group) is German too', async ({ page }) => {
+      await cloudSession(page, { seed: SHOWN, license: ENDED, wall: { variant: 'control', recap: null } });
+      await page.goto('/connectors');
+      await expect(page.getByRole('heading', { name: 'Ihre Testphase ist abgelaufen' })).toBeVisible({ timeout: 15_000 });
+      await expect(page.getByRole('button', { name: 'Starter abonnieren' })).toBeVisible();
+      await shot(page, 'wall-control-de');
+    });
+
+    test('a workspace that outgrew Starter is told so in German', async ({ page }) => {
+      await cloudSession(page, {
+        seed: SHOWN,
+        license: ENDED,
+        wall: { variant: 'trust', recap: null },
+        usage: { connectors: 7, mcpServers: 1, users: 2 },
+      });
+      await page.goto('/connectors');
+      await expect(page.getByRole('radio', { name: /Starter/ })).toContainText('Dieser Workspace hat 7 Connectors, 2 Nutzer', { timeout: 15_000 });
+      await expect(page.getByRole('button', { name: 'Team abonnieren' })).toBeVisible();
+      await shot(page, 'wall-outgrown-de');
+    });
+
+    test('the card-trial page shows the plans in German', async ({ page }) => {
+      await cloudSession(page);
+      await page.goto('/start-trial');
+      const starter = page.getByRole('radio', { name: /Starter/ });
+      await expect(starter).toContainText('Am beliebtesten', { timeout: 15_000 });
+      await expect(starter).toContainText('5 Connectors · 3 MCP-Server · 1 Nutzer');
+      await expect(page.getByText('Preise in EUR, inkl. MwSt.')).toBeVisible();
+      await expect(page.getByText('Most popular')).toHaveCount(0);
+      await shot(page, 'start-trial-de');
+    });
+
+    test('the trial banner counts down and offers the card in German', async ({ page }) => {
+      await cloudSession(page, { seed: SHOWN });
+      await page.goto('/connectors');
+      await expect(page.getByText('Testphase: noch 5 Tage. Sie enthält alles aus Team.')).toBeVisible({ timeout: 15_000 });
+      await expect(page.getByRole('button', { name: /Zahlungsmethode hinterlegen: keine Abbuchung vor dem \d+\. \S+/ })).toBeVisible();
+      await shot(page, 'banner-de');
+    });
+  });
+
+  test.describe('it-IT', () => {
+    test.use({ locale: 'it-IT' });
+
+    test('the ended-trial wall is Italian throughout', async ({ page }) => {
+      await cloudSession(page, { seed: SHOWN, license: ENDED, wall: { variant: 'trust', recap: null } });
+      await page.goto('/connectors');
+      await expect(page.getByRole('heading', { name: 'Tieni la tua AI collegata alle tue app' })).toBeVisible({ timeout: 15_000 });
+      const starter = page.getByRole('radio', { name: /Starter/ });
+      await expect(starter).toContainText('Il più scelto');
+      await expect(starter).toContainText('5 connettori · 3 server MCP · 1 utente');
+      await expect(starter).toContainText('19 €/mese');
+      await expect(page.getByText('Prezzi in EUR, IVA inclusa.')).toBeVisible();
+      await expect(page.getByRole('button', { name: 'Abbonati a Starter' })).toBeVisible();
+      await expect(page.getByRole('link', { name: 'Confronta i piani' })).toBeVisible();
+      await expect(page.getByText('Most popular')).toHaveCount(0);
+      await shot(page, 'wall-it');
+    });
+
+    test('the card-trial page shows the plans in Italian', async ({ page }) => {
+      await cloudSession(page);
+      await page.goto('/start-trial');
+      await expect(page.getByRole('radio', { name: /Team/ })).toContainText('15 connettori · 10 server MCP · fino a 3 utenti', { timeout: 15_000 });
+      await shot(page, 'start-trial-it');
+    });
+  });
+});
+
+test.describe('the paywall in the website\'s other languages (cloud)', () => {
+  const SHOWN = { 'amcp_card_trial_prompt:u1': 'shown' };
+  const ENDED = { plan: 'trial', status: 'active', expiresAt: new Date(Date.now() - 86_400_000).toISOString(), trialDaysLeft: 0 };
+  const TRUST = { variant: 'trust', recap: { successfulCalls: 3, connectors: ['Telegram'], client: 'Claude', blockedSinceEnd: true } };
+  const shot = async (page: Page, name: string) => {
+    if (!process.env.WALL_SHOT) return;
+    await page.waitForTimeout(800);
+    await page.screenshot({ path: `${process.env.WALL_SHOT}/${name}-desktop.png` });
+    for (const width of [390, 320]) {
+      await page.setViewportSize({ width, height: 844 });
+      await page.waitForTimeout(400);
+      await page.screenshot({ path: `${process.env.WALL_SHOT}/${name}-mobile-${width}.png`, fullPage: true });
+    }
+    await page.setViewportSize({ width: 1280, height: 800 });
+  };
+
+  test.describe('es-ES', () => {
+    test.use({ locale: 'es-ES' });
+
+    test('the ended-trial wall is Spanish, over the English dashboard, and sells in place', async ({ page }) => {
+      const { posted } = await cloudSession(page, { seed: SHOWN, license: ENDED, wall: TRUST });
+      await page.goto('/connectors');
+      await expect(page.getByRole('heading', { name: 'Mantén tu IA conectada a tus apps' })).toBeVisible({ timeout: 15_000 });
+      // The dashboard itself has no Spanish: it stays English.
+      await expect(page.locator('html')).toHaveAttribute('lang', 'en');
+      const starter = page.getByRole('radio', { name: /Starter/ });
+      await expect(starter).toContainText('El más elegido');
+      await expect(starter).toContainText('5 conectores · 3 servidores MCP · 1 usuario');
+      await expect(starter).toContainText('19 €/mes');
+      await expect(page.getByRole('radio', { name: /Team/ })).toContainText('15 conectores · 10 servidores MCP · hasta 3 usuarios');
+      await expect(page.getByText('Precios en EUR, IVA incluido.')).toBeVisible();
+      await expect(page.getByTestId('wall-trust')).toContainText('Cancela cuando quieras');
+      await expect(page.getByRole('link', { name: 'Comparar planes' })).toBeVisible();
+      for (const english of ['Most popular', 'Monthly', 'Prices in EUR', 'Compare plans', 'Delete your account']) {
+        await expect(page.getByText(english, { exact: false })).toHaveCount(0);
+      }
+      await shot(page, 'wall-es');
+      await page.getByRole('radio', { name: /Anual/ }).click();
+      await expect(starter).toContainText('≈ 15,83 €/mes');
+      await page.getByRole('radio', { name: 'Mensual' }).click();
+      await page.getByRole('button', { name: 'Suscribirse a Starter' }).click();
+      await expect(page).toHaveURL('https://checkout.example.test/start?intent=i1');
+      expect(posted).toEqual([{ plan: 'starter', billingPeriod: 'monthly', trial: false, source: 'trial_ended_wall' }]);
+    });
+
+    test('the card-trial page is Spanish and names more than a card', async ({ page }) => {
+      const { posted } = await cloudSession(page);
+      await page.goto('/start-trial');
+      await expect(page.getByRole('heading', { name: 'Tu prueba gratuita' })).toBeVisible({ timeout: 15_000 });
+      await expect(page.getByTestId('payment-methods')).toHaveText('0 € hoy · tarjeta, PayPal y otros métodos');
+      await expect(page.getByRole('radio', { name: /Starter/ })).toContainText('El más elegido');
+      await shot(page, 'start-trial-es');
+      await page.getByRole('button', { name: 'Empezar la prueba gratuita', exact: true }).click();
+      await expect(page).toHaveURL('https://checkout.example.test/start?intent=i1');
+      expect(posted).toEqual([{ plan: 'starter', billingPeriod: 'monthly', trial: true, source: 'start_trial' }]);
+    });
+
+    test('the trial banner is Spanish', async ({ page }) => {
+      await cloudSession(page, { seed: SHOWN });
+      await page.goto('/connectors');
+      await expect(page.getByText('Prueba: quedan 5 días. Incluye todo lo de Team.')).toBeVisible({ timeout: 15_000 });
+      await expect(page.getByRole('button', { name: /Añade un método de pago: sin cargos antes del/ })).toBeVisible();
+      await shot(page, 'banner-es');
+    });
+
+    test('English picked in the dashboard keeps the paywall English', async ({ page }) => {
+      await page.context().addCookies([{ name: 'amcp_locale', value: 'en', url: 'http://localhost:3100' }]);
+      await cloudSession(page, { seed: SHOWN, license: ENDED, wall: TRUST });
+      await page.goto('/connectors');
+      await expect(page.getByRole('heading', { name: 'Keep your AI connected to your apps' })).toBeVisible({ timeout: 15_000 });
+      await expect(page.getByRole('button', { name: 'Subscribe to Starter' })).toBeVisible();
+    });
+  });
+
+  test.describe('ru-RU', () => {
+    test.use({ locale: 'ru-RU' });
+
+    test('the wall is Russian, with the right plural forms', async ({ page }) => {
+      await cloudSession(page, { seed: SHOWN, license: ENDED, wall: TRUST, usage: { connectors: 7, mcpServers: 1, users: 2 } });
+      await page.goto('/connectors');
+      await expect(page.getByRole('heading', { name: 'Сохраните связь вашего ИИ с приложениями' })).toBeVisible({ timeout: 15_000 });
+      const starter = page.getByRole('radio', { name: /Starter/ });
+      await expect(starter).toContainText('5 коннекторов · 3 MCP-сервера · 1 пользователь');
+      await expect(starter).toContainText('В этом workspace уже 7 коннекторов, 2 пользователя');
+      await expect(page.getByRole('radio', { name: /Team/ })).toContainText('15 коннекторов · 10 MCP-серверов · до 3 пользователей');
+      await expect(page.getByRole('button', { name: 'Подписаться на Team' })).toBeVisible();
+      await shot(page, 'wall-ru');
+    });
+
+    test('the card-trial page is Russian', async ({ page }) => {
+      await cloudSession(page);
+      await page.goto('/start-trial');
+      await expect(page.getByRole('button', { name: 'Начать бесплатный период', exact: true })).toBeVisible({ timeout: 15_000 });
+      await expect(page.getByTestId('payment-methods')).toHaveText('0 € сегодня · карта, PayPal и другие способы');
+      await shot(page, 'start-trial-ru');
+    });
+
+    test('the trial banner counts the days in Russian', async ({ page }) => {
+      await cloudSession(page, { seed: SHOWN });
+      await page.goto('/connectors');
+      await expect(page.getByText('Пробный период: осталось 5 дней. В него входит всё из Team.')).toBeVisible({ timeout: 15_000 });
+    });
+  });
+
+  test.describe('zh-CN', () => {
+    test.use({ locale: 'zh-CN' });
+
+    test('the wall and the card-trial page are Chinese', async ({ page }) => {
+      await cloudSession(page, { seed: SHOWN, license: ENDED, wall: TRUST });
+      await page.goto('/connectors');
+      await expect(page.getByRole('heading', { name: '让你的 AI 与你的应用保持连接' })).toBeVisible({ timeout: 15_000 });
+      const starter = page.getByRole('radio', { name: /Starter/ });
+      await expect(starter).toContainText('5 个连接器 · 3 个 MCP 服务器 · 1 位用户');
+      await expect(page.getByRole('radio', { name: /Team/ })).toContainText('最多 3 位用户');
+      await page.getByRole('radio', { name: /按年/ }).click();
+      // A point for the decimals, not a comma.
+      await expect(starter).toContainText('≈ 15.83 €/月');
+      await expect(page.getByRole('button', { name: '订阅 Starter' })).toBeVisible();
+      await shot(page, 'wall-zh');
+    });
+  });
+
+  test.describe('ja-JP', () => {
+    test.use({ locale: 'ja-JP' });
+
+    test('the wall and the card-trial page are Japanese', async ({ page }) => {
+      await cloudSession(page, { seed: SHOWN, license: ENDED, wall: TRUST });
+      await page.goto('/connectors');
+      await expect(page.getByRole('heading', { name: 'AI とアプリの接続を維持しましょう' })).toBeVisible({ timeout: 15_000 });
+      await expect(page.getByRole('radio', { name: /Starter/ })).toContainText('コネクタ 5 個 · MCP サーバー 3 台 · ユーザー 1 名');
+      await expect(page.getByRole('button', { name: 'Starter に登録する' })).toBeVisible();
+      await shot(page, 'wall-ja');
+    });
+
+    test('the card-trial page is Japanese', async ({ page }) => {
+      await cloudSession(page);
+      await page.goto('/start-trial');
+      await expect(page.getByRole('button', { name: '無料トライアルを開始', exact: true })).toBeVisible({ timeout: 15_000 });
+      await expect(page.getByTestId('payment-methods')).toHaveText('本日 0 € · カード、PayPal など');
+      await shot(page, 'start-trial-ja');
+    });
+  });
+});
+

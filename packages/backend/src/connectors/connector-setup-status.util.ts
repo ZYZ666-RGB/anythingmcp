@@ -1,6 +1,9 @@
 import { getAdapter } from '../adapters/catalog';
 import { isMachineGrant } from './oauth-grant.util';
 import { shopeeNeedsAuthorization } from './engines/shopee-token.service';
+import { tiktokShopMissingAppVars, tiktokShopNeedsAuthorization } from './engines/tiktok-shop-token.service';
+import { iopNeedsAuthorization } from './engines/iop-token.service';
+import { sheinNeedsAuthorization } from './engines/shein-token.service';
 import { interpolateDeep, interpolateString } from '../common/env-interpolation.util';
 import { CALLER_CONTEXT_PREFIX } from '../common/caller-context.util';
 import {
@@ -154,6 +157,9 @@ export function computeSetupState(input: SetupStatusInput): SetupState {
         authConfig: checkedAuth,
       }),
       ...missingToolVariables(input, envVars),
+      // A TikTok Shop connector leaves its app variables empty to use the
+      // server's app; on a server without one they are still to fill in.
+      ...tiktokShopMissingAppVars(input.authType, authConfig),
     ]),
   ]
     .filter((name) => !name.startsWith(CALLER_CONTEXT_PREFIX))
@@ -171,6 +177,20 @@ export function computeSetupState(input: SetupStatusInput): SetupState {
   // A Shopee shop (HMAC with tokenProvider "shopee") is authorized from the
   // connector page too. False for every other connector.
   if (shopeeNeedsAuthorization(input.authType, authConfig)) {
+    return { status: 'needs_authorization', missing: [] };
+  }
+  // Same for a TikTok Shop shop (HMAC with tokenProvider "tiktok-shop").
+  if (tiktokShopNeedsAuthorization(input.authType, authConfig)) {
+    return { status: 'needs_authorization', missing: [] };
+  }
+  // And for a seller at an IOP gateway (HMAC with tokenProvider "iop":
+  // Lazada, Miravia, AliExpress seller).
+  if (iopNeedsAuthorization(input.authType, authConfig)) {
+    return { status: 'needs_authorization', missing: [] };
+  }
+  // And for a SHEIN shop (HMAC with tokenProvider "shein"): no stored
+  // openKeyId and secretKey yet.
+  if (sheinNeedsAuthorization(input.authType, authConfig)) {
     return { status: 'needs_authorization', missing: [] };
   }
   return { status: 'ready', missing: [] };

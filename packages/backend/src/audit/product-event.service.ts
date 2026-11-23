@@ -41,6 +41,10 @@ export const ProductEvents = {
    * on all of them; read in order they answer where a setup is abandoned:
    * opened, credentials refused (metadata.kind = auth_failed, invalid_input…),
    * sent to the provider's sign-in, finished, or kept as a draft / unverified.
+   * A refused check also carries metadata.code when the provider's answer
+   * names an error code (Shopify: app_not_installed, shop_not_permitted).
+   * setup_started also carries metadata.device ('mobile' or 'desktop'), so
+   * the steps of a workspace can be read per device.
    */
   SETUP_STARTED: 'setup_started',
   SETUP_VERIFY_FAILED: 'setup_verify_failed',
@@ -59,9 +63,38 @@ export const ProductEvents = {
    * A step of a setup guide (adapter `setupGuide`) was shown / left with
    * Continue. metadata.adapterSlug, metadata.step = the step id,
    * metadata.index = its position from 1. Answers which step people give up on.
+   * Rows written before mid-November 2026 carry neither: `step` and `index`
+   * were not allowed metadata keys then, and were dropped.
    */
   SETUP_STEP_VIEWED: 'setup_step_viewed',
   SETUP_STEP_COMPLETED: 'setup_step_completed',
+  /**
+   * The button of a guide step that opens the provider's page (Etsy's app
+   * form, the list of apps) was pressed. metadata.adapterSlug, metadata.step,
+   * metadata.index. Answers whether people who stop on a step went to the
+   * provider at all: read against setup_step_viewed of the same step.
+   */
+  SETUP_STEP_ACTION_OPENED: 'setup_step_action_opened',
+  /**
+   * The setup page's own checks stopped a Continue or a save before anything
+   * was sent to the server: a required field left empty or a value that does
+   * not match the field's pattern. metadata.adapterSlug, metadata.kind =
+   * 'format' (at least one value has the wrong shape) or 'required',
+   * metadata.field = the variable names, comma separated (never a value),
+   * metadata.step / metadata.index inside a guide. Answers how many people
+   * have the keys and cannot get them past the form; the server's own refusals
+   * are setup_verify_failed.
+   */
+  SETUP_FIELDS_REFUSED: 'setup_fields_refused',
+  /**
+   * The connector page showed "finish the setup" for a catalog connector that
+   * is not usable yet (the page an AI client links to for a connector that was
+   * added without its credentials). metadata.adapterSlug, metadata.connectorId,
+   * metadata.kind = 'needs_input' or 'needs_authorization'. Once per page
+   * load. Read against setup_started: how many reach that page and never open
+   * the setup behind its button.
+   */
+  SETUP_FINISH_PROMPT_VIEWED: 'setup_finish_prompt_viewed',
   /**
    * A new cloud account was created; metadata = the first and last touch the
    * visitor arrived through (see signup-attribution.ts). Written by the
@@ -77,11 +110,85 @@ export const ProductEvents = {
    */
   AI_CLIENT_CONNECTED: 'ai_client_connected',
   /**
+   * The steps of connecting an AI client that `ai_client_connected` does not
+   * show (it is written when the user approves, before the code exists):
+   * the sign-in or consent page was opened inside an authorization, the
+   * authorization code was handed to the client's redirect, the client
+   * presented it at the token endpoint, and the client listed the tools.
+   * `authorize_page_viewed` carries a short hash of the authorization as
+   * `attempt`, so reloads of one attempt count once. `mcp_tools_listed` is
+   * written once per workspace and UTC day.
+   *
+   * Every event written while a browser is on our pages carries the same
+   * `attempt`, the `device` ('mobile' or 'desktop') and, on Cloud, the arm of
+   * the page test the attempt is in (`connectedArm`, see
+   * auth/authorization-attempt.ts), so one attempt can be followed from the
+   * page view to the code:
+   * - authorize_page_viewed also carries `lang`, the browser's first language
+   *   when it is one of the seven the trial pages speak, else 'other';
+   * - authorize_action: a button of the sign-in page was used. metadata.button
+   *   = 'google', 'microsoft', 'github', 'sso', 'password', 'session' (Allow
+   *   access as the signed-in dashboard account), 'cancel' or 'create_account'
+   *   (the link to the dashboard's sign-up, reported by the page);
+   * - authorization_signed_in: the identity is settled and access allowed.
+   *   metadata.method = the provider, 'password', 'session', 'email_code' or
+   *   'sso'; metadata.account = 'new' (created in the last 30 minutes) or
+   *   'existing';
+   * - authorization_code_issued carries device, attempt and arm since
+   *   November 2026 (AuthorizationAttemptMiddleware); a code issued and never
+   *   exchanged, by device, is the hand-back that failed;
+   * - post_approve_continue_clicked: "Continue" on the page shown to an empty
+   *   workspace (reported by the page with a beacon that cannot delay the
+   *   click). metadata.button = 'continue', or 'auto_continue' when the page
+   *   went on by itself after the one-tap Telegram bot was connected, or
+   *   'copy_continue' when "Copy & continue" pressed it;
+   * - authorize_action from the page after approving: metadata.button =
+   *   'open_dashboard' ("Or add an app here first") or 'payment_method'
+   *   ("Add a payment method"), both reported by the page with a beacon;
+   * - authorize_step_viewed: a step between sign-in and the code was shown.
+   *   metadata.step = 'email-code' (the code step for an unverified address),
+   *   'servers' ("Choose what to connect") or 'wrong-workspace' (the client
+   *   asked for a server this account cannot reach);
+   * - authorize_request_closed: a browser reached the flow without an open
+   *   authorization (expired after 30 minutes, already used, or a bookmark)
+   *   and was shown the "no longer open" page. metadata.via = 'login',
+   *   'callback' or 'next' (where), metadata.device. No account, no attempt.
+   */
+  AUTHORIZE_PAGE_VIEWED: 'authorize_page_viewed',
+  AUTHORIZE_ACTION: 'authorize_action',
+  AUTHORIZATION_SIGNED_IN: 'authorization_signed_in',
+  AUTHORIZATION_CODE_ISSUED: 'authorization_code_issued',
+  AUTHORIZATION_CODE_EXCHANGED: 'authorization_code_exchanged',
+  POST_APPROVE_CONTINUE_CLICKED: 'post_approve_continue_clicked',
+  AUTHORIZE_STEP_VIEWED: 'authorize_step_viewed',
+  AUTHORIZE_REQUEST_CLOSED: 'authorize_request_closed',
+  MCP_TOOLS_LISTED: 'mcp_tools_listed',
+  /**
+   * An install asked for from a chat or the picker that added no connector,
+   * with a reason code (connector-setup.service.ts). Server only.
+   */
+  SETUP_INSTALL_FAILED: 'setup_install_failed',
+  /**
+   * A new account (created minutes before) authorized one of AnythingMCP's
+   * plugins in OpenAI's plugin directory; metadata.directory = 'chatgpt',
+   * metadata.plugin = the plugin endpoint ('chatgpt-app', 'file-search').
+   * The account's signup_attributed gets the same two fields. Server-only.
+   * Answers: how many sign-ups the ChatGPT directory brings.
+   */
+  DIRECTORY_SIGNUP: 'directory_signup',
+  /**
    * Cloud: after approving an AI client, the user was told their workspace
    * is empty and shown how to add an app (chat or dashboard). Server-only.
    * Read against setup_completed: does the prompt lead to a first connector.
    */
   EMPTY_WORKSPACE_PROMPT: 'empty_workspace_prompt',
+  /**
+   * File Search plugin (/mcp/file-search): after approving the AI client, an
+   * admin of a workspace with no folder was offered to connect one
+   * (login.controller.ts). metadata.client. Server-only. Read against
+   * file_search_wizard_opened with via 'authorize' and file_search_activated.
+   */
+  FILE_SEARCH_AUTHORIZE_OFFERED: 'file_search_authorize_offered',
   /**
    * Cloud: on that page the user picked one of the quick-setup apps, and it
    * was added to the workspace as a connector waiting for its credentials
@@ -93,6 +200,62 @@ export const ProductEvents = {
    * counted as a setup made in the chat (via 'mcp') or the dashboard.
    */
   POST_APPROVE_APP_PICKED: 'post_approve_app_picked',
+  /**
+   * The one-tap Telegram bot on that page (adapters/telegram-managed-bot.ts),
+   * all server-only and all with metadata.adapterSlug = 'telegram-bot'. Read in
+   * order, against post_approve_app_picked for Telegram, they say where a
+   * Telegram setup stops:
+   * - offered: Telegram was picked and the page got the link that creates the
+   *   bot. metadata.client, metadata.device ('mobile' or 'desktop': a desktop
+   *   also gets the QR code).
+   * - link_opened: the user clicked that link (once per setup; a scan of the
+   *   QR code cannot be seen). metadata.device.
+   * - connected: Telegram announced the new bot and its token was stored on
+   *   the connector. metadata.connectorId. metadata.kind = 'claim' when the
+   *   bot was found through its creator's /start (see claim below) and not by
+   *   its username; absent otherwise. Also written as setup_completed with
+   *   via 'telegram_one_tap'.
+   * - unmatched: a new bot could not be connected when it was created.
+   *   metadata.kind = 'no_code' (the user changed the suggested username),
+   *   'unknown_code', 'expired' (created after the 30 minutes) or
+   *   'token_refused'. No workspace is known for the first two. Such a bot
+   *   can still be connected afterwards: then a claim with status 'linked'
+   *   and a connected with kind 'claim' follow.
+   * - claim_offered: the page showed "Changed the username? Link your bot"
+   *   (once per setup). metadata.kind = 'unmatched_bot' (a bot with another
+   *   username had just been created on this instance) or 'timeout' (no bot
+   *   arrived in time), metadata.device.
+   * - claim: the manager bot got `/start <code>` from a Telegram account.
+   *   metadata.status = 'linked' (that account's bot was connected),
+   *   'waiting' (the account is linked to the setup, its bot does not exist
+   *   yet) or 'refused' (then metadata.kind = 'unknown_code' (also a
+   *   parameter this server did not issue), 'expired', 'already_connected',
+   *   'connector_has_token', 'other_user' or 'token_refused').
+   *   metadata.connectorId when the setup is known. Never the code, never a
+   *   Telegram id.
+   * - client_notice: the AI client's first request arrived (a tools/list on
+   *   the shared endpoint, from the user who set the bot up) within 30
+   *   minutes of a one-tap bot being connected, and the bot told its creator
+   *   "your assistant is connected". Once per connector, and only after the
+   *   welcome was delivered. metadata.status = 'sent' or 'failed' (Telegram
+   *   refused the message), metadata.connectorId, metadata.client (the
+   *   client's name), metadata.kind = 'chat_link' when the message carried
+   *   the button that opens a new chat (Claude only). This is the first
+   *   event that says the authorization was really finished after a one-tap
+   *   bot: `connected` is written before "Continue".
+   * - token_pasted: "Already have a bot? Paste its token" was used.
+   *   metadata.status = 'saved' or 'refused' (then metadata.kind says why),
+   *   metadata.connectorId. A saved one is also written as setup_completed
+   *   with via 'post_approve_token'.
+   */
+  TELEGRAM_BOT_LINK_OFFERED: 'telegram_bot_link_offered',
+  TELEGRAM_BOT_LINK_OPENED: 'telegram_bot_link_opened',
+  TELEGRAM_BOT_CONNECTED: 'telegram_bot_connected',
+  TELEGRAM_BOT_UNMATCHED: 'telegram_bot_unmatched',
+  TELEGRAM_BOT_CLAIM_OFFERED: 'telegram_bot_claim_offered',
+  TELEGRAM_BOT_CLAIM: 'telegram_bot_claim',
+  TELEGRAM_BOT_CLIENT_NOTICE: 'telegram_bot_client_notice',
+  TELEGRAM_BOT_TOKEN_PASTED: 'telegram_bot_token_pasted',
   /**
    * A tool of the shared /mcp tool set was called (shared-tool-calls.ts):
    * metadata.tool = the listed tool, metadata.profile = 'default' (Claude and
@@ -131,7 +294,8 @@ export const ProductEvents = {
    *
    * Opened: once per page load; metadata.via = where from ('store',
    * 'welcome', 'store_hint' / 'welcome_hint' for the File Search hint under
-   * the search box, 'connectors_new', 'chat').
+   * the search box, 'connectors_new', 'chat', 'authorize' for the File Search
+   * plugin's setup page after "Approve").
    */
   FILE_SEARCH_WIZARD_OPENED: 'file_search_wizard_opened',
   /**
@@ -238,17 +402,23 @@ export const ProductEvents = {
   /**
    * Cloud: an AI client called a tool of a workspace whose free trial had
    * ended, and was refused with the reactivation link (dynamic-mcp-tools.ts).
-   * metadata.toolName, adapterSlug (catalog connectors only) and client (the
-   * OAuth client's name, when the call came through one). At most one row per
+   * metadata.toolName, adapterSlug (catalog connectors only), client (the
+   * OAuth client's name, when the call came through one) and variant (the
+   * reactivation link given: 'page' or 'pricing', reactivationLinkVariant;
+   * absent on rows from before 7 Nov 2026). At most one row per
    * workspace and tool an hour, so a looping agent cannot flood the table.
    * Server-only. Answers how many workspaces come back after their trial, and
    * with which app.
    */
   TRIAL_EXPIRED_CALL_BLOCKED: 'trial_expired_call_blocked',
   /**
-   * Cloud: a workspace took the one-click 7-day trial extension from the
-   * "your trial has ended" email (trial-extension.controller.ts).
-   * metadata.via = 'email'. Server-only. Read against the paid licences of
+   * Cloud: a workspace's trial was extended by 7 days, once. metadata.via =
+   * 'email': the one-click link in the "your trial has ended" email
+   * (trial-extension.controller.ts). metadata.via = 'app_approved': given by
+   * the server with the approval email, because the provider approved the
+   * user's app when the trial had ended or had under a day left
+   * (app-approval-trial-extension.service.ts; metadata.connectorId,
+   * metadata.adapterSlug). Server-only. Read against the paid licences of
    * those workspaces: does a week more lead to a purchase.
    */
   TRIAL_EXTENDED: 'trial_extended',
@@ -265,10 +435,21 @@ export const ProductEvents = {
    * Etsy accepted keys it had refused, and the connector's owner was told
    * once (app-approval-watch.ts). metadata.connectorId, metadata.adapterSlug,
    * metadata.kind = 'emailed', or 'not_sent' (no SMTP configured, or the
-   * send failed; never retried). Server-only. Its presence is what stops a
-   * second email for that connector.
+   * send failed; never retried). metadata.trialDaysAdded when the trial was
+   * extended with it (see trial_extended, via 'app_approved'). Server-only.
+   * Its presence is what stops a second email for that connector.
    */
   ETSY_APP_APPROVED_NOTIFIED: 'etsy_app_approved_notified',
+  /**
+   * The one reminder, 48 hours after etsy_app_approved_notified, for a
+   * connector that still waits for the sign-in (app-approval-watch.ts).
+   * metadata.connectorId, metadata.adapterSlug, metadata.kind = 'emailed',
+   * 'not_sent' (no SMTP configured, or the send failed; never retried) or
+   * 'opted_out' (the owner unsubscribed from tips and offers, so nothing was
+   * sent). Server-only. Its presence is what stops a second reminder. Read
+   * against the sign-ins that follow: does the reminder bring people back.
+   */
+  ETSY_APP_APPROVED_REMINDED: 'etsy_app_approved_reminded',
   /**
    * Cloud: the onboarding cron sent a user with an empty workspace reminder 1
    * or 2 (ee/cloud/onboarding-reminder.ts). metadata.reminder = 1 or 2,
@@ -286,7 +467,71 @@ export const ProductEvents = {
    * metadata.reminder = 1, metadata.arm = 'holdout'. Once per user.
    */
   ONBOARDING_REMINDER_HOLDOUT: 'onboarding_reminder_holdout',
+  /**
+   * Cloud: an admin of a workspace whose free trial ended was shown the
+   * licence wall, with its buy-in-place plan picker (license-wall.service.ts).
+   * metadata.variant = 'trust' (the wall with the workspace's own numbers and
+   * the trust line) or 'control' (the earlier wall, about 10% of workspaces,
+   * fixed per workspace), metadata.calls = the successful tool calls shown
+   * (0 when none, then no numbers are shown). At most once per workspace a
+   * UTC day. Server-only. Read with Stripe's completed checkouts of
+   * checkout_source 'trial_ended_wall' by organizationId, per variant.
+   */
+  LICENSE_WALL_VIEWED: 'license_wall_viewed',
+  /**
+   * Cloud: the no-login reactivation page (/reactivate/<token>, the link an
+   * AI client gets in the 'page' arm when an ended trial blocks a tool call)
+   * was opened with a valid token (reactivation.controller.ts).
+   * metadata.state = what the page showed ('trial-ended', 'active',
+   * 'payment-failed', 'no-license'). At most once per workspace a UTC day.
+   * Server-only. Read with `trial_expired_call_blocked` (metadata.variant)
+   * and Stripe's checkouts of checkout_source 'mcp_reactivate'.
+   */
+  REACTIVATE_PAGE_VIEWED: 'reactivate_page_viewed',
+  /**
+   * Cloud: what someone did on a pay screen of an ended trial: the licence
+   * wall in the dashboard (metadata.source = 'trial_ended_wall', reported
+   * through POST /api/product-events) or the no-login reactivation page
+   * ('mcp_reactivate', reported through POST /api/license/reactivate/<token>/event).
+   * metadata.action = one of PAYWALL_ACTIONS ('shown' once per page load,
+   * then the clicks, 'left_without_subscribe' when the page is closed without
+   * a subscribe click); metadata.plan / metadata.period on plan, period and
+   * subscribe actions; metadata.device = 'mobile' or 'desktop';
+   * metadata.variant = the wall's variant ('trust' / 'control') or 'page'.
+   * Answers where people stop between seeing the plans and paying, per
+   * screen and device; read with checkout_link_created and Stripe.
+   */
+  PAYWALL_ACTION: 'paywall_action',
+  /**
+   * Cloud: a plan change paused items above the new plan's caps
+   * (metadata.kind 'downgrade') or brought them back ('restore');
+   * metadata.plan = the new plan, metadata.calls = how many items,
+   * metadata.status = 'dry-run' or 'on' (PLAN_CAPS_ENFORCE). PlanCapsService.
+   */
+  PLAN_CAPS_APPLIED: 'plan_caps_applied',
 } as const;
+
+/** The values of `action` on paywall_action (see PAYWALL_ACTION). */
+export const PAYWALL_ACTIONS = [
+  'shown',
+  'plan_selected',
+  'period_selected',
+  'subscribe_clicked',
+  'compare_plans_clicked',
+  'sign_in_clicked',
+  'open_workspace_clicked',
+  'switch_workspace_clicked',
+  'license_key_clicked',
+  'enterprise_clicked',
+  'support_clicked',
+  'delete_account_clicked',
+  'left_without_subscribe',
+  // The "What changes with <plan>" block was shown because the workspace is
+  // above that plan (metadata.plan), and its list of items was opened.
+  'plan_fit_shown',
+  'plan_fit_details_opened',
+] as const;
+export type PaywallAction = (typeof PAYWALL_ACTIONS)[number];
 
 export type ProductEventName = (typeof ProductEvents)[keyof typeof ProductEvents];
 
@@ -296,10 +541,31 @@ export type ProductEventName = (typeof ProductEvents)[keyof typeof ProductEvents
  */
 const SERVER_ONLY = new Set<string>([
   ProductEvents.SIGNUP_ATTRIBUTED,
+  ProductEvents.PLAN_CAPS_APPLIED,
   ProductEvents.OAUTH_FAILED,
   ProductEvents.AI_CLIENT_CONNECTED,
+  ProductEvents.AUTHORIZE_PAGE_VIEWED,
+  ProductEvents.AUTHORIZE_ACTION,
+  ProductEvents.AUTHORIZATION_SIGNED_IN,
+  ProductEvents.AUTHORIZATION_CODE_ISSUED,
+  ProductEvents.AUTHORIZATION_CODE_EXCHANGED,
+  ProductEvents.POST_APPROVE_CONTINUE_CLICKED,
+  ProductEvents.AUTHORIZE_STEP_VIEWED,
+  ProductEvents.AUTHORIZE_REQUEST_CLOSED,
+  ProductEvents.MCP_TOOLS_LISTED,
+  ProductEvents.SETUP_INSTALL_FAILED,
+  ProductEvents.DIRECTORY_SIGNUP,
   ProductEvents.EMPTY_WORKSPACE_PROMPT,
+  ProductEvents.FILE_SEARCH_AUTHORIZE_OFFERED,
   ProductEvents.POST_APPROVE_APP_PICKED,
+  ProductEvents.TELEGRAM_BOT_LINK_OFFERED,
+  ProductEvents.TELEGRAM_BOT_LINK_OPENED,
+  ProductEvents.TELEGRAM_BOT_CONNECTED,
+  ProductEvents.TELEGRAM_BOT_UNMATCHED,
+  ProductEvents.TELEGRAM_BOT_CLAIM_OFFERED,
+  ProductEvents.TELEGRAM_BOT_CLAIM,
+  ProductEvents.TELEGRAM_BOT_CLIENT_NOTICE,
+  ProductEvents.TELEGRAM_BOT_TOKEN_PASTED,
   ProductEvents.SHARED_TOOL_CALLED,
   ProductEvents.ADS_ACTIVATION_REPORTED,
   ProductEvents.ADS_SIGNUP_REPORTED,
@@ -310,8 +576,11 @@ const SERVER_ONLY = new Set<string>([
   ProductEvents.TRIAL_EXTENDED,
   ProductEvents.ETSY_APP_PENDING_SEEN,
   ProductEvents.ETSY_APP_APPROVED_NOTIFIED,
+  ProductEvents.ETSY_APP_APPROVED_REMINDED,
   ProductEvents.ONBOARDING_REMINDER_SENT,
   ProductEvents.ONBOARDING_REMINDER_HOLDOUT,
+  ProductEvents.LICENSE_WALL_VIEWED,
+  ProductEvents.REACTIVATE_PAGE_VIEWED,
 ]);
 const CLIENT_REPORTABLE = new Set<string>(
   Object.values(ProductEvents).filter((e) => !SERVER_ONLY.has(e)),
@@ -411,23 +680,43 @@ export class ProductEventService {
 // `match` = how the results matched (see CATALOG_SEARCH).
 // `status`, `toolName`, `error`: why a setup check or sign-in failed (the
 // provider's message, passed through scrubProviderMessage by the server);
+// `code`: the error code in the provider's refusal of a setup check
+// (`app_not_installed`), kept apart because `error` starts with our hint and
+// is cut before the provider's words; letters and underscores only.
 // `verified`: whether a completed setup made a successful call.
 // `source`: the entry point that led to /start-trial (start_trial_viewed,
 // start_trial_checkout_started); only the CHECKOUT_SOURCES values are kept.
 // `device`: 'mobile' (a touch screen) or 'desktop', on start_trial_viewed;
 // nothing finer, and any other value is dropped.
+// `step`, `index`, `field`: the guided setup (SETUP_STEP_*, SETUP_FIELDS_REFUSED):
+// a guide's step id, its position and the names of the adapter variables a
+// check refused. Each is kept only in that shape (SHAPED_KEYS), so a value
+// typed into a field can never be stored under them.
 // `tool`, `profile`, `setupTool`: shared_tool_called (a tool of the shared
 // /mcp set, the tool set's profile, the setup tool a run tool ran); the last
 // two only from a fixed set.
+// `action`, `plan`, `period`: paywall_action, each from a fixed set.
+// `offer`: the reactivation page's Telegram price test arm, on
+// reactivate_page_viewed, paywall_action and checkout_link_created.
 // `protocol`, `preset`, `files`: the File Search wizard (FILE_SEARCH_*):
 // a known protocol, a known product preset and a file count bucket; any
 // other value is dropped, so no host, path or exact count can be stored.
+// `attempt`: authorize_page_viewed, the value that makes reloads of one
+// authorization count once: a short lower-case base-36 number (the time the
+// pending authorization expires), and nothing else is kept.
+// `button`, `method`, `account`, `lang`, `connectedArm`, `signinArm`: the
+// authorization pages (authorize_action, authorization_signed_in,
+// authorize_page_viewed and the page tests), each from a fixed set.
 const METADATA_KEYS = [
-  'client', 'serverId', 'connectorId', 'adapterSlug', 'kind', 'via', 'query', 'results', 'missing', 'match',
+  'client', 'serverId', 'connectorId', 'adapterSlug', 'step', 'index', 'field', 'kind', 'via', 'query', 'results', 'missing', 'match',
   'status', 'toolName', 'error', 'verified', 'cardTrialOffered', 'source', 'device', 'protocol', 'preset', 'files',
-  'tool', 'profile', 'setupTool',
+  'tool', 'profile', 'setupTool', 'variant', 'calls', 'state', 'action', 'plan', 'period', 'offer', 'attempt', 'code',
+  'button', 'method', 'account', 'lang', 'connectedArm', 'signinArm',
 ] as const;
+/** A provider's error code: a short identifier, never a sentence or a pasted value. */
+const PROVIDER_CODE = /^[A-Za-z][A-Za-z_]{2,39}$/;
 const DEVICE_KINDS = new Set(['mobile', 'desktop']);
+const ATTEMPT_PATTERN = /^[0-9a-z]{6,12}$/;
 const KNOWN_PROTOCOLS = new Set<string>(FILE_SEARCH_PROTOCOLS);
 /** The File Search wizard's product presets. */
 const KNOWN_PRESETS = new Set(['nextcloud', 'owncloud', 'synology', 'qnap', 'fritzbox', 'hetzner']);
@@ -447,11 +736,56 @@ const ENUM_KEYS: Partial<Record<(typeof METADATA_KEYS)[number], ReadonlySet<stri
   protocol: KNOWN_PROTOCOLS,
   preset: KNOWN_PRESETS,
   files: KNOWN_FILE_BUCKETS,
+  // license_wall_viewed (license-wall.service.ts): trust / control;
+  // trial_expired_call_blocked (the reactivation-link test, license-checkout.ts): page / pricing.
+  variant: new Set(['trust', 'control', 'page', 'pricing']),
+  // reactivate_page_viewed (reactivation.controller.ts).
+  state: new Set(['trial-ended', 'active', 'payment-failed', 'no-license']),
+  // paywall_action.
+  action: new Set<string>(PAYWALL_ACTIONS),
+  plan: new Set(['starter', 'team']),
+  period: new Set(['monthly', 'yearly']),
+  // The reactivation page's Telegram price test (reactivationOfferArm).
+  offer: new Set(['personal', 'list']),
+  // The authorization pages (auth/authorization-attempt.ts, login.controller.ts).
+  button: new Set([
+    'google', 'microsoft', 'github', 'sso', 'password', 'session', 'cancel', 'create_account', 'continue', 'auto_continue',
+    'copy_continue', 'open_dashboard', 'payment_method',
+  ]),
+  method: new Set(['google', 'microsoft', 'github', 'sso', 'password', 'session', 'email_code']),
+  account: new Set(['new', 'existing']),
+  lang: new Set(['en', 'de', 'it', 'es', 'zh', 'ja', 'ru', 'other']),
+  connectedArm: new Set(['control', 'next_step']),
+  signinArm: new Set(['control', 'buttons_first']),
+};
+/**
+ * Keys kept only when the value has a fixed shape; anything else is dropped.
+ * `step`: a guide step id (kebab-case); `index`: its position, from 1;
+ * `field`: up to eight adapter variable names (ETSY_CLIENT_ID,ETSY_CLIENT_SECRET).
+ */
+const SHAPED_KEYS: Partial<Record<(typeof METADATA_KEYS)[number], (value: unknown) => boolean>> = {
+  step: (v) => typeof v === 'string' && v.length <= 40 && /^[a-z0-9][a-z0-9-]*$/.test(v),
+  index: (v) => typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 50,
+  field: (v) =>
+    typeof v === 'string' &&
+    v.length <= 200 &&
+    v.split(',').length <= 8 &&
+    v.split(',').every((name) => /^[A-Z][A-Z0-9_]*$/.test(name)),
 };
 const KNOWN_CHECKOUT_SOURCES = new Set<string>(CHECKOUT_SOURCES);
 const MAX_QUERY_LENGTH = 100;
 /** The values of `match` (see catalog-search.ts). */
 const SEARCH_MATCH_KINDS = new Set(['direct', 'fuzzy', 'partial', 'suggested']);
+
+/**
+ * The allow-list above for a writer that is built without dependency
+ * injection (the OAuth store): the same keys, sets and shapes as `log`.
+ */
+export function boundEventMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+): Record<string, string | number | boolean> | null {
+  return boundMetadata(metadata);
+}
 
 function boundMetadata(
   metadata: Record<string, unknown> | null | undefined,
@@ -459,6 +793,7 @@ function boundMetadata(
   if (!metadata || typeof metadata !== 'object') return null;
   const entries: Array<[string, string | number | boolean]> = [];
   for (const key of METADATA_KEYS) {
+    if (SHAPED_KEYS[key] && !SHAPED_KEYS[key](metadata[key])) continue;
     const v =
       key === 'query' || key === 'missing'
         ? sanitizeSearchQuery(metadata[key])
@@ -466,6 +801,10 @@ function boundMetadata(
           ? (SEARCH_MATCH_KINDS.has(metadata[key] as string) ? metadata[key] : null)
           : key === 'source'
             ? (KNOWN_CHECKOUT_SOURCES.has(metadata[key] as string) ? metadata[key] : null)
+            : key === 'attempt'
+              ? (typeof metadata[key] === 'string' && ATTEMPT_PATTERN.test(metadata[key] as string) ? metadata[key] : null)
+            : key === 'code'
+              ? (typeof metadata[key] === 'string' && PROVIDER_CODE.test(metadata[key] as string) ? metadata[key] : null)
             : ENUM_KEYS[key]
               ? (ENUM_KEYS[key]!.has(metadata[key] as string) ? metadata[key] : null)
               : metadata[key];
@@ -506,6 +845,12 @@ export function sanitizeSearchQuery(value: unknown): string | null {
  * `http://` of `http://http://…` (CodeQL js/polynomial-redos).
  */
 const SCRUB_INPUT_LIMIT = 2000;
+/**
+ * Long enough to keep the provider's own words after our hint: a 500 from
+ * Odoo starts with the classifier's sentence, and its "Invalid field 'x'"
+ * came after the old 160-character cut.
+ */
+const PROVIDER_MESSAGE_MAX = 400;
 
 export function scrubProviderMessage(message: unknown, secrets: unknown[] = []): string | null {
   if (typeof message !== 'string' || !message.trim()) return null;
@@ -522,7 +867,7 @@ export function scrubProviderMessage(message: unknown, secrets: unknown[] = []):
   });
   out = out.replace(/[A-Za-z0-9_\-.+/=]{32,}/g, '***');
   out = out.replace(/\s+/g, ' ').trim();
-  return out.length > 160 ? `${out.slice(0, 159)}…` : out;
+  return out.length > PROVIDER_MESSAGE_MAX ? `${out.slice(0, PROVIDER_MESSAGE_MAX - 1)}…` : out;
 }
 
 /** The attribution pair, re-sanitized here so no caller can store anything else. */

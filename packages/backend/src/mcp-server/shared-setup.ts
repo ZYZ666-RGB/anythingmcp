@@ -52,6 +52,11 @@ export interface SetupCallOptions {
 export interface SetupCallResult {
   body: unknown;
   isError?: boolean;
+  /**
+   * The connector an install created. For the server's own callers (the page
+   * after approving an AI client); never part of `body`, which goes to the chat.
+   */
+  connectorId?: string;
 }
 
 export interface SharedSetupProvider {
@@ -64,6 +69,12 @@ export interface SharedSetupProvider {
     opts?: SetupCallOptions,
   ): Promise<SetupCallResult>;
   status(ctx: SetupContext): Promise<SetupCallResult>;
+  /**
+   * A one-time link that opens the setup form of this connector, for this
+   * user (/s/<token>): the chat hands it out for a connector still waiting
+   * for its credentials, instead of the connector's page.
+   */
+  createLink?(ctx: SetupContext, connectorId: string): Promise<string>;
 }
 
 @Injectable()

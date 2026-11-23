@@ -17,6 +17,11 @@ import { isMachineGrant } from '../oauth-grant.util';
 import { ConnectorAuthStatusService, credentialRef } from './connector-auth-status.service';
 import { parseCredentialKey } from '../../common/credential-key.util';
 import { mergeUserCredential } from '../user-credential.util';
+import {
+  describeMissingTokenFields,
+  tokenFieldsAt,
+  tokenResponsePathOf,
+} from './token-response.util';
 
 /** Refresh tokens that expire within this window (5 minutes). */
 const PROACTIVE_REFRESH_BUFFER_MS = 5 * 60 * 1000;
@@ -555,9 +560,10 @@ export class OAuth2TokenService {
             clientAssertionParams(clientAssertionSettingsFrom(authConfig, tokenUrl)),
           );
         } else if (useBasic && clientId && clientSecret) {
-          // client_secret_basic — credentials in the Authorization header.
-          // DATEV and other confidential-client providers reject body creds.
-          if (clientId) body.client_id = clientId;
+          // client_secret_basic — credentials in the Authorization header
+          // only. DATEV and other confidential-client providers reject body
+          // creds; Okta (Constant Contact) also refuses a body client_id next
+          // to the header ("Cannot supply multiple client credentials").
           const basic = Buffer.from(`${clientId}:${clientSecret}`).toString(
             'base64',
           );
@@ -589,8 +595,25 @@ export class OAuth2TokenService {
         },
       );
 
+      // A provider that wraps the token fields names the wrapper in
+      // authConfig.tokenResponsePath (Joom: { code, message, data: { … } });
+      // unset, the answer itself holds them, as RFC 6749 §5.1 has it.
+      const wrapper = tokenResponsePathOf(authConfig.tokenResponsePath);
+      const tokenFields = wrapper
+        ? tokenFieldsAt(response.data, wrapper)
+        : response.data;
+      if (wrapper && !tokenFields) {
+        const reason = describeMissingTokenFields(response.data, wrapper);
+        this.logger.warn(
+          `OAuth2 (${grant}) token refresh failed` +
+            (connectorId ? ` for connector ${connectorId}` : '') +
+            `: ${reason}`,
+        );
+        this.lastRefreshError.set(cacheKey, reason);
+        return null;
+      }
       const { access_token, expires_in, refresh_token: newRefreshToken } =
-        response.data;
+        tokenFields;
       if (!access_token) {
         this.lastRefreshError.set(cacheKey, 'the response carried no access_token');
         return null;

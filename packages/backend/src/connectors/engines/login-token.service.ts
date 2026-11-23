@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import axios from 'axios';
+import axios, { type AxiosResponse } from 'axios';
 import { randomUUID } from 'crypto';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../../common/prisma.service';
@@ -12,6 +12,9 @@ import { urlForLog } from '../../common/log-safe-url.util';
 import { createUnblockerProxyAgent } from './unblocker-proxy-agent';
 import { ClientAssertionError, signJwt } from './client-assertion.util';
 import { findUnresolvedPlaceholders } from '../../common/unresolved-placeholders.util';
+import { escapeXmlValue } from '../../common/xml-escape.util';
+import { isXmlContentType, xmlParser } from './xml-parse.util';
+import { LOGIN_REQUEST_FAILED_PREFIX, loginRequestHint } from '../connector-error.util';
 
 const DEFAULT_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 const DEFAULT_PROACTIVE_REFRESH_SECONDS = 24 * 60 * 60; // 1 day
@@ -33,6 +36,12 @@ const PROACTIVE_RETRY_BACKOFF_MS = 30 * 1000;
  */
 export interface LoginRequestOptions {
   proxyUrl?: string;
+  /**
+   * Names of the connector-level headers. They are not sent with the login
+   * request (only loginHeaders are); a failed login names the ones the login
+   * did not carry, so the user knows where to add a header the login needs.
+   */
+  connectorHeaders?: string[];
 }
 
 /**
@@ -73,10 +82,48 @@ export interface LoginTokenAuthConfig {
   loginBody?: unknown;
   // …or a raw string template (deprecated, brittle for GraphQL mutations).
   loginBodyTemplate?: string;
+  /**
+   * `"xml"`: a string `loginBody` is an XML document. The values `${username}`,
+   * `${password}`, `${aud}` … insert are XML-escaped, and the request is
+   * labelled `application/xml; charset=utf-8` unless loginHeaders set a
+   * Content-Type. Absent: a string loginBody is sent as before (values
+   * inserted as they are, labelled application/json unless loginHeaders say
+   * otherwise).
+   */
+  loginBodyFormat?: 'xml';
+  /**
+   * `"xml"`: the login answers with an XML document (Fnac Darty's
+   * `<auth_response><token>…</token><validity>…</validity></auth_response>`).
+   * A string answer that is declared XML, or starts with `<`, is parsed with
+   * the parser the REST engine uses for XML answers (attributes next to child
+   * elements, no namespace prefixes, values as strings), so tokenJsonPath,
+   * expiryJsonPath and audJsonPath address it: `auth_response.token`.
+   * Absent: the answer is read as axios delivered it.
+   */
+  loginResponseFormat?: 'xml';
+  /**
+   * Headers sent with the login request only (connector-level headers are
+   * not). Values may use `${uuid}` (a new UUID per login) and the login
+   * placeholders `${username}`, `${password}` (or the hashed password's
+   * name), `${aud}` and `${otp}`.
+   */
   loginHeaders?: Record<string, string>;
-  // Required, unless the login proves who it is with `signedJwt` instead.
-  username: string;
-  password: string;
+  /**
+   * Send `Authorization: Basic base64(username:password)` on the login request
+   * only, for APIs whose login takes HTTP Basic credentials and answers with a
+   * token (Wazuh). The engine builds the header itself: the password is not
+   * offered to loginBody/loginBodyTemplate (`${password}` renders empty) and,
+   * without a loginBody, the login has no body. Refused, before any request,
+   * when loginHeaders already set Authorization (any case), with signedJwt,
+   * with bcrypt passwordHashing, and for a username containing ":" (RFC 7617).
+   */
+  loginBasicAuth?: boolean;
+  // Required only when the login uses them: a loginBody, loginBodyTemplate
+  // or loginHeaders that reference `${username}` / `${password}` (or the
+  // hashed password), a login without a body (the default body sends both),
+  // or loginBasicAuth. A key-only token exchange needs neither.
+  username?: string;
+  password?: string;
   aud?: string;
   otp?: string;
 
@@ -111,7 +158,11 @@ export interface LoginTokenAuthConfig {
     outputParam?: string; // template param name (default: passwordHashed)
   };
 
-  tokenJsonPath: string;
+  // One path, or several tried in order when the vendor does not document
+  // the login answer's shape: the first that holds a non-empty string wins.
+  // Empty, absent or "." means the whole response body: a plain-text token or
+  // a JSON string, trimmed. Not read with tokenSource 'cookie' or 'header'.
+  tokenJsonPath?: string | string[];
   expiryJsonPath?: string;
   audJsonPath?: string;
   expiryFormat?: 'iso8601' | 'unix' | 'ttl_seconds';
@@ -122,8 +173,13 @@ export interface LoginTokenAuthConfig {
   // 'cookie'         → parse Set-Cookie header for the cookie named
   //                    {cookieName}, return its value. SAP B1 Service Layer
   //                    uses this with cookieName="B1SESSION".
-  tokenSource?: 'body' | 'cookie';
+  // 'header'         → the value of the response header named
+  //                    {tokenHeaderName}, matched without regard to case.
+  //                    Ceneo's token call answers the bearer token in a
+  //                    response header called `access_token`.
+  tokenSource?: 'body' | 'cookie' | 'header';
   cookieName?: string;
+  tokenHeaderName?: string;
   // With tokenSource 'cookie': 'single' (default) keeps the value of
   // {cookieName}; 'all' keeps every cookie the login sets, as one
   // "a=1; b=2" string for a `Cookie: ${token}` header. For logins that set a
@@ -133,8 +189,22 @@ export interface LoginTokenAuthConfig {
   cookieMode?: 'single' | 'all';
 
   refreshOn401?: boolean;
+  /**
+   * Also re-login (and retry once) when the API refuses the token in the
+   * body instead of with HTTP 401: one of the connector's `config.errorWhen`
+   * rules with `status: 401` matches a 2xx answer, or the body of an HTTP
+   * error answer. REST tools only. Default false.
+   */
+  refreshOnBody401?: boolean;
   proactiveRefreshSeconds?: number;
 
+  /**
+   * Where a REST tool call carries the token. `"header"` (default): in
+   * headerName/headerTemplate. `"body"`: no token header is sent; the token is
+   * the placeholder `${loginToken}` in the tool's `endpointMapping.bodyTemplate`
+   * (XML-escaped with `bodyEncoding: "xml"`, JSON-escaped otherwise).
+   */
+  tokenPlacement?: 'header' | 'body';
   headerName?: string; // default Authorization
   headerTemplate?: string; // default "Bearer ${token}"
   extraHeaders?: Record<string, string>;
@@ -263,6 +333,21 @@ export class LoginTokenService {
   }
 
   /**
+   * Drop the token held for a connector (memory and database), after its
+   * login settings changed: the next call logs in with the new ones instead
+   * of reusing a token the old settings obtained.
+   */
+  async forget(connectorId: string): Promise<void> {
+    this.cache.delete(connectorId);
+    this.retryAfter.delete(connectorId);
+    try {
+      await this.prisma.connectorAuthCache.deleteMany({ where: { connectorId } });
+    } catch (err: any) {
+      this.logger.warn(`LOGIN_TOKEN: failed to drop the cached token for ${connectorId}: ${err.message}`);
+    }
+  }
+
+  /**
    * Force a fresh login regardless of cache state (called on 401 retry).
    */
   async forceRelogin(
@@ -297,17 +382,29 @@ export class LoginTokenService {
     request: LoginRequestOptions,
   ): Promise<LoginTokenBundle> {
     this.requireString(authConfig.loginUrl, 'loginUrl');
-    if (!authConfig.signedJwt) {
-      this.requireString(authConfig.username, 'username');
-      this.requireString(authConfig.password, 'password');
-    }
-    if (authConfig.tokenSource !== 'cookie') {
-      this.requireString(authConfig.tokenJsonPath, 'tokenJsonPath');
+    const needs = loginCredentialNeeds(authConfig);
+    if (needs.username) this.requireString(authConfig.username, 'username');
+    if (needs.password) this.requireString(authConfig.password, 'password');
+    if (authConfig.tokenSource === 'header') {
+      // Checked before the request: a login whose answer cannot be read is
+      // not worth sending.
+      if (!authConfig.tokenHeaderName || typeof authConfig.tokenHeaderName !== 'string' || !authConfig.tokenHeaderName.trim()) {
+        throw new Error(
+          'LOGIN_TOKEN: tokenSource=header requires "tokenHeaderName" to be set',
+        );
+      }
+    } else if (authConfig.tokenSource !== 'cookie') {
+      tokenJsonPaths(authConfig.tokenJsonPath);
     }
 
-    const passwordToSend = authConfig.signedJwt && authConfig.password === undefined
-      ? ''
-      : await this.preparePassword(authConfig, request);
+    const basicAuth = loginBasicAuthHeader(authConfig);
+
+    // A login that does not use the password neither hashes it nor fetches
+    // a salt for it.
+    const passwordToSend =
+      (authConfig.signedJwt && authConfig.password === undefined) || basicAuth || !needs.password
+        ? ''
+        : await this.preparePassword(authConfig, request);
     const signedToken = authConfig.signedJwt
       ? signLoginJwt(authConfig.signedJwt)
       : undefined;
@@ -328,13 +425,42 @@ export class LoginTokenService {
     const url = authConfig.loginUrl;
     await assertSafeOutboundUrl(url);
 
+    // `${uuid}` in a login header becomes a new random UUID for this login
+    // (Walmart's token call takes the same WM_QOS.CORRELATION_ID header as its
+    // API calls).
+    // The login placeholders (`${username}`, `${password}` …) work in login
+    // headers too, for a token exchange that takes its key in a header. Only
+    // known names are replaced; any other `${…}` stays as written.
+    const loginUuid = randomUUID();
+    const headerParams: Record<string, string> = { ...templateParams, uuid: loginUuid };
+    const loginHeaders = Object.fromEntries(
+      Object.entries(authConfig.loginHeaders || {}).map(([k, v]) => [
+        k,
+        String(v).replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (m, name: string) =>
+          Object.prototype.hasOwnProperty.call(headerParams, name) ? headerParams[name] : m,
+        ),
+      ]),
+    );
+    // `loginBodyFormat: "xml"` with a string loginBody: an XML document.
+    const xmlLoginBody =
+      authConfig.loginBodyFormat === 'xml' && typeof authConfig.loginBody === 'string';
     const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      ...(authConfig.loginHeaders || {}),
+      'Content-Type': xmlLoginBody ? 'application/xml; charset=utf-8' : 'application/json',
+      ...loginHeaders,
+      ...(basicAuth ? { Authorization: basicAuth.header } : {}),
     };
+    if (
+      xmlLoginBody &&
+      Object.keys(loginHeaders).some((h) => h !== 'Content-Type' && h.toLowerCase() === 'content-type')
+    ) {
+      // loginHeaders name the type in another spelling: theirs is the one sent.
+      delete headers['Content-Type'];
+    }
 
     let data: unknown;
-    if (authConfig.loginBody !== undefined) {
+    if (xmlLoginBody) {
+      data = renderXmlLoginBody(authConfig.loginBody as string, templateParams);
+    } else if (authConfig.loginBody !== undefined) {
       data = interpolateDeep(authConfig.loginBody, templateParams);
     } else if (authConfig.loginBodyTemplate) {
       const rendered = renderTemplate(
@@ -348,26 +474,48 @@ export class LoginTokenService {
           `LOGIN_TOKEN loginBodyTemplate produced invalid JSON: ${e.message}`,
         );
       }
+    } else if (basicAuth) {
+      // The credentials travel in the Authorization header only.
+      data = undefined;
     } else {
       data = templateParams;
     }
 
     this.logger.debug(
-      `LOGIN_TOKEN: logging in via ${method} ${urlForLog(url, { secrets: [authConfig.password, passwordToSend, signedToken ?? ''] })}${request.proxyUrl ? ' (via proxy)' : ''}`,
+      `LOGIN_TOKEN: logging in via ${method} ${urlForLog(url, { secrets: [authConfig.password, passwordToSend, signedToken ?? '', ...(basicAuth?.secrets ?? [])] })}${request.proxyUrl ? ' (via proxy)' : ''}`,
     );
-    const response = await axios({
-      method,
-      url,
-      data: method === 'GET' ? undefined : data,
-      params: method === 'GET' ? data : undefined,
-      headers,
-      timeout: 15000,
-      ...outboundAxiosOptions({
-        credentialHeaders: Object.keys(authConfig.loginHeaders || {}),
-        credentialsInBody: true,
-      }),
-      ...proxyAgents(request),
-    });
+    let response: AxiosResponse;
+    try {
+      response = await axios({
+        method,
+        url,
+        data: method === 'GET' ? undefined : data,
+        params: method === 'GET' ? data : undefined,
+        headers,
+        timeout: 15000,
+        ...outboundAxiosOptions({
+          credentialHeaders: Object.keys(authConfig.loginHeaders || {}),
+          credentialsInBody: true,
+        }),
+        ...proxyAgents(request),
+      });
+    } catch (err) {
+      if (basicAuth) scrubLoginError(err, basicAuth.secrets);
+      throw labelLoginRequestError(err, {
+        secrets: [
+          authConfig.password ?? '',
+          passwordToSend,
+          signedToken ?? '',
+          ...(basicAuth?.secrets ?? []),
+          ...loginHeaderSecrets(loginHeaders),
+        ],
+        loginHeaders: Object.keys(loginHeaders),
+        connectorHeaders: request.connectorHeaders,
+      });
+    }
+    if (authConfig.loginResponseFormat === 'xml') {
+      response.data = parseXmlLoginAnswer(response);
+    }
 
     let token: unknown;
     if (authConfig.tokenSource === 'cookie' && authConfig.cookieMode === 'all') {
@@ -394,20 +542,23 @@ export class LoginTokenService {
           `LOGIN_TOKEN: cookie "${cookieName}" not found in Set-Cookie response headers`,
         );
       }
-    } else {
-      token = jsonPath(response.data, authConfig.tokenJsonPath);
-      if (!token || typeof token !== 'string') {
-        // Far and away the commonest reason the token is missing is that the
-        // login itself was refused — wrong password, 2FA, a locked account.
-        // The endpoint answers 200 and puts the reason in the body, so saying
-        // "token not found at data.signIn.jwtToken.token" describes our own
-        // JSON path and hides the vendor's explanation. Sorare accounted for
-        // thirteen failures reported that way.
-        const refusal = extractLoginRefusal(response.data);
+    } else if (authConfig.tokenSource === 'header') {
+      const headerName = String(authConfig.tokenHeaderName).trim();
+      token = extractResponseHeader(response.headers, headerName);
+      if (!token) {
         throw new Error(
-          refusal
-            ? `LOGIN_TOKEN: the service refused the login — ${refusal}`
-            : `LOGIN_TOKEN: token not found at "${authConfig.tokenJsonPath}" in login response`,
+          `LOGIN_TOKEN: header "${headerName}" not found in the login response headers`,
+        );
+      }
+    } else {
+      const paths = tokenJsonPaths(authConfig.tokenJsonPath);
+      token = readTokenAt(response.data, paths);
+      if (!token) {
+        // No token means the login is rejected. missingTokenMessage only
+        // chooses the sentence. A field in the body cannot skip the throw
+        // or decide which lookup runs.
+        throw new Error(
+          missingTokenMessage(response.data, paths, authConfig.loginResponseFormat === 'xml'),
         );
       }
     }
@@ -442,7 +593,7 @@ export class LoginTokenService {
     request: LoginRequestOptions,
   ): Promise<string> {
     const hashing = authConfig.passwordHashing;
-    if (!hashing || hashing.scheme === 'none') return authConfig.password;
+    if (!hashing || hashing.scheme === 'none') return authConfig.password ?? '';
     if (hashing.scheme !== 'bcrypt') {
       throw new Error(
         `LOGIN_TOKEN: unsupported passwordHashing.scheme "${hashing.scheme}"`,
@@ -455,7 +606,7 @@ export class LoginTokenService {
         'LOGIN_TOKEN: passwordHashing.scheme=bcrypt requires a non-empty salt',
       );
     }
-    return bcrypt.hashSync(authConfig.password, salt);
+    return bcrypt.hashSync(authConfig.password ?? '', salt);
   }
 
   private async resolveSalt(
@@ -474,7 +625,7 @@ export class LoginTokenService {
       throw new Error('LOGIN_TOKEN: saltSource.url is required when type=fetch');
     }
 
-    const url = src.url.replace(/\$\{username\}/g, encodeURIComponent(authConfig.username));
+    const url = src.url.replace(/\$\{username\}/g, encodeURIComponent(authConfig.username ?? ''));
     await assertSafeOutboundUrl(url);
 
     const method = (src.method || 'GET').toUpperCase();
@@ -598,6 +749,338 @@ export class LoginTokenService {
       throw new Error(`LOGIN_TOKEN: authConfig.${name} is required`);
     }
   }
+}
+
+/**
+ * The login's `Authorization: Basic` header when `loginBasicAuth` is true,
+ * else undefined. Built here from username and password, never through a
+ * template. Explicit configuration conflicts are refused instead of resolved
+ * silently: an Authorization in loginHeaders (which one would the vendor see?),
+ * signedJwt (no password), bcrypt passwordHashing (Basic sends the password
+ * as is) and a username with ":" (RFC 7617 cannot encode it). No error quotes
+ * a credential. `secrets` lists the strings to keep out of logs and errors.
+ */
+export function loginBasicAuthHeader(
+  cfg: LoginTokenAuthConfig,
+): { header: string; secrets: string[] } | undefined {
+  const flag = (cfg as { loginBasicAuth?: unknown }).loginBasicAuth;
+  if (flag === undefined || flag === false) return undefined;
+  if (flag !== true) {
+    throw new Error('LOGIN_TOKEN: loginBasicAuth must be true or false');
+  }
+  if (cfg.signedJwt) {
+    throw new Error('LOGIN_TOKEN: loginBasicAuth cannot be combined with signedJwt');
+  }
+  if (cfg.passwordHashing && cfg.passwordHashing.scheme !== 'none') {
+    throw new Error(
+      'LOGIN_TOKEN: loginBasicAuth sends the password as is and cannot be combined with passwordHashing',
+    );
+  }
+  if (Object.keys(cfg.loginHeaders || {}).some((h) => h.toLowerCase() === 'authorization')) {
+    throw new Error(
+      'LOGIN_TOKEN: loginBasicAuth sets the login Authorization header itself; remove Authorization from loginHeaders',
+    );
+  }
+  for (const name of ['username', 'password'] as const) {
+    const v = cfg[name];
+    if (!v || typeof v !== 'string') {
+      throw new Error(`LOGIN_TOKEN: authConfig.${name} is required`);
+    }
+  }
+  const username = cfg.username as string;
+  const password = cfg.password as string;
+  if (username.includes(':')) {
+    throw new Error('LOGIN_TOKEN: loginBasicAuth: the username must not contain ":"');
+  }
+  const encoded = Buffer.from(`${username}:${password}`, 'utf8').toString('base64');
+  return { header: `Basic ${encoded}`, secrets: [password, encoded] };
+}
+
+/**
+ * Remove the Basic credentials from a failed login's error before it travels
+ * on: the Authorization header from the request config axios attaches (also
+ * under response.config), the raw request head Node keeps on the request, and
+ * any occurrence of a secret in the message. Status and response stay, so the
+ * callers still see a 401 as a 401.
+ */
+function scrubLoginError(err: unknown, secrets: string[]): void {
+  if (!err || typeof err !== 'object') return;
+  const e = err as {
+    message?: unknown;
+    config?: { headers?: unknown };
+    response?: { config?: { headers?: unknown } };
+    request?: { _header?: unknown };
+  };
+  for (const holder of [e.config, e.response?.config]) {
+    const headers = holder?.headers as Record<string, unknown> | undefined;
+    if (!headers || typeof headers !== 'object') continue;
+    const del = (headers as { delete?: unknown }).delete;
+    if (typeof del === 'function') del.call(headers, 'Authorization');
+    for (const k of Object.keys(headers)) {
+      if (k.toLowerCase() === 'authorization') delete headers[k];
+    }
+  }
+  if (e.request && typeof e.request === 'object' && typeof e.request._header === 'string') {
+    e.request._header = e.request._header.replace(/^authorization:.*$/gim, 'Authorization: [redacted]');
+  }
+  if (typeof e.message === 'string') {
+    let m = e.message;
+    for (const secret of secrets) if (secret) m = m.split(secret).join('[redacted]');
+    e.message = m;
+  }
+}
+
+/** The token path that means "the whole response body". */
+export const WHOLE_BODY_PATH = '.';
+
+/** Whether a token path addresses the whole body ("", ".", or no segments). */
+export function isWholeBodyPath(path: string): boolean {
+  return path.replace(/\[(\d+)\]/g, '.$1').split('.').filter((p) => p.trim()).length === 0;
+}
+
+/**
+ * The token path(s) of an authConfig as a list. A single string is the usual
+ * form; a list is for logins whose answer is undocumented, tried in order.
+ * Absent, empty (`""`, `[]`) or `"."` means the whole response body, for a
+ * login that answers with a bare token (plain text or a JSON string). A
+ * non-string entry is a configuration error.
+ */
+export function tokenJsonPaths(value: unknown): string[] {
+  if (value === undefined || value === null) return [WHOLE_BODY_PATH];
+  const list = Array.isArray(value) ? value : [value];
+  if (list.some((p) => typeof p !== 'string')) {
+    throw new Error(
+      'LOGIN_TOKEN: authConfig.tokenJsonPath must be a path, or a list of paths (empty for the whole response body)',
+    );
+  }
+  if (list.length === 0) return [WHOLE_BODY_PATH];
+  return (list as string[]).map((p) => (isWholeBodyPath(p) ? WHOLE_BODY_PATH : p.trim()));
+}
+
+/**
+ * The token when the whole response body is the token: a plain-text answer
+ * or a JSON string, without the white space and quotes around it. A safe
+ * integer counts (axios parses a bare `12345` as a number); anything else
+ * (an object, an empty body) is not a token.
+ */
+function wholeBodyToken(body: unknown): string | undefined {
+  if (typeof body === 'number' && Number.isSafeInteger(body)) return String(body);
+  if (typeof body !== 'string') return undefined;
+  let text = body.trim();
+  if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) {
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (typeof parsed === 'string') text = parsed.trim();
+    } catch {
+      // Not a JSON string: the quotes are part of the text.
+    }
+  }
+  return text || undefined;
+}
+
+/** The first non-empty string found at one of `paths`, in order. */
+export function readTokenAt(body: unknown, paths: string[]): string | undefined {
+  for (const path of paths) {
+    if (isWholeBodyPath(path)) {
+      const token = wholeBodyToken(body);
+      if (token) return token;
+      continue;
+    }
+    const value = jsonPath(body, path);
+    if (typeof value === 'string' && value.trim() !== '') return value;
+  }
+  return undefined;
+}
+
+/**
+ * The error text when a login answer contained no token.
+ *
+ * Far and away the commonest reason is that the login was refused (wrong
+ * password, 2FA, a locked account) and the endpoint still answered 200.
+ * Naming only our JSON path hides the vendor's explanation. Sorare
+ * accounted for thirteen failures reported that way. SkuVault instead
+ * answers 200 with the token field set to null.
+ *
+ * The lookups always run. Their results are read afterwards, in order, and
+ * never decide whether the login is rejected.
+ */
+function missingTokenMessage(body: unknown, paths: string[], xml: boolean): string {
+  const fromJson = extractLoginRefusal(body);
+  const fromXml = extractXmlLoginRefusal(body);
+  const fromNull = nullTokenRefusal(body, paths);
+  const refusal = firstNonEmpty(fromJson, xml ? fromXml : null, fromNull);
+  if (refusal) return `LOGIN_TOKEN: the service refused the login — ${refusal}`;
+  return tokenNotFoundMessage(paths, body);
+}
+
+function firstNonEmpty(...parts: Array<string | null>): string | null {
+  for (const part of parts) {
+    if (part) return part;
+  }
+  return null;
+}
+
+/**
+ * SkuVault's getTokens, and APIs like it, answer HTTP 200 with the token
+ * field set to null when the login is refused. That is a refusal, not a
+ * path we guessed wrong.
+ */
+function nullTokenRefusal(body: unknown, paths: string[]): string | null {
+  for (const path of paths) {
+    if (isWholeBodyPath(path)) continue;
+    if (jsonPath(body, path) === null) return `the token at "${path}" was null`;
+  }
+  return null;
+}
+
+/** Why no token was found, naming the paths (the whole body in words). */
+function tokenNotFoundMessage(paths: string[], body: unknown): string {
+  if (paths.length === 1 && isWholeBodyPath(paths[0])) {
+    const shape =
+      body === undefined || body === null || (typeof body === 'string' && !body.trim())
+        ? 'was empty'
+        : Array.isArray(body)
+          ? 'is a JSON array'
+          : typeof body === 'object'
+            ? 'is a JSON object'
+            : `is a ${typeof body}`;
+    return (
+      `LOGIN_TOKEN: token not found: the login response body ${shape}, not a plain-text token. ` +
+      'Set tokenJsonPath ("Token JSON path") to the field that holds the token; leave it empty only when the whole body is the token'
+    );
+  }
+  const named = paths.map((p) => (isWholeBodyPath(p) ? 'the whole body' : `"${p}"`));
+  return `LOGIN_TOKEN: token not found at ${named.join(', ')} in login response`;
+}
+
+/**
+ * Which credentials a login actually uses, so a key-only token exchange can
+ * leave username and password empty.
+ *
+ * - signedJwt: neither (as before).
+ * - loginBasicAuth: both (loginBasicAuthHeader checks them).
+ * - no loginBody and no loginBodyTemplate: both, because the default body is
+ *   the credentials themselves.
+ * - otherwise: what the loginBody, loginBodyTemplate and loginHeaders
+ *   reference. `${username}` needs the username; `${password}`,
+ *   `${passwordHashed}` (or passwordHashing.outputParam) need the password,
+ *   and a bcrypt salt fetched from a URL with `${username}` needs both.
+ */
+export function loginCredentialNeeds(cfg: LoginTokenAuthConfig): {
+  username: boolean;
+  password: boolean;
+} {
+  if (cfg.signedJwt) return { username: false, password: false };
+  if ((cfg as { loginBasicAuth?: unknown }).loginBasicAuth === true) {
+    return { username: true, password: true };
+  }
+  if (cfg.loginBody === undefined && !cfg.loginBodyTemplate) {
+    return { username: true, password: true };
+  }
+  const text = JSON.stringify([cfg.loginBody ?? null, cfg.loginBodyTemplate ?? null, cfg.loginHeaders ?? null]);
+  const uses = (name: string) => text.includes('${' + name + '}');
+  const passwordNames = ['password', 'passwordHashed', cfg.passwordHashing?.outputParam].filter(
+    (n): n is string => typeof n === 'string' && n.length > 0,
+  );
+  const password = passwordNames.some(uses);
+  const saltUrl = cfg.passwordHashing?.scheme === 'bcrypt' ? cfg.passwordHashing.saltSource?.url : undefined;
+  const username = uses('username') || (password && typeof saltUrl === 'string' && saltUrl.includes('${username}'));
+  return { username, password };
+}
+
+/** Login header names whose values are not credentials, kept in error excerpts. */
+const PLAIN_LOGIN_HEADERS = new Set(['content-type', 'accept', 'accept-language', 'user-agent']);
+
+/** The login header values to keep out of an error excerpt. */
+function loginHeaderSecrets(headers: Record<string, string>): string[] {
+  return Object.entries(headers)
+    .filter(([name]) => !PLAIN_LOGIN_HEADERS.has(name.toLowerCase()))
+    .map(([, value]) => value);
+}
+
+const LOGIN_EXCERPT_MAX = 300;
+
+/**
+ * A short, single-line excerpt of a failed login's answer: HTML tags dropped,
+ * white space collapsed, the given secrets (and the bare value behind a
+ * `Bearer `/`Basic ` prefix) replaced by [redacted], cut at 300 characters.
+ */
+export function loginBodyExcerpt(data: unknown, secrets: string[] = []): string {
+  let text: string;
+  if (data === undefined || data === null) text = '';
+  else if (typeof data === 'string') text = data;
+  else if (Buffer.isBuffer(data)) text = data.toString('utf8');
+  else if (data instanceof ArrayBuffer) text = Buffer.from(data).toString('utf8');
+  else {
+    try {
+      text = JSON.stringify(data);
+    } catch {
+      text = String(data);
+    }
+  }
+  if (/<(html|body|head|!doctype)\b/i.test(text)) {
+    text = text.replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, ' ').replace(/<[^>]+>/g, ' ');
+  }
+  text = text.replace(/\s+/g, ' ').trim();
+  const words = new Set<string>();
+  for (const secret of secrets) {
+    if (typeof secret !== 'string' || secret.length < 4) continue;
+    words.add(secret);
+    const bare = /^(?:bearer|basic|token)\s+(.+)$/i.exec(secret.trim())?.[1];
+    if (bare && bare.length >= 4) words.add(bare);
+  }
+  for (const word of [...words].sort((a, b) => b.length - a.length)) {
+    text = text.split(word).join('[redacted]');
+  }
+  return text.length > LOGIN_EXCERPT_MAX ? `${text.slice(0, LOGIN_EXCERPT_MAX)}…` : text;
+}
+
+/**
+ * Restate an error thrown by the login request itself, so it cannot be taken
+ * for a failed tool call: `LOGIN_TOKEN: login request failed (HTTP 401
+ * Unauthorized): <excerpt of the answer>`, or with the network error code and
+ * message when nothing answered. The error object stays the same (an axios
+ * error keeps its response and status, which the callers classify by), and
+ * gets `hint` (what to fix in the login settings, see loginRequestHint) and
+ * `loginRequestFailed: true`.
+ */
+export function labelLoginRequestError(
+  err: unknown,
+  options: { secrets?: string[]; loginHeaders?: string[]; connectorHeaders?: string[] } = {},
+): unknown {
+  if (!err || typeof err !== 'object') return err;
+  const e = err as {
+    message?: unknown;
+    code?: unknown;
+    response?: { status?: unknown; statusText?: unknown; data?: unknown };
+    hint?: string;
+    loginRequestFailed?: boolean;
+  };
+  if (e.loginRequestFailed) return err;
+  const status = typeof e.response?.status === 'number' ? e.response.status : undefined;
+  const original = typeof e.message === 'string' ? e.message : '';
+  if (status !== undefined) {
+    const statusText =
+      typeof e.response?.statusText === 'string' && e.response.statusText.trim()
+        ? ` ${e.response.statusText.trim()}`
+        : '';
+    const excerpt = loginBodyExcerpt(e.response?.data, options.secrets);
+    e.message = `${LOGIN_REQUEST_FAILED_PREFIX} (HTTP ${status}${statusText}): ${excerpt || 'empty response body'}`;
+  } else {
+    const code = typeof e.code === 'string' && e.code ? e.code : 'no response';
+    e.message = `${LOGIN_REQUEST_FAILED_PREFIX} (${code}): ${loginBodyExcerpt(original, options.secrets) || 'no details'}`;
+  }
+  e.hint = loginRequestHint(status, {
+    connectorHeaders: options.connectorHeaders,
+    loginHeaders: options.loginHeaders,
+  });
+  e.loginRequestFailed = true;
+  return err;
+}
+
+/** Whether an error comes from a failed Login → Token login request. */
+export function isLoginRequestError(err: unknown): boolean {
+  return !!err && typeof err === 'object' && (err as { loginRequestFailed?: unknown }).loginRequestFailed === true;
 }
 
 /**
@@ -735,6 +1218,32 @@ export function extractSetCookieValue(
 }
 
 /**
+ * The value of a named response header, matched without regard to case (HTTP
+ * header names are case-insensitive, and Node hands them over in lower case
+ * whatever the server wrote). Surrounding white space is dropped; when the
+ * header came more than once, the first non-empty value is taken. Null when
+ * the response has no such header or only an empty one.
+ *
+ * Example: extractResponseHeader(headers, "access_token") reads the bearer
+ * token Ceneo's GetToken call answers in its `access_token` header.
+ */
+export function extractResponseHeader(
+  headers: Record<string, unknown> | undefined,
+  headerName: string,
+): string | null {
+  if (!headers || typeof headers !== 'object') return null;
+  const wanted = headerName.trim().toLowerCase();
+  if (!wanted) return null;
+  for (const [name, raw] of Object.entries(headers)) {
+    if (name.toLowerCase() !== wanted) continue;
+    for (const value of Array.isArray(raw) ? raw : [raw]) {
+      if (typeof value === 'string' && value.trim() !== '') return value.trim();
+    }
+  }
+  return null;
+}
+
+/**
  * Every cookie a response sets, as the value of a `Cookie` request header:
  * `name=value` pairs joined with "; ", in the order they were set. Attributes
  * (Path, Domain, HttpOnly ...) are dropped. When a name is set more than once
@@ -847,6 +1356,74 @@ export function extractLoginRefusal(body: unknown): string | null {
 }
 
 /**
+ * A string `loginBody` with `loginBodyFormat: "xml"`: every `${name}` becomes
+ * the value XML-escaped, so a key with `&` or `<` in it cannot break the
+ * document; an unknown name becomes empty, as in the other login bodies.
+ */
+export function renderXmlLoginBody(
+  template: string,
+  params: Record<string, string>,
+): string {
+  return template.replace(
+    /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g,
+    (_m, name: string) =>
+      Object.prototype.hasOwnProperty.call(params, name) ? escapeXmlValue(String(params[name] ?? '')) : '',
+  );
+}
+
+/**
+ * The login answer for `loginResponseFormat: "xml"`: a string body that is
+ * declared XML, or that starts with `<`, parsed with the REST engine's XML
+ * parser. Anything else (an object axios already parsed, text that is not
+ * XML, a document that does not parse) is returned as it arrived.
+ */
+export function parseXmlLoginAnswer(response: {
+  data: unknown;
+  headers?: unknown;
+}): unknown {
+  const { data } = response;
+  if (typeof data !== 'string') return data;
+  const contentType = (response.headers as Record<string, unknown> | undefined)?.['content-type'];
+  if (!isXmlContentType(contentType) && !data.trimStart().startsWith('<')) return data;
+  try {
+    const parsed = xmlParser.parse(data);
+    return parsed && typeof parsed === 'object' && Object.keys(parsed).length > 0 ? parsed : data;
+  } catch {
+    return data;
+  }
+}
+
+/**
+ * The refusal text of an XML login answer that carried no token: the text of
+ * the first `<error>` element. One with attributes parses to an object whose
+ * text is under `#text` (`<error code="ERR_097">Authentication failed</error>`),
+ * which {@link extractLoginRefusal} does not read. The error's `code`
+ * attribute is put in front when there is one.
+ */
+export function extractXmlLoginRefusal(body: unknown): string | null {
+  const seen = new Set<unknown>();
+  const walk = (node: unknown, depth: number): string | null => {
+    if (!node || typeof node !== 'object' || depth > 4 || seen.has(node)) return null;
+    seen.add(node);
+    const obj = node as Record<string, unknown>;
+    const errors = Array.isArray(obj.error) ? obj.error : [obj.error];
+    for (const error of errors) {
+      if (!error || typeof error !== 'object') continue;
+      const text = (error as Record<string, unknown>)['#text'];
+      if (typeof text !== 'string' || !text.trim()) continue;
+      const code = (error as Record<string, unknown>).code;
+      return typeof code === 'string' && code.trim() ? `${code.trim()}: ${text.trim()}` : text.trim();
+    }
+    for (const v of Object.values(obj)) {
+      const found = walk(v, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  };
+  return walk(body, 0);
+}
+
+/**
  * Agents for a login that goes through the connector proxy, set after the
  * outbound spread as the tool calls do (see rest.engine). Empty without one.
  */
@@ -854,4 +1431,21 @@ function proxyAgents(request: LoginRequestOptions) {
   if (!request.proxyUrl) return {};
   const agent = createUnblockerProxyAgent(request.proxyUrl);
   return { httpAgent: agent, httpsAgent: agent, proxy: false as const };
+}
+
+/**
+ * Placeholder renderer for LOGIN_TOKEN API headers: `${token}`, `${aud}` and
+ * `${uuid}`. The UUID is drawn once per request, so two headers that both use
+ * `${uuid}` carry the same value.
+ */
+export function loginTokenHeaderInterpolator(
+  token: string,
+  aud?: string,
+): (s: string) => string {
+  let uuid: string | undefined;
+  return (s: string): string =>
+    s
+      .replace(/\$\{token\}/g, token)
+      .replace(/\$\{aud\}/g, aud || '')
+      .replace(/\$\{uuid\}/g, () => (uuid ??= randomUUID()));
 }

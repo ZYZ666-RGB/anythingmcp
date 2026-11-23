@@ -3,13 +3,19 @@ import { Logger } from '@nestjs/common';
 // LoginController -> SsoService. Nothing here exercises the network half.
 jest.mock('openid-client', () => ({}));
 
-import { LoginController } from './login.controller';
+import { CONTINUE_ONCE_SCRIPT, LoginController } from './login.controller';
+import { followPausedPageInPlace } from './paused-page.spec-helper';
+import { TELEGRAM_ONE_TAP } from '../adapters/telegram-managed-bot';
+import { TELEGRAM_PANEL_SCRIPT } from './first-app-telegram';
 import type { SsoService } from '../identity-providers/sso.service';
 import type { Request, Response } from 'express';
 import type { AuthService } from './auth.service';
 import type { PrismaService } from '../common/prisma.service';
 import type { ConfigService } from '@nestjs/config';
 import type { PrismaOAuthStore } from './prisma-oauth.store';
+
+// The page after approving is reached through a redirect: follow it in place.
+followPausedPageInPlace();
 
 interface FakeRes extends Response {
   _cookies: Record<string, { value: string; options: any }>;
@@ -51,8 +57,9 @@ function makeRes(): FakeRes {
       this._json = payload;
       return this;
     },
-    redirect(url: string) {
-      this._redirect = url;
+    redirect(a: string | number, b?: string) {
+      // Express: redirect(url) or redirect(status, url).
+      this._redirect = typeof a === 'number' ? (b as string) : a;
       return this;
     },
   };
@@ -84,6 +91,8 @@ describe('LoginController', () => {
     grantWholeOrganization: jest.Mock;
     listSelectableTargets: jest.Mock;
     resolve: jest.Mock;
+    keepVisible: jest.Mock;
+    restrictedIn: jest.Mock;
   };
 
   beforeEach(() => {
@@ -94,7 +103,7 @@ describe('LoginController', () => {
       }),
     };
     prisma = { user: { findUnique: jest.fn(), findMany: jest.fn().mockResolvedValue([]) } };
-    config = { get: jest.fn().mockReturnValue(undefined) };
+    config = { get: jest.fn((key: string) => (key === 'AUTHORIZE_SIGNIN_PAGE_TEST' ? 'off' : undefined)) as any };
     store = { getOAuthSession: jest.fn(), getClient: jest.fn() };
     sso = { startMcp: jest.fn() };
     grants = {
@@ -103,6 +112,9 @@ describe('LoginController', () => {
       listSelectableTargets: jest.fn().mockResolvedValue([]),
       // No grant: the user's own organization, as before grants existed.
       resolve: jest.fn().mockResolvedValue(null),
+      // Member visibility hides nothing unless a test says so.
+      keepVisible: jest.fn(async (_userId: string, servers: unknown[]) => servers),
+      restrictedIn: jest.fn().mockResolvedValue(false),
     };
 
     controller = new LoginController(
@@ -117,6 +129,18 @@ describe('LoginController', () => {
   });
 
   describe('GET /auth/login (consent + CSRF)', () => {
+    /** A pending authorization from Claude in this browser (cookie `oauth_session=s1`). */
+    const pending = () => {
+      store.getOAuthSession.mockResolvedValue({
+        sessionId: 's1',
+        state: 'x',
+        clientId: 'client-abc',
+        redirectUri: 'https://claude.ai/api/mcp/auth_callback',
+        expiresAt: Date.now() + 20 * 60_000,
+      } as any);
+      store.getClient.mockResolvedValue({ client_id: 'client-abc', client_name: 'Claude' } as any);
+    };
+
     it('renders the client name and redirect host for a pending OAuth session', async () => {
       store.getOAuthSession.mockResolvedValue({
         sessionId: 's1',
@@ -146,10 +170,12 @@ describe('LoginController', () => {
       expect(csrf).toBeDefined();
       expect(csrf.options.signed).toBe(true);
       expect(csrf.options.httpOnly).toBe(true);
-      expect(res._sent).toContain(`name="csrf" value="${csrf.value}"`);
+      // The form holds the token; the cookie also names the pending authorization it belongs to.
+      expect(res._sent).toContain(`name="csrf" value="${csrf.value.split('.')[0]}"`);
     });
 
     it('renders the provider mark unescaped and the provider name escaped', async () => {
+      pending();
       // Locks the new markup and the escaping invariant together: the SVG
       // must reach the page intact, the admin-supplied name must not.
       (prisma as any).mcpServerConfig = {
@@ -165,7 +191,7 @@ describe('LoginController', () => {
       await controller.showLoginPage(
         undefined as unknown as string,
         undefined as unknown as string,
-        makeReq({ cookies: {}, signedCookies: { mcp_resource: 'srv-1' } } as any),
+        makeReq({ cookies: { oauth_session: 's1' }, signedCookies: { mcp_resource: 'srv-1' } } as any),
         res,
       );
 
@@ -189,14 +215,15 @@ describe('LoginController', () => {
         { mode: 'cloud', isCloud: () => true, isSelfHosted: () => false } as any,
         grants as any,
       );
+      pending();
       const res = makeRes();
       await cloud.showLoginPage(
         undefined as unknown as string,
         undefined as unknown as string,
-        makeReq({ cookies: {} }),
+        makeReq({ cookies: { oauth_session: 's1' } }),
         res,
       );
-      expect(res._sent).toContain('href="/login?mode=register&amp;redirect=%2Fauth%2Flogin"');
+      expect(res._sent).toContain('href="/login?mode=register&amp;redirect=%2Fauth%2Flogin&amp;client=claude"');
       expect(res._sent).toContain('href="/forgot-password"');
       // The sign-up is a button at the top of the card, before the form.
       expect(res._sent).toContain('class="signup-btn"');
@@ -214,25 +241,32 @@ describe('LoginController', () => {
         { mode: 'cloud', isCloud: () => true, isSelfHosted: () => false } as any,
         grants as any,
       );
+      pending();
       const res = makeRes();
-      await cloud.showLoginPage('Invalid email or password', undefined as unknown as string, makeReq({ cookies: {} }), res);
+      await cloud.showLoginPage(
+        'Invalid email or password',
+        undefined as unknown as string,
+        makeReq({ cookies: { oauth_session: 's1' } }),
+        res,
+      );
       expect(res._sent).not.toContain('class="signup-btn"');
-      expect(res._sent).toContain('href="/login?mode=register&amp;redirect=%2Fauth%2Flogin"');
+      expect(res._sent).toContain('href="/login?mode=register&amp;redirect=%2Fauth%2Flogin&amp;client=claude"');
     });
 
     it('offers no sign-up on self-hosted (registration is invite-based there)', async () => {
+      pending();
       const res = makeRes();
       await controller.showLoginPage(
         undefined as unknown as string,
         undefined as unknown as string,
-        makeReq({ cookies: {} }),
+        makeReq({ cookies: { oauth_session: 's1' } }),
         res,
       );
       expect(res._sent).not.toContain('mode=register');
       expect(res._sent).toContain('href="/forgot-password"');
     });
 
-    it('falls back to a generic form (no consent block) without a session', async () => {
+    it('shows the "no longer open" page, not a form, without a pending authorization', async () => {
       const res = makeRes();
       await controller.showLoginPage(
         undefined as unknown as string,
@@ -241,8 +275,27 @@ describe('LoginController', () => {
         res,
       );
       expect(store.getOAuthSession).not.toHaveBeenCalled();
+      // Signing in here could only end in a refused callback: no form, no token.
+      expect(res._sent).toContain('<h1>This connection request is no longer open</h1>');
+      expect(res._sent).toContain('press <strong>Connect</strong> again');
+      expect(res._sent).not.toContain('name="password"');
       expect(res._sent).not.toContain('class="consent"');
-      expect(res._cookies['login_csrf']).toBeDefined();
+      expect(res._cookies['login_csrf']).toBeUndefined();
+      expect(res._headers['Cache-Control']).toBe('no-store');
+    });
+
+    it('says the same for an authorization that expired, with the message of the step that noticed', async () => {
+      store.getOAuthSession.mockResolvedValue(undefined as any);
+      const res = makeRes();
+      await controller.showLoginPage(
+        'Your authorization request expired. Start again from your AI client.',
+        undefined as unknown as string,
+        makeReq({ cookies: { oauth_session: 'gone' } }),
+        res,
+      );
+      expect(res._sent).toContain('This connection request is no longer open');
+      expect(res._sent).toContain('Your authorization request expired. Start again from your AI client.');
+      expect(res._sent).not.toContain('name="csrf"');
     });
   });
 
@@ -268,6 +321,29 @@ describe('LoginController', () => {
       );
       expect(prisma.user.findUnique).not.toHaveBeenCalled();
       expect(res._redirect).toContain('/auth/login?error=');
+    });
+
+    it('redirects instead of crashing when the POST has no form body', async () => {
+      const res = makeRes();
+      await controller.handleLogin(
+        makeReq({ signedCookies: { login_csrf: 'tok' } }),
+        undefined as any,
+        res,
+      );
+      expect(prisma.user.findUnique).not.toHaveBeenCalled();
+      expect(res._redirect).toContain('/auth/login?error=');
+      expect(res._cleared).toContain('login_csrf');
+    });
+
+    it('redirects instead of crashing when the server selection has no form body', async () => {
+      const res = makeRes();
+      await controller.handleServerSelection(
+        makeReq({ signedCookies: { login_csrf: 'tok' } }),
+        undefined as any,
+        res,
+      );
+      expect(res._redirect).toContain('/auth/login?error=');
+      expect(res._cleared).toContain('login_csrf');
     });
   });
 
@@ -478,7 +554,9 @@ describe('LoginController', () => {
       const res = await getPage({ amcp_token: 'jwt' });
 
       expect(authService.verifyToken).not.toHaveBeenCalled();
-      expect(res._sent).toContain('name="password"');
+      // No form at all outside an authorization: the "no longer open" page.
+      expect(res._sent).toContain('This connection request is no longer open');
+      expect(res._sent).not.toContain('approve-session');
     });
 
     it.each([
@@ -620,25 +698,22 @@ describe('LoginController', () => {
       cloudPrisma.user.findUnique.mockImplementation(({ select }: any) =>
         select?.organizationId
           ? { organizationId: 'org-1', email: 'a@b.com' }
-          : { id: 'u1', email: 'a@b.com', name: 'A', passwordHash: 'hash' },
+          : { id: 'u1', email: 'a@b.com', name: 'A', passwordHash: 'hash', emailVerified: true },
       );
-      cloudPrisma.user.findMany.mockResolvedValue([{ id: 'u1', email: 'a@b.com', name: 'A', passwordHash: 'hash' }]);
+      cloudPrisma.user.findMany.mockResolvedValue([{ id: 'u1', email: 'a@b.com', name: 'A', passwordHash: 'hash', emailVerified: true }]);
       cloudPrisma.organizationMember.findFirst.mockResolvedValue({ role: opts.role ?? 'ADMIN' });
       cloudPrisma.connector.count.mockResolvedValue(opts.connectors ?? 0);
       authService.comparePassword.mockResolvedValue(true);
     };
 
-    const login = async (signedCookies: Record<string, string> = {}) => {
+    const login = async (signedCookies: Record<string, string> = {}, headers: Record<string, string> = {}) => {
       const res = makeRes();
-      await cloud.handleLogin(
-        makeReq({
-          cookies: { oauth_session: 's1' },
-          signedCookies: { login_csrf: 'tok', ...signedCookies },
-          headers: { host: 'mcp.test' },
-        } as any),
-        { email: 'a@b.com', password: 'pw', csrf: 'tok', action: 'approve' },
-        res,
-      );
+      const request = makeReq({
+        cookies: { oauth_session: 's1' },
+        signedCookies: { login_csrf: 'tok', ...signedCookies },
+        headers: { host: 'mcp.test', ...headers },
+      } as any);
+      await cloud.handleLogin(request, { email: 'a@b.com', password: 'pw', csrf: 'tok', action: 'approve' }, res);
       return res;
     };
 
@@ -651,8 +726,10 @@ describe('LoginController', () => {
       productEvents = { log: jest.fn().mockResolvedValue(undefined) };
       licenseGuard = { getTrialState: jest.fn().mockResolvedValue(null) };
       eligibility = { hadSubscription: jest.fn().mockResolvedValue(false) };
+      // The page test (authorization-attempt.ts) is held on its control arm
+      // here: the tests of the arms set it themselves.
       config.get.mockImplementation((key: string) =>
-        key === 'FRONTEND_URL' ? 'https://cloud.example/' : undefined,
+        key === 'FRONTEND_URL' ? 'https://cloud.example/' : key === 'AUTHORIZE_CONNECTED_PAGE_TEST' ? 'control' : key === 'AUTHORIZE_SIGNIN_PAGE_TEST' ? 'off' : undefined,
       );
       cloud = new LoginController(
         authService as unknown as AuthService,
@@ -666,6 +743,50 @@ describe('LoginController', () => {
         licenseGuard as any,
         eligibility as any,
       );
+    });
+
+    // The funnel before sign-up: a view inside a pending authorization is
+    // recorded once per attempt, with the client and the kind of device.
+    it('records that the sign-in page was opened inside an authorization', async () => {
+      arrange();
+      productEvents.log.mockClear();
+      const view = (userAgent: string, cookies: Record<string, string> = { oauth_session: 's1' }) =>
+        cloud.showLoginPage(
+          undefined as unknown as string,
+          undefined as unknown as string,
+          makeReq({ cookies, headers: { host: 'mcp.test', 'user-agent': userAgent } } as any),
+          makeRes(),
+        );
+      await view('Mozilla/5.0 (iPhone; CPU iPhone OS 26_6 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1');
+      await view('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36');
+      const views = productEvents.log.mock.calls.map((c) => c[0]).filter((e) => e.event === 'authorize_page_viewed');
+      expect(views).toHaveLength(2);
+      expect(views[0].metadata).toEqual({
+        client: 'Claude',
+        device: 'mobile',
+        attempt: expect.stringMatching(/^[0-9a-z]{6,12}$/),
+        connectedArm: 'control',
+        // No Accept-Language header: no language bucket.
+        lang: undefined,
+      });
+      expect(views[1].metadata.device).toBe('desktop');
+      // The same authorization: the same value, so a reload counts once.
+      expect(views[1].metadata.attempt).toBe(views[0].metadata.attempt);
+      // Nothing of the session id.
+      expect(JSON.stringify(views)).not.toContain('"s1"');
+      expect(views[0].userId).toBeUndefined();
+    });
+
+    it('records nothing for a page opened outside an authorization', async () => {
+      arrange({ session: false });
+      productEvents.log.mockClear();
+      await cloud.showLoginPage(
+        undefined as unknown as string,
+        undefined as unknown as string,
+        makeReq({ cookies: {}, headers: { host: 'mcp.test' } } as any),
+        makeRes(),
+      );
+      expect(productEvents.log.mock.calls.map((c) => c[0].event)).not.toContain('authorize_page_viewed');
     });
 
     it('explains how to add an app before handing back to the client', async () => {
@@ -718,17 +839,20 @@ describe('LoginController', () => {
         ...over,
       });
 
-      it('tells an admin on the free trial when it ends, under Continue, in a new tab', async () => {
+      it('offers an admin on the free trial a payment method under Continue, coming back through /callback', async () => {
         arrange();
         licenseGuard.getTrialState.mockResolvedValue(trial());
         const res = await login();
 
         expect(licenseGuard.getTrialState).toHaveBeenCalledWith('org-1');
         expect(res._sent).toContain('Your free trial runs until October&nbsp;13.');
-        expect(res._sent).toContain('Nothing is charged before October&nbsp;13.');
-        expect(res._sent).toMatch(
-          /<a href="https:\/\/cloud\.example\/start-trial\?source=post_approve" target="_blank" rel="noopener noreferrer">add a card now \(new tab\)<\/a>/,
+        expect(res._sent).toContain('nothing is charged before October&nbsp;13.');
+        // Same tab: the card-trial page sends every way out back to /callback,
+        // which finishes this authorization.
+        expect(res._sent).toContain(
+          '<a class="button secondary-link" id="card-trial-link" href="https://cloud.example/start-trial?source=post_approve&amp;return=%2Fcallback">Add a payment method (optional)</a>',
         );
+        expect(res._sent).not.toMatch(/id="card-trial-link"[^>]*target=/);
         // Continue stays the first and only button.
         const html = res._sent ?? '';
         expect(html.indexOf('Continue to Claude')).toBeLessThan(html.indexOf('start-trial'));
@@ -736,7 +860,7 @@ describe('LoginController', () => {
         expect(productEvents.log).toHaveBeenCalledWith(
           expect.objectContaining({
             event: 'empty_workspace_prompt',
-            metadata: { client: 'Claude', cardTrialOffered: true },
+            metadata: expect.objectContaining({ client: 'Claude', cardTrialOffered: true }),
           }),
         );
       });
@@ -752,9 +876,9 @@ describe('LoginController', () => {
 
         expect(res._sent).toContain('Claude is connected');
         expect(res._sent).not.toContain('start-trial');
-        expect(productEvents.log).toHaveBeenCalledWith(
-          expect.objectContaining({ metadata: { client: 'Claude' } }),
-        );
+        const prompt = productEvents.log.mock.calls.map((c) => c[0]).find((e) => e.event === 'empty_workspace_prompt');
+        expect(prompt.metadata).toEqual(expect.objectContaining({ client: 'Claude' }));
+        expect(prompt.metadata).not.toHaveProperty('cardTrialOffered');
       });
 
       it('is left out for an address that had a subscription: it would pay today', async () => {
@@ -818,7 +942,7 @@ describe('LoginController', () => {
 
       expect(res._redirect).toBe('http://mcp.test/callback');
       expect(res._cookies['login_user'].options.maxAge).toBe(60 * 1000);
-      expect(productEvents.log).not.toHaveBeenCalled();
+      expect(productEvents.log.mock.calls.map((c) => c[0].event)).not.toContain('empty_workspace_prompt');
     });
 
     it('goes straight to /callback when the client connects one server URL', async () => {
@@ -1055,10 +1179,14 @@ describe('LoginController', () => {
         picking = make(CLOUD);
       });
 
-      const showPage = async (c: LoginController = picking) => {
+      const showPage = async (c: LoginController = picking, userAgent?: string) => {
         const res = makeRes();
         await c.handleLogin(
-          makeReq({ cookies: { oauth_session: 's1' }, signedCookies: { login_csrf: 'tok' }, headers: { host: 'mcp.test' } } as any),
+          makeReq({
+            cookies: { oauth_session: 's1' },
+            signedCookies: { login_csrf: 'tok' },
+            headers: { host: 'mcp.test', ...(userAgent ? { 'user-agent': userAgent } : {}) },
+          } as any),
           { email: 'a@b.com', password: 'pw', csrf: 'tok', action: 'approve' },
           res,
         );
@@ -1067,7 +1195,7 @@ describe('LoginController', () => {
 
       const pick = async (
         body: Record<string, unknown>,
-        signedCookies: Record<string, string> = { first_app_csrf: 'pick-tok', login_user: LOGIN_USER },
+        signedCookies: Record<string, string> = { first_app_csrf: 'pick-tok', login_user: LOGIN_USER, login_bind: 's1' },
         c: LoginController = picking,
       ) => {
         const res = makeRes();
@@ -1091,7 +1219,6 @@ describe('LoginController', () => {
         for (const [slug, name] of [
           ['etsy', 'Etsy'],
           ['telegram-bot', 'Telegram'],
-          ['shopify', 'Shopify'],
           ['woocommerce', 'WooCommerce'],
           ['odoo', 'Odoo'],
           ['printify', 'Printify'],
@@ -1100,11 +1227,14 @@ describe('LoginController', () => {
         }
         // Picked often, set up almost never: it is reached through "Another app".
         expect(page).not.toContain('data-adapter="gemini"');
+        // Needs the store owner and an app in Shopify's Dev Dashboard: 75 picks, no keys.
+        expect(page).not.toContain('data-adapter="shopify"');
         expect(page).toContain('<label class="other-label" for="other-app">Another app</label>');
         expect(page).toContain('role="status" aria-live="polite"');
         // Optional: Continue is still the one button, straight to the callback.
         expect(page.match(/class="button"/g)).toHaveLength(1);
-        expect(page).toContain('href="http://mcp.test/callback" data-open-chat="https://claude.ai/new"');
+        expect(page).toContain('href="http://mcp.test/callback" data-client="Claude"');
+        expect(page).not.toContain('data-open-chat');
         expect(page.indexOf('id="quick-apps"')).toBeLessThan(page.indexOf('Continue to Claude'));
       });
 
@@ -1144,9 +1274,13 @@ describe('LoginController', () => {
         const flush = () => new Promise((r) => setImmediate(r));
 
         /** Runs the page's scripts against a minimal DOM built from the page. */
-        const run = async (fetchAnswer: () => Promise<unknown>) => {
+        const run = async (
+          fetchAnswer: () => Promise<unknown>,
+          touch = false,
+          opts: { userAgent?: string; navigator?: object; client?: string } = {},
+        ) => {
           arrange();
-          const page = (await showPage())._sent as string;
+          const page = (await showPage(picking, opts.userAgent))._sent as string;
           const script = page.slice(page.indexOf('<script>') + 8, page.indexOf('</script>'));
           const chips = [...page.matchAll(/data-adapter="([^"]+)" data-name="([^"]+)"/g)].map((m) =>
             el({ 'data-adapter': m[1], 'data-name': m[2], 'aria-pressed': 'false' }),
@@ -1160,20 +1294,23 @@ describe('LoginController', () => {
             'quick-apps': picker,
             'quick-status': el(),
             'other-app': el(),
-            continue: el({ 'data-client': 'Claude', 'data-open-chat': 'https://claude.ai/new' }),
+            // Continue and the "Copied" line as the page really has them.
+            continue: el({ 'data-client': 'Claude' }),
+            'request-copied': el(),
           };
+          nodes['request-copied'].hidden = /id="request-copied"[^>]*\shidden/.test(page);
           const fetch = jest.fn(async () => ({ json: async () => fetchAnswer() }));
           const open = jest.fn();
-          const window = { fetch, JSON, open };
+          const window = { fetch, JSON, open, matchMedia: (q: string) => ({ matches: touch && q === '(pointer: coarse)' }) };
           require('vm').runInNewContext(script, {
             document: { getElementById: (id: string) => nodes[id] ?? null },
-            navigator: {},
+            navigator: opts.navigator ?? {},
             window,
             fetch,
             JSON,
             encodeURIComponent,
           });
-          return { nodes, chips, fetch, open };
+          return { nodes, chips, fetch, open, page };
         };
 
         it('shows the picker, adds a picked app and changes the request', async () => {
@@ -1200,17 +1337,17 @@ describe('LoginController', () => {
         });
 
         it('keeps everything usable when the pick fails', async () => {
-          const { nodes, chips } = await run(async () => ({ ok: false, error: 'Shopify could not be added right now.' }));
+          const { nodes, chips } = await run(async () => ({ ok: false, error: 'WooCommerce could not be added right now.' }));
           chips[2].listeners.click({ currentTarget: chips[2] });
           await flush();
           await flush();
-          expect(nodes['quick-status'].textContent).toBe('Shopify could not be added right now.');
+          expect(nodes['quick-status'].textContent).toBe('WooCommerce could not be added right now.');
           expect(nodes['example-request'].textContent).toBe('Connect my Telegram bot to AnythingMCP.');
           // aria-disabled, never disabled: keyboard focus stays on the chip.
           expect(chips.every((c) => c.attrs['aria-disabled'] === 'false' && !c.disabled)).toBe(true);
         });
 
-        it('turns another app into the request, and opens Claude with it on Continue', async () => {
+        it('turns another app into the request, and opens nothing on Continue', async () => {
           const { nodes, open } = await run(async () => ({}));
           nodes['other-app'].value = '  HubSpot   CRM ';
           nodes['other-app'].listeners.input({});
@@ -1219,16 +1356,197 @@ describe('LoginController', () => {
           nodes['other-app'].listeners.input({});
           expect(nodes['example-request'].textContent).toBe('Connect my Telegram bot to AnythingMCP.');
 
-          nodes.continue.listeners.click({});
-          expect(open).toHaveBeenCalledWith(
-            'https://claude.ai/new?q=Connect%20my%20Telegram%20bot%20to%20AnythingMCP.',
-            '_blank',
-            'noopener',
-          );
+          // No clipboard in this browser: Continue is the plain link, with no listener at all.
+          expect(nodes.continue.listeners.click).toBeUndefined();
+          expect(open).not.toHaveBeenCalled();
+        });
+
+        it('opens no second tab on a touch device either, whatever its user agent says', async () => {
+          const { nodes, open } = await run(async () => ({}), true);
+          expect(nodes.continue.listeners.click).toBeUndefined();
+          expect(open).not.toHaveBeenCalled();
+        });
+
+        // Continue opens no chat tab on any device, so the click copies the
+        // request instead. Continue is where 60% of phone users were lost for
+        // two weeks, and a fifth of the desktop ones later: the copy must not
+        // be able to change what the click does.
+        describe('Continue also copies the request', () => {
+          const IPHONE =
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 26_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1';
+          const MAC =
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
+          /** A click as the browser hands it over: the test fails if the page stops or redirects it. */
+          const tap = () => ({
+            preventDefault: jest.fn(),
+            stopPropagation: jest.fn(),
+            stopImmediatePropagation: jest.fn(),
+            defaultPrevented: false,
+            returnValue: true,
+          });
+          const untouched = (event: ReturnType<typeof tap>) => {
+            expect(event.preventDefault).not.toHaveBeenCalled();
+            expect(event.stopPropagation).not.toHaveBeenCalled();
+            expect(event.stopImmediatePropagation).not.toHaveBeenCalled();
+            expect(event.returnValue).toBe(true);
+          };
+
+          it('has the line for it near the request, empty and hidden, on every device', async () => {
+            arrange();
+            const phone = (await showPage(picking, IPHONE))._sent as string;
+            const desktop = (await showPage(picking, MAC))._sent as string;
+            for (const page of [phone, desktop]) {
+              expect(page).toContain('<p class="copied" id="request-copied" role="status" aria-live="polite" hidden></p>');
+              expect(page.indexOf('id="example-request"')).toBeLessThan(page.indexOf('id="request-copied"'));
+              expect(page.indexOf('id="request-copied"')).toBeLessThan(page.indexOf('id="continue"'));
+            }
+            // Continue itself is the same plain link on both: no attribute for a chat tab.
+            for (const page of [phone, desktop]) {
+              expect(page).toContain('<a class="button" id="continue" href="http://mcp.test/callback" data-client="Claude">Continue to Claude</a>');
+            }
+          });
+
+          it('copies inside the tap and says so, without preventing the default action or opening a window', async () => {
+            let settle: () => void = () => undefined;
+            const writeText = jest.fn(() => new Promise<void>((resolve) => (settle = resolve)));
+            const { nodes, open } = await run(async () => ({}), true, { userAgent: IPHONE, navigator: { clipboard: { writeText } } });
+            nodes['example-request'].textContent = 'Send me a test message on Telegram.';
+            const event = tap();
+
+            // The listener returns before the clipboard answers: the browser follows the link at once.
+            expect(nodes.continue.listeners.click(event)).toBeUndefined();
+            expect(writeText).toHaveBeenCalledTimes(1);
+            expect(writeText).toHaveBeenCalledWith('Send me a test message on Telegram.');
+            expect(nodes['request-copied'].hidden).toBe(true);
+            untouched(event);
+            expect(open).not.toHaveBeenCalled();
+
+            settle();
+            await flush();
+            expect(nodes['request-copied'].textContent).toBe('Copied. Paste it in a new chat in Claude.');
+            expect(nodes['request-copied'].hidden).toBe(false);
+            untouched(event);
+            expect(open).not.toHaveBeenCalled();
+            // Nothing was changed on the link either.
+            expect(nodes.continue.attrs).toEqual({ 'data-client': 'Claude' });
+          });
+
+          it.each([
+            ['refuses', () => Promise.reject(new Error('NotAllowedError'))],
+            ['throws', () => {
+              throw new Error('SecurityError');
+            }],
+            ['never answers', () => new Promise<void>(() => undefined)],
+            ['answers with something that is no promise', () => undefined as unknown as Promise<void>],
+          ])('changes nothing when the clipboard %s', async (_what, writeText) => {
+            const { nodes, open } = await run(async () => ({}), true, {
+              userAgent: IPHONE,
+              navigator: { clipboard: { writeText: jest.fn(writeText) } },
+            });
+            const event = tap();
+            expect(() => nodes.continue.listeners.click(event)).not.toThrow();
+            await flush();
+            await flush();
+            untouched(event);
+            expect(open).not.toHaveBeenCalled();
+            expect(nodes['request-copied'].hidden).toBe(true);
+            expect(nodes['request-copied'].textContent).toBe('');
+          });
+
+          it('adds nothing to Continue where there is no clipboard', async () => {
+            for (const navigator of [{}, { clipboard: {} }]) {
+              const { nodes } = await run(async () => ({}), true, { userAgent: IPHONE, navigator });
+              expect(nodes.continue.listeners).toEqual({});
+            }
+          });
+
+          it('copies on a touch device that asked for the desktop site', async () => {
+            const writeText = jest.fn().mockResolvedValue(undefined);
+            const { nodes, open } = await run(async () => ({}), true, { userAgent: MAC, navigator: { clipboard: { writeText } } });
+            expect(Object.keys(nodes.continue.listeners)).toEqual(['click']);
+            nodes.continue.listeners.click(tap());
+            await flush();
+            expect(writeText).toHaveBeenCalledWith('Connect my Telegram bot to AnythingMCP.');
+            expect(open).not.toHaveBeenCalled();
+            expect(nodes['request-copied'].hidden).toBe(false);
+          });
+
+          it('copies on a desktop too, and opens no chat tab there', async () => {
+            const writeText = jest.fn().mockResolvedValue(undefined);
+            const { nodes, open } = await run(async () => ({}), false, { userAgent: MAC, navigator: { clipboard: { writeText } } });
+            expect(Object.keys(nodes.continue.listeners)).toEqual(['click']);
+            const event = tap();
+            nodes.continue.listeners.click(event);
+            await flush();
+            expect(writeText).toHaveBeenCalledTimes(1);
+            expect(writeText).toHaveBeenCalledWith('Connect my Telegram bot to AnythingMCP.');
+            expect(nodes['request-copied'].hidden).toBe(false);
+            expect(open).not.toHaveBeenCalled();
+            untouched(event);
+            expect(nodes.continue.attrs).toEqual({ 'data-client': 'Claude' });
+          });
+
+          it('is written so that it cannot stop, delay or redirect the tap', async () => {
+            const { page } = await run(async () => ({}), true, { userAgent: IPHONE });
+            const script = page.slice(page.indexOf('<script>') + 8, page.indexOf('</script>'));
+            const from = script.indexOf('// Continue goes back through the authorization and opens nothing else');
+            // The copy listener's own block: up to the end of its function.
+            const copy = script.slice(from, script.indexOf('})();', from));
+            expect(copy).toContain("cont.addEventListener('click'");
+            for (const forbidden of ['preventDefault', 'stopPropagation', 'window.open', 'location', 'await', 'return false', 'setTimeout', '.click(', 'href', 'setAttribute']) {
+              expect(copy).not.toContain(forbidden);
+            }
+            // Three click listeners on Continue in the whole page (the copy, the
+            // beacon that reports the click, and the one that drops a second
+            // press), and no window opened anywhere in it.
+            expect(script.match(/cont\.addEventListener\('click'/g)).toHaveLength(3);
+            expect(script).not.toContain('window.open');
+          });
+
+          it('lets the first press through untouched and drops a second one for five seconds', () => {
+            const listeners: Array<(e: any) => void> = [];
+            const timers: Array<() => void> = [];
+            const cont = { addEventListener: (_t: string, f: (e: any) => void) => listeners.push(f) };
+            require('vm').runInNewContext(CONTINUE_ONCE_SCRIPT, {
+              document: { getElementById: (id: string) => (id === 'continue' ? cont : null) },
+              window: { setTimeout: (f: () => void) => timers.push(f) },
+            });
+            expect(listeners).toHaveLength(1);
+            const tap = () => ({ preventDefault: jest.fn() });
+            const first = tap();
+            listeners[0](first);
+            expect(first.preventDefault).not.toHaveBeenCalled();
+            const second = tap();
+            listeners[0](second);
+            expect(second.preventDefault).toHaveBeenCalledTimes(1);
+            // Five seconds later the link works again (a hand-back the browser refused).
+            timers.forEach((t) => t());
+            const later = tap();
+            listeners[0](later);
+            expect(later.preventDefault).not.toHaveBeenCalled();
+          });
         });
       });
 
-      it('opens a new chat only for a code sent to claude.ai', async () => {
+      // A second tab takes over and the authorization in the first one is never
+      // finished: about 200 codes a day were left unexchanged on phones in early
+      // November 2026, and a fifth of the desktop codes from 19 November.
+      it.each([
+        ['iPhone', 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1'],
+        ['Android', 'Mozilla/5.0 (Linux; Android 16; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36'],
+        ['iPad', 'Mozilla/5.0 (iPad; CPU OS 26_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1'],
+        ['a Mac', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'],
+        ['Windows', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0'],
+      ])('goes straight back to Claude on %s, without a chat tab', async (_device, userAgent) => {
+        arrange();
+        const page = (await showPage(picking, userAgent))._sent as string;
+        expect(page).toContain('<a class="button" id="continue" href="http://mcp.test/callback" data-client="Claude">Continue to Claude</a>');
+        expect(page).not.toContain('data-open-chat');
+        expect(page).not.toContain('window.open');
+        expect(page).not.toContain('claude.ai/new');
+      });
+
+      it('opens no chat for another client either', async () => {
         arrange();
         store.getOAuthSession.mockResolvedValue({
           sessionId: 's1',
@@ -1240,7 +1558,8 @@ describe('LoginController', () => {
         store.getClient.mockResolvedValue({ client_id: 'client-abc', client_name: 'ChatGPT' } as any);
         const page = (await showPage())._sent as string;
         expect(page).toContain('Continue to ChatGPT');
-        expect(page).not.toContain('data-open-chat="');
+        expect(page).not.toContain('data-open-chat');
+        expect(page).not.toContain('window.open');
       });
 
       it('is left out, with its cookie, when this instance cannot add connectors', async () => {
@@ -1277,7 +1596,14 @@ describe('LoginController', () => {
           event: 'post_approve_app_picked',
           userId: 'u1',
           organizationId: 'org-1',
-          metadata: { adapterSlug: 'telegram-bot', client: 'Claude', status: 'added' },
+          metadata: {
+            adapterSlug: 'telegram-bot',
+            client: 'Claude',
+            status: 'added',
+            device: 'desktop',
+            attempt: expect.stringMatching(/^[0-9a-z]{6,12}$/),
+            connectedArm: 'control',
+          },
         });
       });
 
@@ -1285,12 +1611,12 @@ describe('LoginController', () => {
         arrange();
         // The user's own organization is org-1; they picked org-2 on "Choose what to connect".
         grants.resolve.mockResolvedValue({ mode: 'organization', organizationId: 'org-2' });
-        const res = await pick({ adapter: 'shopify', csrf: 'pick-tok' });
+        const res = await pick({ adapter: 'woocommerce', csrf: 'pick-tok' });
 
         expect(res._json.ok).toBe(true);
         const ctx = expect.objectContaining({ userId: 'u1', organizationId: 'org-2', serverIds: [] });
         expect(provider.canSetUp).toHaveBeenCalledWith(ctx);
-        expect(provider.install).toHaveBeenCalledWith(ctx, { adapter: 'shopify' }, { via: 'post_approve' });
+        expect(provider.install).toHaveBeenCalledWith(ctx, { adapter: 'woocommerce' }, { via: 'post_approve' });
         expect(productEvents.log).toHaveBeenCalledWith(
           expect.objectContaining({ event: 'post_approve_app_picked', organizationId: 'org-2' }),
         );
@@ -1299,11 +1625,11 @@ describe('LoginController', () => {
       it('adds the app to the user\'s own workspace when the client has no grant', async () => {
         arrange();
         grants.resolve.mockResolvedValue(null);
-        await pick({ adapter: 'shopify', csrf: 'pick-tok' });
+        await pick({ adapter: 'woocommerce', csrf: 'pick-tok' });
 
         expect(provider.install).toHaveBeenCalledWith(
           expect.objectContaining({ organizationId: 'org-1', serverIds: [] }),
-          { adapter: 'shopify' },
+          { adapter: 'woocommerce' },
           { via: 'post_approve' },
         );
       });
@@ -1323,7 +1649,7 @@ describe('LoginController', () => {
       ])('refuses a pick for %s: there is no one workspace to add it to', async (_label, grant) => {
         arrange();
         grants.resolve.mockResolvedValue(grant);
-        const res = await pick({ adapter: 'shopify', csrf: 'pick-tok' });
+        const res = await pick({ adapter: 'woocommerce', csrf: 'pick-tok' });
 
         expect(res._status).toBe(403);
         expect(provider.install).not.toHaveBeenCalled();
@@ -1366,13 +1692,13 @@ describe('LoginController', () => {
       it('lets the user continue when the install fails, and records why', async () => {
         arrange();
         provider.install.mockResolvedValue({ isError: true, body: { error: 'Connector limit reached' } });
-        const res = await pick({ adapter: 'shopify', csrf: 'pick-tok' });
+        const res = await pick({ adapter: 'woocommerce', csrf: 'pick-tok' });
         expect(res._status).toBe(200);
         expect(res._json).toEqual({ ok: false, error: expect.stringContaining('You can still continue') });
         expect(productEvents.log).toHaveBeenCalledWith(
           expect.objectContaining({
             event: 'post_approve_app_picked',
-            metadata: { adapterSlug: 'shopify', client: 'Claude', status: 'failed', error: 'Connector limit reached' },
+            metadata: expect.objectContaining({ adapterSlug: 'woocommerce', client: 'Claude', status: 'failed', error: 'Connector limit reached' }),
           }),
         );
       });
@@ -1386,6 +1712,1118 @@ describe('LoginController', () => {
         );
         expect(res._status).toBe(404);
         expect(provider.install).not.toHaveBeenCalled();
+      });
+
+      describe('the one-tap Telegram bot', () => {
+        const LINK = 'https://t.me/newbot/AnythingMCPBot/amcp_1a2b3c4d_bot?name=My%20AnythingMCP%20bot';
+        /** Opens the manager bot's chat with the setup code: for a bot whose username was changed. */
+        const CLAIM = 'https://t.me/AnythingMCPBot?start=1a2b3c4d';
+        const DESKTOP_UA =
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
+        const PHONE_UA =
+          'Mozilla/5.0 (iPhone; CPU iPhone OS 26_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1';
+        const COOKIES = { first_app_csrf: 'pick-tok', login_user: LOGIN_USER, login_bind: 's1' };
+        let telegram: { isEnabledFor: jest.Mock; begin: jest.Mock; status: jest.Mock; saveToken: jest.Mock; qrScanned: jest.Mock };
+        // The same two links for Telegram in the browser, as the service hands them out.
+        const WEB = 'https://web.telegram.org/a/#?tgaddr=tg%3A%2F%2Fnewbot%3Fmanager%3DAnythingMCPBot%26username%3Damcp_1a2b3c4d_bot';
+        const CLAIM_WEB = 'https://web.telegram.org/a/#?tgaddr=tg%3A%2F%2Fresolve%3Fdomain%3DAnythingMCPBot%26start%3D1a2b3c4d';
+        let oneTap: LoginController;
+
+        /** A controller whose instance has the Telegram service, found by its token. */
+        const makeWithTelegram = (service: object, deployment: object = CLOUD) =>
+          new LoginController(
+            authService as unknown as AuthService,
+            cloudPrisma as unknown as PrismaService,
+            config as unknown as ConfigService,
+            store as unknown as PrismaOAuthStore,
+            sso as unknown as SsoService,
+            deployment as any,
+            grants as any,
+            productEvents as any,
+            licenseGuard as any,
+            eligibility as any,
+            undefined,
+            { get: (token: unknown) => (token === TELEGRAM_ONE_TAP ? service : { get: () => provider }) } as any,
+          );
+
+        beforeEach(() => {
+          telegram = {
+            isEnabledFor: jest.fn().mockReturnValue(true),
+            begin: jest.fn().mockResolvedValue({
+              link: LINK,
+              username: 'amcp_1a2b3c4d_bot',
+              claimLink: CLAIM,
+              webLink: WEB,
+              claimWebLink: CLAIM_WEB,
+              qrPath: '/auth/first-app/telegram/qr/1a2b3c4d',
+            }),
+            qrScanned: jest.fn().mockResolvedValue(LINK),
+            status: jest.fn().mockResolvedValue({ state: 'waiting' }),
+            saveToken: jest.fn().mockResolvedValue({ ok: true, bot: '@my_own_bot' }),
+          };
+          provider.install.mockResolvedValue({ connectorId: 'conn-1', body: { installed: 'Telegram Bot', status: 'needs_input' } });
+          oneTap = makeWithTelegram(telegram);
+        });
+
+        const request = (signedCookies: Record<string, string> = COOKIES, userAgent = DESKTOP_UA) =>
+          makeReq({ cookies: { oauth_session: 's1' }, signedCookies, headers: { host: 'mcp.test', 'user-agent': userAgent } } as any);
+        const status = async (
+          body: Record<string, unknown>,
+          signedCookies: Record<string, string> = COOKIES,
+          c: LoginController = oneTap,
+          userAgent = DESKTOP_UA,
+        ) => {
+          const res = makeRes();
+          await c.telegramOneTapStatus(request(signedCookies, userAgent), body, res);
+          return res;
+        };
+        const saveToken = async (
+          body: Record<string, unknown>,
+          signedCookies: Record<string, string> = COOKIES,
+          c: LoginController = oneTap,
+        ) => {
+          const res = makeRes();
+          await c.telegramOneTapToken(request(signedCookies), body, res);
+          return res;
+        };
+        /** The page without what differs on every render. */
+        const stable = (page: string) => page.replace(/data-csrf="[^"]+"/, 'data-csrf="X"');
+
+        describe('when it is off', () => {
+          it('leaves the page exactly as it is without a manager bot', async () => {
+            arrange();
+            const page = (await showPage(picking, DESKTOP_UA))._sent as string;
+            for (const part of ['tg-setup', 'tg-create', 'amcpTelegram', 'Create your Telegram bot', 'Paste its token', '/auth/first-app/telegram']) {
+              expect(page).not.toContain(part);
+            }
+          });
+
+          it('leaves the page exactly as it is for a workspace outside the allowlist', async () => {
+            arrange();
+            telegram.isEnabledFor.mockImplementation((organizationId: string) => organizationId === 'org-9');
+            const without = (await showPage(picking, DESKTOP_UA))._sent as string;
+            const outside = (await showPage(oneTap, DESKTOP_UA))._sent as string;
+            expect(telegram.isEnabledFor).toHaveBeenCalledWith('org-1');
+            expect(stable(outside)).toBe(stable(without));
+          });
+
+          it('adds Telegram as before, with no link', async () => {
+            arrange();
+            telegram.isEnabledFor.mockReturnValue(false);
+            const res = await pick({ adapter: 'telegram-bot', csrf: 'pick-tok' }, undefined, oneTap);
+            expect(res._json).toEqual({
+              ok: true,
+              adapter: 'telegram-bot',
+              name: 'Telegram',
+              request: 'Finish setting up my Telegram connector.',
+            });
+            expect(telegram.begin).not.toHaveBeenCalled();
+          });
+
+          it('refuses the status and the token requests', async () => {
+            arrange();
+            telegram.isEnabledFor.mockReturnValue(false);
+            expect((await status({ csrf: 'pick-tok' }))._status).toBe(403);
+            expect((await saveToken({ csrf: 'pick-tok', token: 'x' }))._status).toBe(403);
+            expect(telegram.status).not.toHaveBeenCalled();
+            expect(telegram.saveToken).not.toHaveBeenCalled();
+          });
+        });
+
+        describe('the page', () => {
+          it('on a desktop holds the hidden panel: button, QR code, status and the token option', async () => {
+            arrange();
+            const page = (await showPage(oneTap, DESKTOP_UA))._sent as string;
+
+            expect(page).toContain('<div class="tg" id="tg-setup" hidden>');
+            expect(page).toContain(
+              '<a class="tg-create" id="tg-create" href="https://t.me/" target="_blank" rel="noopener noreferrer">Create your Telegram bot</a>',
+            );
+            expect(page).toContain('<figure class="tg-qr" id="tg-qr" hidden>');
+            // Beside the QR code: the same link for Telegram in the browser, hidden until there is one.
+            expect(page).toContain(
+              '<figcaption>Scan with your phone<a class="tg-web" id="tg-web" href="https://web.telegram.org/a/" target="_blank" rel="noopener noreferrer" hidden>or open Telegram Web in this browser</a></figcaption>',
+            );
+            expect(page).toContain('id="tg-link-web"');
+            expect(page).toContain('<p class="tg-status" id="tg-status" role="status" aria-live="polite"></p>');
+            // Whose bot this is, and where someone who has one goes.
+            expect(page).toContain(
+              '<p class="tg-help" id="tg-help">This creates a new bot that belongs to you: it appears in your own @BotFather list, and you can rename it, add a picture and use it with your customers. Already have a bot? Paste its token below.</p>',
+            );
+            // What is left to do once the bot is connected: empty and hidden until then.
+            expect(page).toContain('<p class="tg-next" id="tg-next" role="status" aria-live="polite" hidden></p>');
+            expect(page.indexOf('id="tg-status"')).toBeLessThan(page.indexOf('id="tg-next"'));
+            // The second way in, hidden until it is needed: an ordinary link on its own button.
+            expect(page).toContain('<div class="tg-link" id="tg-link" hidden>');
+            expect(page).toContain(
+              '<a class="tg-link-btn" id="tg-link-btn" href="https://t.me/" target="_blank" rel="noopener noreferrer">Changed the username? Link your bot</a>',
+            );
+            // With its own QR code beside it: on a desktop the bot was usually made on the phone.
+            expect(page).toContain(
+              '<p class="tg-hint" id="tg-hint">Telegram opens our setup bot: press Start there, then come back here. Bot made on your phone? Scan the code.</p>',
+            );
+            expect(page).toContain('<figure class="tg-qr" id="tg-link-qr" hidden>');
+            expect(page.indexOf('id="tg-link-qr"')).toBeGreaterThan(page.indexOf('id="tg-link"'));
+            expect(page.indexOf('id="tg-link-qr"')).toBeLessThan(page.indexOf('id="tg-paste"'));
+            expect(page).toContain('a.tg-link-btn:focus-visible');
+            expect(page.indexOf('id="tg-create"')).toBeLessThan(page.indexOf('id="tg-link"'));
+            expect(page.indexOf('id="tg-link"')).toBeLessThan(page.indexOf('id="tg-paste"'));
+            // Collapsed until asked for; a labelled field and a real button.
+            expect(page).toContain('<details class="tg-paste" id="tg-paste">');
+            expect(page).toContain('<summary>Already have a bot? Paste its token</summary>');
+            expect(page).toContain('<label for="tg-token">Bot token</label>');
+            expect(page).toContain('<button type="submit" class="secondary" id="tg-token-save">Save</button>');
+            expect(page).toContain('a.tg-create:focus-visible');
+            // Inside the picker, before Continue, which stays the one button and is unchanged.
+            expect(page.indexOf('id="quick-apps"')).toBeLessThan(page.indexOf('id="tg-setup"'));
+            expect(page.indexOf('id="tg-setup"')).toBeLessThan(page.indexOf('Continue to Claude'));
+            expect(page.match(/class="button"/g)).toHaveLength(1);
+            expect(page).toContain(
+              '<a class="button" id="continue" href="http://mcp.test/callback" data-client="Claude">Continue to Claude</a>',
+            );
+          });
+
+          it('on a phone or tablet has no QR code: the button opens the Telegram app', async () => {
+            arrange();
+            for (const userAgent of [
+              PHONE_UA,
+              'Mozilla/5.0 (Linux; Android 16; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36',
+              'Mozilla/5.0 (iPad; CPU OS 26_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1',
+            ]) {
+              const page = (await showPage(oneTap, userAgent))._sent as string;
+              expect(page).toContain('id="tg-setup" hidden');
+              expect(page).toContain('Create your Telegram bot</a>');
+              expect(page).toContain('Changed the username? Link your bot</a>');
+              expect(page).toContain('<p class="tg-hint" id="tg-hint">Telegram opens our setup bot: press Start there, then come back here.</p>');
+              expect(page).not.toContain('Scan the code');
+              // And no Telegram Web link: the button opens the app there.
+              expect(page).not.toContain('id="tg-web"');
+              expect(page).not.toContain('id="tg-link-web"');
+              expect(page).not.toContain('<figure');
+              expect(page).not.toContain('Scan with your phone');
+              // Continue as on every device: straight to the callback, no chat tab.
+              expect(page).toContain('<a class="button" id="continue" href="http://mcp.test/callback" data-client="Claude">Continue to Claude</a>');
+            }
+          });
+
+          it('changes nothing else on the page', async () => {
+            arrange();
+            const without = (await showPage(picking, DESKTOP_UA))._sent as string;
+            const withPanel = (await showPage(oneTap, DESKTOP_UA))._sent as string;
+            // Everything up to the picker's end, and from Continue to the script, is the same markup.
+            const head = (page: string) => stable(page.slice(page.indexOf('<main'), page.indexOf('id="quick-status"')));
+            const tail = (page: string) => page.slice(page.indexOf('<a class="button" id="continue"'), page.indexOf('<script>'));
+            expect(head(withPanel)).toBe(head(without));
+            expect(tail(withPanel)).toBe(tail(without));
+          });
+
+          it('never navigates or opens a window from its script, and never touches Continue', () => {
+            for (const forbidden of ['window.open', 'location', '.click(', "getElementById('continue').add", 'cont.addEventListener', 'cont.setAttribute']) {
+              expect(TELEGRAM_PANEL_SCRIPT).not.toContain(forbidden);
+            }
+          });
+        });
+
+        describe('picking Telegram', () => {
+          it('starts a setup for the added connector and answers with the two links and their QR codes', async () => {
+            arrange();
+            const res = makeRes();
+            await oneTap.pickFirstApp(request(), { adapter: 'telegram-bot', csrf: 'pick-tok' }, res);
+
+            expect(telegram.begin).toHaveBeenCalledWith({
+              userId: 'u1',
+              organizationId: 'org-1',
+              connectorId: 'conn-1',
+              // For the bot's own messages: the button's name, and the link to a new chat.
+              client: { name: 'Claude', claude: true },
+            });
+            expect(res._json).toEqual({
+              ok: true,
+              adapter: 'telegram-bot',
+              name: 'Telegram',
+              request: 'Finish setting up my Telegram connector.',
+              telegram: {
+                link: LINK,
+                claim: CLAIM,
+                qr: expect.stringMatching(/^data:image\/svg\+xml;base64,[A-Za-z0-9+/=]+$/),
+                claimQr: expect.stringMatching(/^data:image\/svg\+xml;base64,[A-Za-z0-9+/=]+$/),
+                // A computer also gets Telegram in the browser, for someone without the app.
+                web: WEB,
+                claimWeb: CLAIM_WEB,
+              },
+            });
+            expect(res._json.telegram.claimQr).not.toBe(res._json.telegram.qr);
+            for (const qr of [res._json.telegram.qr, res._json.telegram.claimQr]) {
+              const svg = Buffer.from(qr.split(',')[1], 'base64').toString('utf8');
+              expect(svg.startsWith('<svg')).toBe(true);
+              expect(svg).not.toContain('<script');
+            }
+            expect(productEvents.log).toHaveBeenCalledWith({
+              event: 'telegram_bot_link_offered',
+              userId: 'u1',
+              organizationId: 'org-1',
+              metadata: { adapterSlug: 'telegram-bot', client: 'Claude', device: 'desktop' },
+            });
+          });
+
+          // The QR code holds this server's own address for the code, not the
+          // t.me link: the scan is then counted before it goes on to Telegram.
+          it('points the QR code of the creation link at its own address on this server', async () => {
+            arrange();
+            const res = makeRes();
+            await oneTap.pickFirstApp(request(COOKIES, DESKTOP_UA), { adapter: 'telegram-bot', csrf: 'pick-tok' }, res);
+            const expected = (await import('./first-app-telegram')).telegramQrDataUri('http://mcp.test/auth/first-app/telegram/qr/1a2b3c4d');
+            expect(res._json.telegram.qr).toBe(expected);
+            expect(res._json.telegram.qr).not.toBe((await import('./first-app-telegram')).telegramQrDataUri(LINK));
+          });
+
+          it('sends a scan on to Telegram, and answers 404 for a code that is not ours', async () => {
+            const scanned = makeRes() as any;
+            scanned.setHeader = jest.fn();
+            scanned.redirect = jest.fn();
+            await oneTap.telegramOneTapQr('1a2b3c4d', scanned);
+            expect(telegram.qrScanned).toHaveBeenCalledWith('1a2b3c4d');
+            expect(scanned.redirect).toHaveBeenCalledWith(302, LINK);
+            expect(scanned.setHeader).toHaveBeenCalledWith('Cache-Control', 'no-store');
+
+            telegram.qrScanned.mockResolvedValue(null);
+            const refused = makeRes() as any;
+            refused.type = jest.fn().mockReturnValue(refused);
+            refused.send = jest.fn();
+            refused.redirect = jest.fn();
+            await oneTap.telegramOneTapQr('zzzzzzzz', refused);
+            expect(refused.redirect).not.toHaveBeenCalled();
+            expect(refused._status).toBe(404);
+          });
+
+          it('sends no QR code to a phone', async () => {
+            arrange();
+            const res = makeRes();
+            await oneTap.pickFirstApp(request(COOKIES, PHONE_UA), { adapter: 'telegram-bot', csrf: 'pick-tok' }, res);
+            expect(res._json.telegram).toEqual({ link: LINK, claim: CLAIM });
+            expect(productEvents.log).toHaveBeenCalledWith(
+              expect.objectContaining({ event: 'telegram_bot_link_offered', metadata: expect.objectContaining({ device: 'mobile' }) }),
+            );
+          });
+
+          it('starts the setup in the workspace the connection was granted', async () => {
+            arrange();
+            grants.resolve.mockResolvedValue({ mode: 'organization', organizationId: 'org-2' });
+            await pick({ adapter: 'telegram-bot', csrf: 'pick-tok' }, undefined, oneTap);
+            expect(telegram.isEnabledFor).toHaveBeenCalledWith('org-2');
+            expect(telegram.begin).toHaveBeenCalledWith(expect.objectContaining({ organizationId: 'org-2', connectorId: 'conn-1' }));
+          });
+
+          it('starts none for another app, a failed install, or a service that cannot start one', async () => {
+            arrange();
+            expect((await pick({ adapter: 'woocommerce', csrf: 'pick-tok' }, undefined, oneTap))._json.telegram).toBeUndefined();
+            provider.install.mockResolvedValue({ isError: true, body: { error: 'Connector limit reached' } });
+            expect((await pick({ adapter: 'telegram-bot', csrf: 'pick-tok' }, undefined, oneTap))._json.ok).toBe(false);
+            expect(telegram.begin).not.toHaveBeenCalled();
+
+            provider.install.mockResolvedValue({ connectorId: 'conn-1', body: {} });
+            telegram.begin.mockResolvedValue(null);
+            expect((await pick({ adapter: 'telegram-bot', csrf: 'pick-tok' }, undefined, oneTap))._json).toEqual({
+              ok: true,
+              adapter: 'telegram-bot',
+              name: 'Telegram',
+              request: 'Finish setting up my Telegram connector.',
+            });
+            telegram.begin.mockRejectedValue(new Error('database down'));
+            expect((await pick({ adapter: 'telegram-bot', csrf: 'pick-tok' }, undefined, oneTap))._json.telegram).toBeUndefined();
+            expect(productEvents.log).not.toHaveBeenCalledWith(expect.objectContaining({ event: 'telegram_bot_link_offered' }));
+          });
+        });
+
+        describe('POST /auth/first-app/telegram/status', () => {
+          it('answers where the setup stands, for the user and workspace of the paused authorization', async () => {
+            arrange();
+            const res = await status({ csrf: 'pick-tok' });
+            expect(res._status).toBe(200);
+            expect(res._json).toEqual({ ok: true, state: 'waiting' });
+            expect(telegram.status).toHaveBeenCalledWith({
+              organizationId: 'org-1',
+              userId: 'u1',
+              opened: false,
+              openedVia: 'app',
+              claimOffered: false,
+              device: 'desktop',
+            });
+            expect(grants.resolve).toHaveBeenCalledWith('client-abc', 'u1');
+          });
+
+          it('adds the request to try once the bot is connected', async () => {
+            arrange();
+            telegram.status.mockResolvedValue({ state: 'connected', bot: '@amcp_1a2b3c4d_bot', startUrl: 'https://t.me/amcp_1a2b3c4d_bot' });
+            expect((await status({ csrf: 'pick-tok' }))._json).toEqual({
+              ok: true,
+              state: 'connected',
+              bot: '@amcp_1a2b3c4d_bot',
+              startUrl: 'https://t.me/amcp_1a2b3c4d_bot',
+              request: 'Send me a test message on Telegram.',
+            });
+          });
+
+          it('passes on a click on the link only when the page says so, with the device', async () => {
+            arrange();
+            await status({ csrf: 'pick-tok', opened: true }, COOKIES, oneTap, PHONE_UA);
+            expect(telegram.status).toHaveBeenLastCalledWith({
+              organizationId: 'org-1',
+              userId: 'u1',
+              opened: true,
+              openedVia: 'app',
+              claimOffered: false,
+              device: 'mobile',
+            });
+            await status({ csrf: 'pick-tok', opened: 'yes' });
+            expect(telegram.status).toHaveBeenLastCalledWith(expect.objectContaining({ opened: false }));
+            // Which link it was: Telegram in the browser only when the page says exactly that.
+            await status({ csrf: 'pick-tok', opened: true, via: 'web' });
+            expect(telegram.status).toHaveBeenLastCalledWith(expect.objectContaining({ opened: true, openedVia: 'web' }));
+            await status({ csrf: 'pick-tok', opened: true, via: 'anything else' });
+            expect(telegram.status).toHaveBeenLastCalledWith(expect.objectContaining({ openedVia: 'app' }));
+          });
+
+          it('passes on that "Link your bot" is shown, and what the server knows about the wait', async () => {
+            arrange();
+            telegram.status.mockResolvedValue({ state: 'waiting', unmatched: true });
+            expect((await status({ csrf: 'pick-tok', offered: true }))._json).toEqual({ ok: true, state: 'waiting', unmatched: true });
+            expect(telegram.status).toHaveBeenLastCalledWith(expect.objectContaining({ claimOffered: true }));
+            await status({ csrf: 'pick-tok', offered: 1 });
+            expect(telegram.status).toHaveBeenLastCalledWith(expect.objectContaining({ claimOffered: false }));
+
+            telegram.status.mockResolvedValue({ state: 'waiting', claimed: true });
+            expect((await status({ csrf: 'pick-tok' }))._json).toEqual({ ok: true, state: 'waiting', claimed: true });
+          });
+
+          it.each([
+            ['no CSRF token', {}, COOKIES],
+            ['a wrong CSRF token', { csrf: 'other' }, COOKIES],
+            ['no CSRF cookie', { csrf: 'pick-tok' }, { login_user: LOGIN_USER, login_bind: 's1' }],
+            ['no signed login cookie', { csrf: 'pick-tok' }, { first_app_csrf: 'pick-tok' }],
+            ['a login cookie that is not a profile', { csrf: 'pick-tok' }, { first_app_csrf: 'pick-tok', login_user: 'garbage', login_bind: 's1' }],
+          ])('refuses a request with %s', async (_label, body, signedCookies) => {
+            arrange();
+            const res = await status(body, signedCookies as Record<string, string>);
+            expect(res._status).toBe(403);
+            expect(res._json.ok).toBe(false);
+            expect(telegram.status).not.toHaveBeenCalled();
+          });
+
+          it('refuses without a pending authorization, or for one server\'s own URL', async () => {
+            arrange({ session: false });
+            store.getOAuthSession.mockResolvedValue(null as any);
+            expect((await status({ csrf: 'pick-tok' }))._status).toBe(403);
+
+            arrange();
+            expect((await status({ csrf: 'pick-tok' }, { ...COOKIES, mcp_resource: 'srv-9' }))._status).toBe(403);
+            expect(telegram.status).not.toHaveBeenCalled();
+          });
+
+          it('refuses a viewer, a grant without one workspace, and self-hosted', async () => {
+            arrange({ role: 'VIEWER' });
+            expect((await status({ csrf: 'pick-tok' }))._status).toBe(403);
+
+            arrange();
+            grants.resolve.mockResolvedValue({ mode: 'none' });
+            expect((await status({ csrf: 'pick-tok' }))._status).toBe(403);
+
+            arrange();
+            grants.resolve.mockResolvedValue(null);
+            const selfHosted = makeWithTelegram(telegram, { mode: 'self-hosted', isCloud: () => false, isSelfHosted: () => true });
+            expect((await status({ csrf: 'pick-tok' }, COOKIES, selfHosted))._status).toBe(403);
+            expect(telegram.status).not.toHaveBeenCalled();
+          });
+
+          it('checks the role in the workspace the connection was granted', async () => {
+            arrange();
+            grants.resolve.mockResolvedValue({ mode: 'organization', organizationId: 'org-2' });
+            await status({ csrf: 'pick-tok' });
+            expect(cloudPrisma.organizationMember.findFirst).toHaveBeenLastCalledWith({
+              where: { userId: 'u1', organizationId: 'org-2', deactivatedAt: null },
+              select: { role: true },
+            });
+            expect(telegram.status).toHaveBeenCalledWith(expect.objectContaining({ organizationId: 'org-2' }));
+          });
+
+          it('answers "try again", not "expired", when the status cannot be read', async () => {
+            arrange();
+            telegram.status.mockRejectedValue(new Error('database down'));
+            const res = await status({ csrf: 'pick-tok' });
+            expect(res._status).toBe(503);
+            expect(res._json.ok).toBeUndefined();
+          });
+        });
+
+        describe('POST /auth/first-app/telegram/token', () => {
+          const TOKEN = '8123456789:AAGpastedTokenForTestsOnly0123456789abc';
+
+          it('saves a pasted token for the user and workspace of the paused authorization', async () => {
+            arrange();
+            const res = await saveToken({ csrf: 'pick-tok', token: TOKEN });
+            expect(telegram.saveToken).toHaveBeenCalledWith({ organizationId: 'org-1', userId: 'u1', token: TOKEN });
+            expect(res._json).toEqual({
+              ok: true,
+              bot: '@my_own_bot',
+              state: 'connected',
+              request: 'Send me a test message on Telegram.',
+            });
+            // The token is never sent back.
+            expect(JSON.stringify(res._json)).not.toContain(TOKEN);
+          });
+
+          it('passes on why a token was refused', async () => {
+            arrange();
+            telegram.saveToken.mockResolvedValue({ ok: false, error: 'Telegram refused the bot token.' });
+            expect((await saveToken({ csrf: 'pick-tok', token: TOKEN }))._json).toEqual({ ok: false, error: 'Telegram refused the bot token.' });
+          });
+
+          it.each([
+            ['no CSRF token', { token: TOKEN }, COOKIES],
+            ['a wrong CSRF token', { csrf: 'other', token: TOKEN }, COOKIES],
+            ['no signed login cookie', { csrf: 'pick-tok', token: TOKEN }, { first_app_csrf: 'pick-tok' }],
+          ])('refuses a request with %s', async (_label, body, signedCookies) => {
+            arrange();
+            const res = await saveToken(body, signedCookies as Record<string, string>);
+            expect(res._status).toBe(403);
+            expect(telegram.saveToken).not.toHaveBeenCalled();
+          });
+
+          it('refuses a viewer', async () => {
+            arrange({ role: 'VIEWER' });
+            expect((await saveToken({ csrf: 'pick-tok', token: TOKEN }))._status).toBe(403);
+            expect(telegram.saveToken).not.toHaveBeenCalled();
+          });
+
+          it('keeps the token out of the log when saving fails', async () => {
+            arrange();
+            const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+            telegram.saveToken.mockRejectedValue(new Error(`could not store ${TOKEN}`));
+            const res = await saveToken({ csrf: 'pick-tok', token: TOKEN });
+            expect(res._json).toEqual({ ok: false, error: 'The token could not be saved. Try again.' });
+            expect(warn.mock.calls.flat().join(' ')).not.toContain(TOKEN);
+            warn.mockRestore();
+          });
+        });
+
+        describe('its script', () => {
+          type Node = {
+            textContent: string;
+            hidden: boolean;
+            value: string;
+            attrs: Record<string, string>;
+            listeners: Record<string, (e?: unknown) => void>;
+            getAttribute(n: string): string | null;
+            setAttribute(n: string, v: string): void;
+            addEventListener(t: string, f: (e?: unknown) => void): void;
+            querySelectorAll(): Node[];
+          };
+          const node = (attrs: Record<string, string> = {}, text = ''): Node => ({
+            textContent: text,
+            hidden: false,
+            value: '',
+            attrs,
+            listeners: {},
+            getAttribute(n) {
+              return n in this.attrs ? this.attrs[n] : null;
+            },
+            setAttribute(n, v) {
+              this.attrs[n] = v;
+            },
+            addEventListener(t, f) {
+              this.listeners[t] = f;
+            },
+            querySelectorAll() {
+              return [];
+            },
+          });
+          const flush = async () => {
+            for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+          };
+          const PICKED = {
+            ok: true,
+            name: 'Telegram',
+            request: 'Finish setting up my Telegram connector.',
+            telegram: {
+              link: LINK,
+              claim: CLAIM,
+              qr: 'data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=',
+              claimQr: 'data:image/svg+xml;base64,PHN2Zz5jbGFpbTwvc3ZnPg==',
+              web: 'https://web.telegram.org/a/#?tgaddr=tg%3A%2F%2Fnewbot%3Fmanager%3DAnythingMCPBot',
+              claimWeb: 'https://web.telegram.org/a/#?tgaddr=tg%3A%2F%2Fresolve%3Fdomain%3DAnythingMCPBot',
+            },
+          };
+
+          /**
+           * Runs the page's script against a minimal DOM built from the page,
+           * with a clock the test moves: timers fire in `advance`.
+           */
+          const run = async (opts: { userAgent?: string; touch?: boolean } = {}) => {
+            arrange();
+            const page = (await showPage(oneTap, opts.userAgent ?? DESKTOP_UA))._sent as string;
+            const script = page.slice(page.indexOf('<script>') + 8, page.indexOf('</script>'));
+            const chips = [...page.matchAll(/data-adapter="([^"]+)" data-name="([^"]+)"/g)].map((m) =>
+              node({ 'data-adapter': m[1], 'data-name': m[2], 'aria-pressed': 'false' }),
+            );
+            const picker = node({ 'data-csrf': /data-csrf="([^"]+)"/.exec(page)![1] });
+            picker.hidden = true;
+            picker.querySelectorAll = () => chips;
+            const nodes: Record<string, Node> = {
+              'copy-request': node(),
+              'example-request': node({}, 'Connect my Telegram bot to AnythingMCP.'),
+              'first-sub': node({}, 'Your workspace has no apps yet.'),
+              'first-body': node({}, 'Claude finds the connector and sets it up with you.'),
+              'quick-apps': picker,
+              'quick-status': node(),
+              'other-app': node(),
+              continue: node({ 'data-client': 'Claude' }),
+            };
+            // Every element of the panel the page really has, hidden where its markup says so.
+            for (const m of page.matchAll(/<[a-z]+[^>]*\bid="(tg-[a-z-]+)"([^>]*)>/g)) {
+              nodes[m[1]] = node();
+              nodes[m[1]].hidden = /\shidden\b/.test(m[2]);
+            }
+
+            const clock = { now: 1_000_000 };
+            let timers: Array<{ id: number; at: number; f: () => void }> = [];
+            let nextId = 1;
+            const answers = {
+              status: (): unknown => ({ ok: true, state: 'waiting' }),
+              token: (): unknown => ({ ok: true, state: 'connected', bot: '@my_own_bot', request: 'Send me a test message on Telegram.' }),
+            };
+            const fetch = jest.fn(async (url: string, init?: { body: string }) => ({
+              json: async () => {
+                if (url === '/auth/first-app/telegram/status') return answers.status();
+                if (url === '/auth/first-app/telegram/token') return answers.token();
+                // The server sends the link with Telegram only.
+                const adapter = JSON.parse(init?.body ?? '{}').adapter;
+                return adapter === 'telegram-bot' ? PICKED : { ok: true, name: 'WooCommerce', request: 'Finish setting up my WooCommerce connector.' };
+              },
+            }));
+            const open = jest.fn();
+            const documentListeners: Record<string, () => void> = {};
+            const windowListeners: Record<string, () => void> = {};
+            const document = {
+              hidden: false,
+              getElementById: (id: string) => nodes[id] ?? null,
+              addEventListener: (t: string, f: () => void) => {
+                documentListeners[t] = f;
+              },
+            };
+            const window: Record<string, any> = {
+              fetch,
+              JSON,
+              open,
+              matchMedia: (q: string) => ({ matches: !!opts.touch && q === '(pointer: coarse)' }),
+              addEventListener: (t: string, f: () => void) => {
+                windowListeners[t] = f;
+              },
+            };
+            require('vm').runInNewContext(script, {
+              document,
+              navigator: {},
+              window,
+              fetch,
+              JSON,
+              encodeURIComponent,
+              Date: { now: () => clock.now },
+              setTimeout: (f: () => void, ms: number) => {
+                timers.push({ id: nextId, at: clock.now + ms, f });
+                return nextId++;
+              },
+              clearTimeout: (id: number) => {
+                timers = timers.filter((t) => t.id !== id);
+              },
+            });
+            /** Let `ms` pass, firing the timers that fall due, in order. */
+            const advance = async (ms: number) => {
+              const end = clock.now + ms;
+              for (;;) {
+                const due = timers.filter((t) => t.at <= end).sort((a, b) => a.at - b.at)[0];
+                if (!due) break;
+                timers = timers.filter((t) => t !== due);
+                clock.now = Math.max(clock.now, due.at);
+                due.f();
+                await flush();
+              }
+              clock.now = end;
+            };
+            const pickTelegram = async () => {
+              chips[1].listeners.click({ currentTarget: chips[1] });
+              await flush();
+            };
+            const requests = (path: string) =>
+              fetch.mock.calls.filter((c) => c[0] === path).map((c) => JSON.parse((c[1] as { body: string }).body));
+            return { nodes, chips, fetch, open, document, window, documentListeners, windowListeners, answers, advance, pickTelegram, requests };
+          };
+          const STATUS = '/auth/first-app/telegram/status';
+
+          it('stays out of the way until Telegram is picked', async () => {
+            const t = await run();
+            expect(t.nodes['quick-apps'].hidden).toBe(false);
+            expect(t.nodes['tg-setup'].hidden).toBe(true);
+            await t.advance(10_000);
+            expect(t.fetch).not.toHaveBeenCalled();
+
+            // Another app never shows it.
+            t.chips[2].listeners.click({ currentTarget: t.chips[2] });
+            await flush();
+            expect(t.nodes['tg-setup'].hidden).toBe(true);
+          });
+
+          it('shows the button with the link and the QR code once Telegram is picked', async () => {
+            const t = await run();
+            await t.pickTelegram();
+
+            expect(t.nodes['tg-setup'].hidden).toBe(false);
+            expect(t.nodes['tg-create'].attrs.href).toBe(LINK);
+            expect(t.nodes['tg-qr'].hidden).toBe(false);
+            expect(t.nodes['tg-qr-img'].attrs.src).toBe(PICKED.telegram.qr);
+            // Beside the QR code, for a computer without the Telegram app: Telegram in the browser.
+            expect(t.nodes['tg-web'].hidden).toBe(false);
+            expect(t.nodes['tg-web'].attrs.href).toBe(PICKED.telegram.web);
+            expect(t.nodes['tg-link-web'].attrs.href).toBe(PICKED.telegram.claimWeb);
+            expect(t.nodes['tg-status'].textContent).toBe('Waiting for your bot…');
+            expect(t.nodes['quick-status'].textContent).toBe('Telegram added. Create its bot now, or continue and finish it in Claude.');
+            expect(t.nodes['quick-apps'].attrs['data-telegram']).toBe('on');
+            // The second link is ready, and not shown yet.
+            expect(t.nodes['tg-link'].hidden).toBe(true);
+            expect(t.nodes['tg-link-btn'].attrs.href).toBe(CLAIM);
+            expect(t.nodes['tg-link-qr'].hidden).toBe(true);
+            // Everything stays optional: the request for the chat is still there.
+            expect(t.nodes['example-request'].textContent).toBe('Finish setting up my Telegram connector.');
+          });
+
+          it('keeps the QR code hidden on a touch device, whatever its user agent says', async () => {
+            const t = await run({ touch: true });
+            await t.pickTelegram();
+            expect(t.nodes['tg-setup'].hidden).toBe(false);
+            expect(t.nodes['tg-qr'].hidden).toBe(true);
+            expect(t.nodes['tg-qr-img'].attrs.src).toBeUndefined();
+          });
+
+          it('has no QR code at all on a phone', async () => {
+            const t = await run({ userAgent: PHONE_UA, touch: true });
+            expect(t.nodes['tg-qr']).toBeUndefined();
+            await t.pickTelegram();
+            expect(t.nodes['tg-setup'].hidden).toBe(false);
+            expect(t.nodes['tg-create'].attrs.href).toBe(LINK);
+          });
+
+          it('asks for the status every two seconds, with the CSRF token', async () => {
+            const t = await run();
+            await t.pickTelegram();
+            expect(t.requests(STATUS)).toHaveLength(0);
+            await t.advance(1_900);
+            expect(t.requests(STATUS)).toHaveLength(0);
+            await t.advance(200);
+            expect(t.requests(STATUS)).toEqual([{ csrf: t.nodes['quick-apps'].attrs['data-csrf'] }]);
+            expect(t.fetch).toHaveBeenLastCalledWith(STATUS, expect.objectContaining({ method: 'POST', credentials: 'same-origin' }));
+            await t.advance(6_000);
+            expect(t.requests(STATUS)).toHaveLength(4);
+          });
+
+          it('reports a click on "open Telegram Web" as the web way in, once', async () => {
+            const t = await run();
+            await t.pickTelegram();
+            const before = t.requests(STATUS).length;
+            t.nodes['tg-web'].listeners.click();
+            await flush();
+            expect(t.requests(STATUS)[before]).toEqual({ csrf: expect.any(String), opened: true, via: 'web' });
+            // A later click on the app's button does not change what was reported.
+            t.nodes['tg-create'].listeners.click();
+            await flush();
+            expect(t.requests(STATUS)[before + 1]).toEqual({ csrf: expect.any(String) });
+          });
+
+          it('does not ask while the page is in the background, and asks at once on coming back', async () => {
+            const t = await run();
+            await t.pickTelegram();
+            t.document.hidden = true;
+            await t.advance(20_000);
+            expect(t.requests(STATUS)).toHaveLength(0);
+
+            // Back from Telegram: no waiting for the next tick.
+            t.document.hidden = false;
+            t.documentListeners.visibilitychange();
+            await flush();
+            expect(t.requests(STATUS)).toHaveLength(1);
+            t.windowListeners.focus();
+            await flush();
+            expect(t.requests(STATUS)).toHaveLength(2);
+            // And the two-second rhythm goes on from there.
+            await t.advance(2_100);
+            expect(t.requests(STATUS)).toHaveLength(3);
+          });
+
+          it('shows the connected bot, changes the example request and stops asking', async () => {
+            const t = await run();
+            await t.pickTelegram();
+            t.answers.status = () => ({ ok: true, state: 'connected', bot: '@amcp_1a2b3c4d_bot', request: 'Send me a test message on Telegram.' });
+            await t.advance(2_100);
+
+            expect(t.nodes['tg-status'].textContent).toBe('Telegram is connected: @amcp_1a2b3c4d_bot.');
+            expect(t.nodes['example-request'].textContent).toBe('Send me a test message on Telegram.');
+            // The opening lines said the workspace has no apps: no longer true.
+            expect(t.nodes['first-sub'].textContent).toBe('Telegram is ready. Continue to Claude and ask, for example:');
+            expect(t.nodes['first-body'].hidden).toBe(true);
+            expect(t.nodes['tg-setup'].attrs['data-state']).toBe('connected');
+            expect(t.nodes['tg-create'].hidden).toBe(true);
+            expect(t.nodes['tg-qr'].hidden).toBe(true);
+            expect(t.nodes['tg-paste'].hidden).toBe(true);
+            expect(t.nodes['tg-link'].hidden).toBe(true);
+            expect(t.nodes['quick-status'].textContent).toBe('');
+            // One step is left, and the page says which.
+            expect(t.nodes['tg-next'].hidden).toBe(false);
+            expect(t.nodes['tg-next'].textContent).toBe('Last step: tap Continue to Claude below.');
+            expect(t.nodes['quick-apps'].attrs['data-telegram']).toBe('done');
+
+            const asked = t.requests(STATUS).length;
+            await t.advance(60_000);
+            expect(t.requests(STATUS)).toHaveLength(asked);
+          });
+
+          it('brings Continue into view once the bot is connected, and never follows it for the user', async () => {
+            const t = await run();
+            const scrolled: unknown[] = [];
+            (t.nodes.continue as any).scrollIntoView = (how: unknown) => scrolled.push(how);
+            (t.nodes.continue as any).click = jest.fn();
+            const before = t.nodes.continue.listeners.click;
+            await t.pickTelegram();
+            expect(scrolled).toEqual([]);
+            t.answers.status = () => ({ ok: true, state: 'connected', bot: '@amcp_1a2b3c4d_bot', request: 'Send me a test message on Telegram.' });
+            await t.advance(2_100);
+
+            // Only as far as needed, and once: a later answer does not move the page again.
+            expect(scrolled).toEqual([{ block: 'nearest', behavior: 'smooth' }]);
+            t.windowListeners.focus();
+            await flush();
+            await t.advance(10_000);
+            expect(scrolled).toHaveLength(1);
+            // The tap stays the user's: nothing clicked, opened or added to Continue.
+            expect((t.nodes.continue as any).click).not.toHaveBeenCalled();
+            expect(t.open).not.toHaveBeenCalled();
+            expect(t.nodes.continue.listeners.click).toBe(before);
+            expect(t.nodes.continue.attrs).toEqual({ 'data-client': 'Claude' });
+          });
+
+          it('still shows the bot as connected in a browser that cannot scroll that way', async () => {
+            const t = await run();
+            (t.nodes.continue as any).scrollIntoView = () => {
+              throw new TypeError('options are not supported');
+            };
+            await t.pickTelegram();
+            t.answers.status = () => ({ ok: true, state: 'connected', bot: '@b_bot', request: 'Send me a test message on Telegram.' });
+            await t.advance(2_100);
+            expect(t.nodes['tg-status'].textContent).toBe('Telegram is connected: @b_bot.');
+            expect(t.nodes['tg-next'].textContent).toBe('Last step: tap Continue to Claude below.');
+          });
+
+          it('points to the bot\'s chat until Start was pressed there, then is done', async () => {
+            const t = await run();
+            await t.pickTelegram();
+            const connected = { ok: true, state: 'connected', bot: '@amcp_1a2b3c4d_bot', request: 'Send me a test message on Telegram.' };
+            t.answers.status = () => ({ ...connected, startUrl: 'https://t.me/amcp_1a2b3c4d_bot' });
+            await t.advance(2_100);
+
+            expect(t.nodes['tg-status'].textContent).toBe('Telegram is connected: @amcp_1a2b3c4d_bot.');
+            expect(t.nodes['tg-setup'].attrs['data-state']).toBe('start');
+            expect(t.nodes['tg-create'].hidden).toBe(false);
+            expect(t.nodes['tg-create'].attrs.href).toBe('https://t.me/amcp_1a2b3c4d_bot');
+            expect(t.nodes['tg-create'].textContent).toBe('Open your bot and press Start');
+            // Two things are left, in their order; Continue is not pointed at yet.
+            expect(t.nodes['tg-next'].hidden).toBe(false);
+            expect(t.nodes['tg-next'].textContent).toBe('Two steps left: press Start in your bot’s chat, then tap Continue to Claude below.');
+            expect(t.nodes['quick-apps'].attrs['data-telegram']).toBe('on');
+
+            // Still asking: the server greets the user after their first /start.
+            const asked = t.requests(STATUS).length;
+            await t.advance(4_000);
+            expect(t.requests(STATUS).length).toBeGreaterThan(asked);
+
+            t.answers.status = () => connected;
+            await t.advance(2_100);
+            expect(t.nodes['tg-create'].hidden).toBe(true);
+            expect(t.nodes['tg-setup'].attrs['data-state']).toBe('connected');
+            expect(t.nodes['tg-next'].textContent).toBe('Last step: tap Continue to Claude below.');
+            expect(t.nodes['quick-apps'].attrs['data-telegram']).toBe('done');
+            const done = t.requests(STATUS).length;
+            await t.advance(30_000);
+            expect(t.requests(STATUS)).toHaveLength(done);
+          });
+
+          it('stops asking two minutes after connecting when Start is never pressed', async () => {
+            const t = await run();
+            await t.pickTelegram();
+            t.answers.status = () => ({ ok: true, state: 'connected', bot: '@b_bot', startUrl: 'https://t.me/b_bot', request: 'x' });
+            await t.advance(125_000);
+            const asked = t.requests(STATUS).length;
+            await t.advance(60_000);
+            expect(t.requests(STATUS)).toHaveLength(asked);
+          });
+
+          describe('a bot whose username was changed', () => {
+            it('offers "Link your bot" a minute after the pick when the link was never clicked (the QR code)', async () => {
+              const t = await run();
+              await t.pickTelegram();
+              await t.advance(58_000);
+              expect(t.nodes['tg-link'].hidden).toBe(true);
+              await t.advance(4_000);
+              expect(t.nodes['tg-link'].hidden).toBe(false);
+              // On a desktop also as a QR code: the bot was made on the phone.
+              expect(t.nodes['tg-link-qr'].hidden).toBe(false);
+              expect(t.nodes['tg-link-qr-img'].attrs.src).toBe(PICKED.telegram.claimQr);
+              // The first QR code and the token option are still there.
+              expect(t.nodes['tg-qr'].hidden).toBe(false);
+              expect(t.nodes['tg-paste'].hidden).toBe(false);
+            });
+
+            it('offers it 20 seconds after the click on the link, and reports that click once', async () => {
+              const t = await run();
+              await t.pickTelegram();
+              await t.advance(50_000);
+              const before = t.requests(STATUS).length;
+
+              t.nodes['tg-create'].listeners.click();
+              await flush();
+              // Sent at once, with the click.
+              expect(t.requests(STATUS)).toHaveLength(before + 1);
+              expect(t.requests(STATUS)[before]).toEqual({ csrf: expect.any(String), opened: true, via: 'app' });
+
+              // The click counts the wait anew: a bot with the suggested username arrives within seconds.
+              await t.advance(18_000);
+              expect(t.nodes['tg-link'].hidden).toBe(true);
+              await t.advance(4_000);
+              expect(t.nodes['tg-link'].hidden).toBe(false);
+              expect(t.requests(STATUS).filter((body) => body.opened)).toHaveLength(1);
+              // The click opens nothing itself: the link does.
+              expect(t.open).not.toHaveBeenCalled();
+            });
+
+            it('offers it at once when the server saw a bot with another username, and reports that once', async () => {
+              const t = await run({ userAgent: PHONE_UA, touch: true });
+              await t.pickTelegram();
+              t.nodes['tg-create'].listeners.click();
+              await flush();
+              expect(t.nodes['tg-link'].hidden).toBe(true);
+
+              // Back from Telegram, seconds later.
+              t.answers.status = () => ({ ok: true, state: 'waiting', unmatched: true });
+              await t.advance(2_100);
+              expect(t.nodes['tg-link'].hidden).toBe(false);
+              expect(t.nodes['tg-link-btn'].attrs.href).toBe(CLAIM);
+              expect(t.nodes['tg-link-btn'].attrs.target).toBeUndefined(); // set in the markup, never by the script
+              // No QR code on a phone: the button opens the Telegram app.
+              expect(t.nodes['tg-link-qr']).toBeUndefined();
+
+              await t.advance(6_000);
+              expect(t.requests(STATUS).filter((body) => body.offered)).toEqual([{ csrf: expect.any(String), offered: true }]);
+            });
+
+            it('says so again when the report did not arrive', async () => {
+              const t = await run();
+              await t.pickTelegram();
+              t.answers.status = () => ({ ok: true, state: 'waiting', unmatched: true });
+              await t.advance(2_100);
+              t.answers.status = () => ({ statusCode: 429, message: 'ThrottlerException: Too Many Requests' });
+              await t.advance(2_000);
+              t.answers.status = () => ({ ok: true, state: 'waiting' });
+              await t.advance(6_000);
+              expect(t.requests(STATUS).filter((body) => body.offered)).toHaveLength(2);
+              // Once shown it stays, whatever the server says next.
+              expect(t.nodes['tg-link'].hidden).toBe(false);
+            });
+
+            it('keeps its QR code hidden on a touch device, whatever its user agent says', async () => {
+              const t = await run({ touch: true });
+              await t.pickTelegram();
+              t.answers.status = () => ({ ok: true, state: 'waiting', unmatched: true });
+              await t.advance(2_100);
+              expect(t.nodes['tg-link'].hidden).toBe(false);
+              expect(t.nodes['tg-link-qr'].hidden).toBe(true);
+              expect(t.nodes['tg-link-qr-img'].attrs.src).toBeUndefined();
+            });
+
+            it('asks for the status at once on a click on it, and opens or navigates nothing itself', async () => {
+              const t = await run({ userAgent: PHONE_UA, touch: true });
+              await t.pickTelegram();
+              t.answers.status = () => ({ ok: true, state: 'waiting', unmatched: true });
+              await t.advance(2_100);
+              const before = t.requests(STATUS).length;
+
+              t.nodes['tg-link-btn'].listeners.click();
+              await flush();
+              expect(t.requests(STATUS)).toHaveLength(before + 1);
+              expect(t.open).not.toHaveBeenCalled();
+              // Continue is as it was: no listener, on a phone.
+              expect(t.nodes.continue.listeners).toEqual({});
+
+              // Start was pressed in the setup bot's chat: the bot is connected.
+              t.answers.status = () => ({ ok: true, state: 'connected', bot: '@my_shop_bot', request: 'Send me a test message on Telegram.' });
+              t.documentListeners.visibilitychange();
+              await flush();
+              expect(t.nodes['tg-status'].textContent).toBe('Telegram is connected: @my_shop_bot.');
+              expect(t.nodes['tg-link'].hidden).toBe(true);
+              expect(t.nodes['example-request'].textContent).toBe('Send me a test message on Telegram.');
+            });
+
+            it('says that the account is linked when Start was pressed before any bot existed', async () => {
+              const t = await run();
+              await t.pickTelegram();
+              t.answers.status = () => ({ ok: true, state: 'waiting', unmatched: true });
+              await t.advance(2_100);
+              expect(t.nodes['tg-link'].hidden).toBe(false);
+
+              t.answers.status = () => ({ ok: true, state: 'waiting', claimed: true });
+              await t.advance(2_100);
+              expect(t.nodes['tg-status'].textContent).toBe('Your Telegram account is linked. Now create your bot: any username works.');
+              // Nothing left to link: the button to create the bot is what matters now.
+              expect(t.nodes['tg-link'].hidden).toBe(true);
+              expect(t.nodes['tg-create'].hidden).toBe(false);
+              expect(t.nodes['tg-create'].attrs.href).toBe(LINK);
+              await t.advance(120_000);
+              expect(t.nodes['tg-link'].hidden).toBe(true);
+
+              t.answers.status = () => ({ ok: true, state: 'connected', bot: '@my_shop_bot', request: 'Send me a test message on Telegram.' });
+              await t.advance(2_100);
+              expect(t.nodes['tg-status'].textContent).toBe('Telegram is connected: @my_shop_bot.');
+            });
+
+            it('never shows a link it was not given', async () => {
+              const t = await run();
+              const picked = PICKED.telegram as { claim?: string };
+              const claim = picked.claim;
+              delete picked.claim;
+              try {
+                await t.pickTelegram();
+                t.answers.status = () => ({ ok: true, state: 'waiting', unmatched: true });
+                await t.advance(70_000);
+                expect(t.nodes['tg-link'].hidden).toBe(true);
+                expect(t.requests(STATUS).filter((body) => body.offered)).toHaveLength(0);
+              } finally {
+                picked.claim = claim;
+              }
+            });
+          });
+
+          it('says so and stops when the page has expired', async () => {
+            const t = await run();
+            await t.pickTelegram();
+            t.answers.status = () => ({ ok: false, error: 'This page has expired.' });
+            await t.advance(2_100);
+            expect(t.nodes['tg-status'].textContent).toBe('This link has expired. Go back to Claude and press Connect again.');
+            expect(t.nodes['tg-link'].hidden).toBe(true);
+            const asked = t.requests(STATUS).length;
+            await t.advance(30_000);
+            expect(t.requests(STATUS)).toHaveLength(asked);
+          });
+
+          it('keeps asking after an answer it cannot read (offline, too many requests)', async () => {
+            const t = await run();
+            await t.pickTelegram();
+            t.answers.status = () => ({ statusCode: 429, message: 'ThrottlerException: Too Many Requests' });
+            await t.advance(6_100);
+            expect(t.nodes['tg-status'].textContent).toBe('Waiting for your bot…');
+            t.answers.status = () => {
+              throw new Error('offline');
+            };
+            await t.advance(4_000);
+            t.answers.status = () => ({ ok: true, state: 'connected', bot: '@b_bot', request: 'Send me a test message on Telegram.' });
+            await t.advance(2_100);
+            expect(t.nodes['tg-status'].textContent).toBe('Telegram is connected: @b_bot.');
+          });
+
+          it('gives up after 30 minutes', async () => {
+            const t = await run();
+            await t.pickTelegram();
+            await t.advance(31 * 60_000);
+            const asked = t.requests(STATUS).length;
+            await t.advance(60_000);
+            expect(t.requests(STATUS)).toHaveLength(asked);
+          });
+
+          describe('the token of a bot one already has', () => {
+            const TOKEN = '8123456789:AAGpastedTokenForTestsOnly0123456789abc';
+            const TOKEN_PATH = '/auth/first-app/telegram/token';
+            const submit = async (t: Awaited<ReturnType<typeof run>>, value: string) => {
+              t.nodes['tg-token'].value = value;
+              const event = { preventDefault: jest.fn() };
+              t.nodes['tg-token-form'].listeners.submit(event);
+              await flush();
+              return event;
+            };
+
+            it('is saved, and the page shows the bot as connected', async () => {
+              const t = await run();
+              await t.pickTelegram();
+              const event = await submit(t, `  ${TOKEN} `);
+
+              // Never a page load: the form only posts in the background.
+              expect(event.preventDefault).toHaveBeenCalled();
+              expect(t.requests(TOKEN_PATH)).toEqual([{ csrf: t.nodes['quick-apps'].attrs['data-csrf'], token: TOKEN }]);
+              expect(t.nodes['tg-status'].textContent).toBe('Telegram is connected: @my_own_bot.');
+              expect(t.nodes['tg-next'].textContent).toBe('Last step: tap Continue to Claude below.');
+              expect(t.nodes['example-request'].textContent).toBe('Send me a test message on Telegram.');
+              expect(t.nodes['tg-token'].value).toBe('');
+              expect(t.nodes['tg-create'].hidden).toBe(true);
+              const asked = t.requests(STATUS).length;
+              await t.advance(30_000);
+              expect(t.requests(STATUS)).toHaveLength(asked);
+            });
+
+            it('is checked on the page before anything is sent', async () => {
+              const t = await run();
+              await t.pickTelegram();
+              await submit(t, 'my bot');
+              expect(t.requests(TOKEN_PATH)).toHaveLength(0);
+              expect(t.nodes['tg-token-status'].textContent).toContain('does not look like a bot token');
+            });
+
+            it('shows why it was refused and keeps waiting for the one-tap bot', async () => {
+              const t = await run();
+              await t.pickTelegram();
+              t.answers.token = () => ({ ok: false, error: 'Telegram refused the bot token.' });
+              await submit(t, TOKEN);
+
+              expect(t.nodes['tg-token-status'].textContent).toBe('Telegram refused the bot token.');
+              expect(t.nodes['tg-token-save'].attrs['aria-disabled']).toBe('false');
+              expect(t.nodes['tg-status'].textContent).toBe('Waiting for your bot…');
+              expect(t.nodes['tg-token'].value).toBe(TOKEN);
+              const asked = t.requests(STATUS).length;
+              await t.advance(2_100);
+              expect(t.requests(STATUS).length).toBeGreaterThan(asked);
+            });
+          });
+
+          it('leaves Continue alone: no listener of its own, on a desktop or a phone', async () => {
+            const desktop = await run();
+            const before = desktop.nodes.continue.listeners.click;
+            await desktop.pickTelegram();
+            desktop.nodes['tg-create'].listeners.click();
+            await flush();
+            await desktop.advance(25_000);
+            desktop.nodes['tg-link-btn'].listeners.click();
+            await flush();
+            await desktop.advance(5_000);
+            expect(desktop.nodes['tg-link'].hidden).toBe(false);
+            // This test browser has no clipboard, so the page added nothing to Continue either.
+            expect(before).toBeUndefined();
+            expect(desktop.nodes.continue.listeners).toEqual({});
+            expect(desktop.open).not.toHaveBeenCalled();
+
+            const phone = await run({ userAgent: PHONE_UA, touch: true });
+            await phone.pickTelegram();
+            phone.nodes['tg-create'].listeners.click();
+            await flush();
+            await phone.advance(25_000);
+            phone.nodes['tg-link-btn'].listeners.click();
+            await flush();
+            await phone.advance(5_000);
+            expect(phone.nodes['tg-link'].hidden).toBe(false);
+            expect(phone.nodes.continue.listeners).toEqual({});
+            expect(phone.open).not.toHaveBeenCalled();
+          });
+        });
       });
     });
   });
@@ -1447,42 +2885,60 @@ describe('LoginController', () => {
       expect(html).toContain('Only continue if you started this');
     });
 
-    it('shows the directory badge to every client but ChatGPT and Muse, and tells the sign-up page who it is', async () => {
+    it("shows each assistant only its own directory badge, both to other clients, and tells the sign-up page who it is", async () => {
       const link = (client: string) => `href="/login?mode=register&amp;redirect=%2Fauth%2Flogin&amp;client=${client}"`;
+      const CLAUDE_ONLY = 'Listed in Anthropic&#39;s Claude Directory';
+      const CHATGPT_ONLY = 'Listed in OpenAI&#39;s ChatGPT Plugin Directory';
+      const BOTH = 'Listed in the Claude and ChatGPT directories';
 
       session('https://claude.ai/api/mcp/auth_callback', 'Claude');
       let html = await page(make(DEPLOY.cloud));
-      expect(html).toContain('Claude Directory');
+      expect(html).toContain(CLAUDE_ONLY);
+      expect(html).not.toMatch(/ChatGPT Plugin Directory|directories/);
       expect(html).toContain(link('claude'));
 
       session('https://chatgpt.com/connector_platform_oauth_redirect', 'ChatGPT');
       html = await page(make(DEPLOY.cloud));
-      expect(html).not.toContain('Claude Directory');
+      expect(html).toContain(CHATGPT_ONLY);
+      expect(html).toContain('class="verified verified-chatgpt"');
+      expect(html).not.toMatch(/Claude Directory|directories/);
       expect(html).toContain(link('chatgpt'));
 
-      // Muse by Meta's domains, or by name while its host is not known yet.
+      // Muse by Meta's domains, or by name while its host is not known yet:
+      // neither assistant's listing.
       for (const [uri, name] of [
         ['https://www.meta.ai/oauth/callback', 'Meta AI'],
         ['https://connectors.example.net/cb', 'Muse'],
       ]) {
         session(uri, name);
         html = await page(make(DEPLOY.cloud));
-        expect(html).not.toContain('Claude Directory');
+        expect(html).not.toContain('class="verified');
+        expect(html).not.toMatch(/Directory|directories|plugin directory/);
         expect(html).toContain(link('muse'));
       }
 
-      // Any other client (Cursor, Copilot, Grok…) sees it.
+      // Any other client (Cursor, Copilot, Grok…) sees both, in one pill.
       session('https://grok.com/connectors-oauth-exchange-code/', 'Grok');
       html = await page(make(DEPLOY.cloud));
-      expect(html).toContain('Claude Directory');
+      expect(html).toContain(BOTH);
+      expect(html).not.toContain(CLAUDE_ONLY);
+      expect(html).not.toContain(CHATGPT_ONLY);
       expect(html).toContain(link('other'));
     });
 
-    it('shows no directory badge on self-hosted, even for Claude', async () => {
+    it('shows no directory badge on self-hosted, for any client', async () => {
+      for (const [uri, name] of [
+        ['https://claude.ai/api/mcp/auth_callback', 'Claude'],
+        ['https://chatgpt.com/connector_platform_oauth_redirect', 'ChatGPT'],
+        ['https://grok.com/connectors-oauth-exchange-code/', 'Grok'],
+      ]) {
+        session(uri, name);
+        const html = await page(make(DEPLOY.selfHosted));
+        expect(html).not.toContain('class="verified');
+        expect(html).not.toMatch(/Directory|directories|plugin directory/);
+      }
       session('https://claude.ai/api/mcp/auth_callback', 'Claude');
-      const html = await page(make(DEPLOY.selfHosted));
-      expect(html).toContain('class="tile tile-claude"');
-      expect(html).not.toContain('Claude Directory');
+      expect(await page(make(DEPLOY.selfHosted))).toContain('class="tile tile-claude"');
     });
 
     it('puts Allow before Cancel in the markup, so Enter never cancels', async () => {
@@ -1532,6 +2988,12 @@ describe('LoginController', () => {
       expect(p.organizationMember.findFirst).toHaveBeenCalledWith(
         expect.objectContaining({ where: expect.objectContaining({ userId: 'u1', organizationId: 'org-1' }) }),
       );
+
+      // A member who may not see the server (restricted member visibility).
+      grants.keepVisible.mockResolvedValueOnce([]);
+      const hidden = await page(make(DEPLOY.cloud, p), req as any);
+      expect(hidden).not.toContain('Sales');
+      expect(grants.keepVisible).toHaveBeenLastCalledWith('u1', [{ id: 'srv-1', organizationId: 'org-1' }]);
 
       p.organizationMember.findFirst.mockResolvedValue(null);
       const outsider = await page(make(DEPLOY.cloud, p), req as any);

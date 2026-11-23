@@ -55,7 +55,7 @@ export function toolPrefixFrom(name: string): string {
     .replace(/[̀-ͯ]/g, '')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '');
+    .replace(/^_|_$/g, ''); // runs are already one underscore long
   // At most 24 characters, cut after a whole word ("drawing_archive_ftps",
   // not "drawing_archive_ftps_tes"); a single long word is cut as is.
   let cut = base.slice(0, 24);
@@ -163,7 +163,11 @@ export function parseFileSearchConfig(raw: unknown, opts: ParseOptions): FileSea
   }
 
   // sftp / ftp / ftps / ftps-implicit
-  const host = (c.host ?? '').trim().replace(/^[a-z]+:\/\//i, '').replace(/\/.*$/, '');
+  // The host is what comes before the first '/'. A value with a line break in
+  // it is never a host name: it is refused whole (`/^.*$/` fails on any line
+  // terminator), as before, rather than cut at the first '/'.
+  const rawHost = (c.host ?? '').trim().replace(/^[a-z]+:\/\//i, '');
+  const host = /^.*$/.test(rawHost) ? rawHost.split('/')[0] : '';
   if (!host || !HOST_RE.test(host)) throw new FileSearchConfigError('Enter the server name or IP address.', 'host');
   out.host = host.toLowerCase();
   out.port = c.port ?? DEFAULT_PORTS[protocol] ?? undefined;

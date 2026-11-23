@@ -211,6 +211,11 @@ test.describe('starter pack on /welcome', () => {
     // says "Add 2" and a third, unticked card is disabled.
     await expect(region.getByRole('button', { name: 'Add 2 connectors' })).toBeEnabled();
     await expect(region.getByText('Your current plan includes')).toBeVisible();
+    // The checkout takes more than cards, so the link says "payment method".
+    await expect(region.getByRole('link', { name: 'Add a payment method for more' })).toHaveAttribute(
+      'href',
+      '/start-trial?source=starter_pack',
+    );
     await expect(region.getByRole('checkbox', { name: /Nominatim/ })).toBeDisabled();
 
     await region.getByRole('button', { name: 'Add 2 connectors' }).click();
@@ -262,7 +267,7 @@ test.describe('popular apps on /welcome', () => {
   test('leads with the apps workspaces connect, saying what each setup asks for', async ({ page }) => {
     await openWelcome(page);
     const telegram = page.getByRole('link', { name: /Telegram Bot API/ });
-    await expect(telegram).toHaveAttribute('href', '/connectors/setup/telegram-bot');
+    await expect(telegram).toHaveAttribute('href', '/connectors/setup/telegram-bot?back=welcome');
     await expect(telegram).toContainText('Bot token');
     await expect(page.getByRole('link', { name: /Etsy Open API v3/ })).toContainText('Sign in · Keystring and Shared secret');
     await expect(page.getByRole('link', { name: /Odoo JSON-2 API/ })).toContainText('Already added');
@@ -280,6 +285,6 @@ test.describe('popular apps on /welcome', () => {
       popular: 'fail',
       catalog: [{ slug: 'telegram-bot', name: 'Telegram Bot API', icon: 'telegram', category: 'messaging', setupKind: 'credentials', requiredEnvVars: ['TELEGRAM_BOT_TOKEN'] }],
     });
-    await expect(page.getByRole('link', { name: /Telegram Bot API/ })).toHaveAttribute('href', '/connectors/setup/telegram-bot');
+    await expect(page.getByRole('link', { name: /Telegram Bot API/ })).toHaveAttribute('href', '/connectors/setup/telegram-bot?back=welcome');
   });
 });

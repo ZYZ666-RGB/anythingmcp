@@ -1,4 +1,5 @@
 import { Client } from '@modelcontextprotocol/client';
+import { resetReadReminders } from '../ee/learning/learning-tools';
 import { InMemoryTransport, McpServer } from '@modelcontextprotocol/server';
 import { McpEndpointController } from './mcp-endpoint.controller';
 import { McpServersService } from '../mcp-servers/mcp-servers.service';
@@ -7,6 +8,7 @@ import {
   connectorInstructionsUri,
   serverInstructionsUri,
 } from './mcp-resources';
+import { withRegistryIndexes } from './registry-test-double';
 
 /**
  * Regression tests for cross-tenant isolation on the per-server MCP endpoint.
@@ -33,6 +35,7 @@ describe('McpEndpointController — tenant isolation', () => {
     const res: any = {};
     res.status = jest.fn().mockReturnValue(res);
     res.json = jest.fn().mockReturnValue(res);
+    res.setHeader = jest.fn();
     res.headersSent = false;
     return res;
   };
@@ -46,7 +49,7 @@ describe('McpEndpointController — tenant isolation', () => {
         .mockResolvedValue({ instructions: undefined, connectors: [], resources: [] }),
       isUserInOrganization: jest.fn().mockResolvedValue(false),
     };
-    toolRegistry = { getAllTools: jest.fn().mockReturnValue([]) };
+    toolRegistry = withRegistryIndexes({ getAllTools: jest.fn().mockReturnValue([]) });
     toolExecutor = { executeTool: jest.fn() };
     rolesService = { getAllowedToolIds: jest.fn().mockResolvedValue(null) };
     const kgService = {
@@ -76,8 +79,10 @@ describe('McpEndpointController — tenant isolation', () => {
 
   it('denies a non-member whose org differs and has no membership (cross-tenant)', async () => {
     // org-B user, NOT a member of org-A → isUserInOrganization returns false.
+    const warn = jest.spyOn((controller as any).logger, 'warn').mockImplementation(() => undefined);
     const req: any = {
       user: { sub: 'u-b', organizationId: 'org-B', authMethod: 'jwt' },
+      headers: { host: 'cloud.anythingmcp.com', 'x-forwarded-proto': 'https', authorization: 'Bearer tok' },
     };
     const res = makeRes();
 
@@ -87,9 +92,130 @@ describe('McpEndpointController — tenant isolation', () => {
       'u-b',
       'org-A',
     );
-    expect(res.status).toHaveBeenCalledWith(403);
+    // A sign-in for the wrong workspace: 401 + invalid_token, so the client
+    // runs OAuth again instead of retrying the same token forever (#1609).
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(res.setHeader).toHaveBeenCalledWith(
+      'WWW-Authenticate',
+      'Bearer realm="AnythingMCP MCP Server", error="invalid_token", ' +
+        'error_description="This sign-in is not a member of the workspace that owns this MCP server", ' +
+        'resource_metadata="https://cloud.anythingmcp.com/.well-known/oauth-protected-resource/mcp/srv-A"',
+    );
+    expect(res.json.mock.calls[0][0].error.message).toMatch(/different workspace/);
+    expect(warn.mock.calls.map((c) => String(c[0])).some((m) => m.includes('caller is not a member'))).toBe(true);
     // Must short-circuit before touching the server's connectors/tools.
     expect(mcpServersService.getConnectorIds).not.toHaveBeenCalled();
+  });
+
+  it('keeps the 403 for an API key of another workspace (signing in again would not help)', async () => {
+    const req: any = {
+      user: { sub: 'u-b', organizationId: 'org-B', authMethod: 'mcp_api_key', apiKeyName: 'laptop' },
+      headers: {},
+    };
+    const res = makeRes();
+
+    await controller.handlePost('srv-A', req, res, {});
+
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.setHeader).not.toHaveBeenCalledWith('WWW-Authenticate', expect.anything());
+    expect(mcpServersService.getConnectorIds).not.toHaveBeenCalled();
+  });
+
+  describe('refusal marker for the refresh grant', () => {
+    let refusals: { mark: jest.Mock };
+    let marked: McpEndpointController;
+
+    beforeEach(() => {
+      refusals = { mark: jest.fn().mockResolvedValue(undefined) };
+      marked = new McpEndpointController(
+        mcpServersService,
+        toolRegistry,
+        toolExecutor,
+        rolesService,
+        (controller as any).kgService,
+        (controller as any).sessionManager,
+        grants as any,
+        { create: jest.fn(), hasVisible: jest.fn().mockResolvedValue(false) } as any,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        refusals as any,
+      );
+      jest.spyOn((marked as any).logger, 'warn').mockImplementation(() => undefined);
+    });
+
+    it('marks the refusal for the client of a JWT non-member before answering 401', async () => {
+      const order: string[] = [];
+      refusals.mark.mockImplementation(async () => {
+        order.push('mark');
+      });
+      const res = makeRes();
+      res.status = jest.fn((code: number) => {
+        order.push(`status ${code}`);
+        return res;
+      });
+      const req: any = {
+        user: { sub: 'u-b', organizationId: 'org-B', authMethod: 'jwt', azp: 'client-1' },
+        headers: { authorization: 'Bearer tok' },
+      };
+
+      await marked.handlePost('srv-A', req, res, {});
+
+      expect(refusals.mark).toHaveBeenCalledWith('u-b', 'client-1', 'srv-A');
+      expect(order).toEqual(['mark', 'status 401']);
+    });
+
+    it('still answers 401 when the marker cannot be written', async () => {
+      refusals.mark.mockRejectedValue(new Error('redis down'));
+      const res = makeRes();
+      await marked.handlePost(
+        'srv-A',
+        { user: { sub: 'u-b', organizationId: 'org-B', authMethod: 'jwt', azp: 'client-1' }, headers: {} } as any,
+        res,
+        {},
+      );
+      expect(res.status).toHaveBeenCalledWith(401);
+    });
+
+    it('does not mark an app JWT without an OAuth client', async () => {
+      const res = makeRes();
+      await marked.handlePost(
+        'srv-A',
+        { user: { sub: 'u-b', organizationId: 'org-B', authMethod: 'jwt' }, headers: {} } as any,
+        res,
+        {},
+      );
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(refusals.mark).not.toHaveBeenCalled();
+    });
+
+    it('does not mark for an API key of another workspace', async () => {
+      const res = makeRes();
+      await marked.handlePost(
+        'srv-A',
+        {
+          user: { sub: 'u-b', organizationId: 'org-B', authMethod: 'mcp_api_key', azp: 'client-1' },
+          headers: {},
+        } as any,
+        res,
+        {},
+      );
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(refusals.mark).not.toHaveBeenCalled();
+    });
+
+    it('does not mark a member', async () => {
+      mcpServersService.isUserInOrganization.mockResolvedValue(true);
+      await marked.handlePost(
+        'srv-A',
+        { user: { sub: 'u-multi', organizationId: 'org-B', authMethod: 'jwt', azp: 'client-1' }, headers: {} } as any,
+        makeRes(),
+        {},
+      );
+      expect(refusals.mark).not.toHaveBeenCalled();
+    });
   });
 
   describe('subscriptions/listen', () => {
@@ -100,11 +226,11 @@ describe('McpEndpointController — tenant isolation', () => {
       const res = makeRes();
       await controller.handlePost(
         'srv-A',
-        { user: { sub: 'u-b', organizationId: 'org-B', authMethod: 'jwt' } } as any,
+        { user: { sub: 'u-b', organizationId: 'org-B', authMethod: 'jwt' }, headers: {} } as any,
         res,
         LISTEN,
       );
-      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.status).toHaveBeenCalledWith(401);
       expect((controller as any).serveStateless).not.toHaveBeenCalled();
     });
 
@@ -165,6 +291,36 @@ describe('McpEndpointController — tenant isolation', () => {
     expect((controller as any).kgService.captureIntentEnabled).toHaveBeenCalledWith('org-A', 'u-multi');
   });
 
+  // An API key belongs to the workspace it was created in: unlike a sign-in,
+  // it does not reach the servers of the owner's other workspaces.
+  it("refuses an API key on a server of the owner's other workspace, even for a member", async () => {
+    mcpServersService.isUserInOrganization.mockResolvedValue(true);
+    const req: any = {
+      user: { sub: 'u-multi', organizationId: 'org-B', authMethod: 'mcp_api_key', apiKeyName: 'laptop' },
+      headers: {},
+    };
+    const res = makeRes();
+
+    await controller.handlePost('srv-A', req, res, {});
+
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(mcpServersService.isUserInOrganization).not.toHaveBeenCalled();
+    expect(mcpServersService.getConnectorIds).not.toHaveBeenCalled();
+  });
+
+  it("serves an API key on a server of the key's own workspace", async () => {
+    const req: any = {
+      user: { sub: 'u-multi', organizationId: 'org-A', authMethod: 'mcp_api_key', apiKeyName: 'laptop' },
+      headers: {},
+    };
+    const res = makeRes();
+
+    await controller.handlePost('srv-A', req, res, {});
+
+    expect(res.status).not.toHaveBeenCalledWith(403);
+    expect(mcpServersService.getConnectorIds).toHaveBeenCalledWith('srv-A');
+  });
+
   it('logs who was refused (ids and key name, no secret) and tells the client why', async () => {
     const warn = jest.spyOn((controller as any).logger, 'warn').mockImplementation(() => undefined);
     const req: any = {
@@ -194,12 +350,13 @@ describe('McpEndpointController — tenant isolation', () => {
   });
 
   it('denies when the caller organization cannot be determined (fail closed)', async () => {
-    const req: any = { user: { authMethod: 'jwt' } }; // no organizationId
+    const req: any = { user: { authMethod: 'jwt' }, headers: {} }; // no organizationId
     const res = makeRes();
 
     await controller.handlePost('srv-A', req, res, {});
 
-    expect(res.status).toHaveBeenCalledWith(403);
+    // Still refused; as a sign-in, with the 401 that makes the client sign in again.
+    expect(res.status).toHaveBeenCalledWith(401);
     expect(mcpServersService.getConnectorIds).not.toHaveBeenCalled();
   });
 
@@ -356,7 +513,7 @@ describe('McpEndpointController — keys created for a server', () => {
     };
     controller = new McpEndpointController(
       mcpServersService,
-      { getAllTools: jest.fn().mockReturnValue([]) } as any,
+      withRegistryIndexes({ getAllTools: jest.fn().mockReturnValue([]) }) as any,
       { executeTool: jest.fn() } as any,
       { getAllowedToolIds: jest.fn().mockResolvedValue(null) } as any,
       {
@@ -452,6 +609,61 @@ describe('McpEndpointController — keys created for a server', () => {
       expect(res.status).toHaveBeenCalledWith(405);
     }
   });
+
+  describe('the guide placeholder pasted as the server id', () => {
+    const jwtUser = { sub: 'u-a', organizationId: 'org-A', authMethod: 'jwt' };
+    const prevServerUrl = process.env.SERVER_URL;
+    afterEach(() => {
+      if (prevServerUrl === undefined) delete process.env.SERVER_URL;
+      else process.env.SERVER_URL = prevServerUrl;
+    });
+
+    it('still answers 404, explaining the placeholder and the sign-in /mcp of the request host', async () => {
+      delete process.env.SERVER_URL;
+      for (const id of ['YOUR_SERVER_ID', 'YOUR_SERVER_ID, then click Add.', '<server-id>']) {
+        const res = makeRes();
+        await controller.handlePost(
+          id,
+          { user: jwtUser, headers: { host: 'mcp.example.test', 'x-forwarded-proto': 'https' } } as any,
+          res,
+          {},
+        );
+        expect(res.status).toHaveBeenCalledWith(404);
+        const body = res.json.mock.calls[0][0];
+        expect(body).toMatchObject({ jsonrpc: '2.0', id: null, error: { code: -32001 } });
+        expect(body.error.message).toMatch(/^MCP server not found: .*placeholder/);
+        expect(body.error.message).toContain('Replace YOUR_SERVER_ID');
+        expect(body.error.message).toContain('https://mcp.example.test/mcp.');
+      }
+      expect(mcpServersService.getConnectorIds).not.toHaveBeenCalled();
+      expect((controller as any).serveStateless).not.toHaveBeenCalled();
+    });
+
+    it('names the configured public URL when SERVER_URL is set', async () => {
+      process.env.SERVER_URL = 'https://public.example.test/';
+      const res = makeRes();
+      await controller.handlePost('YOUR_SERVER_ID', { user: jwtUser, headers: { host: 'internal:4000' } } as any, res, {});
+      expect(res.json.mock.calls[0][0].error.message).toContain('https://public.example.test/mcp.');
+    });
+
+    it('keeps the plain message for any other unknown id', async () => {
+      const res = makeRes();
+      await controller.handlePost('srv-missing', { user: jwtUser, headers: {} } as any, res, {});
+      expect(res.status).toHaveBeenCalledWith(404);
+      expect(res.json).toHaveBeenCalledWith({
+        jsonrpc: '2.0',
+        error: { code: -32001, message: 'MCP server not found' },
+        id: null,
+      });
+    });
+
+    it('is still refused first for a key created for another server', async () => {
+      const res = makeRes();
+      await controller.handlePost('YOUR_SERVER_ID', { user: keyFor('srv-A'), headers: {} } as any, res, {});
+      denied(res);
+      expect(mcpServersService.findById).not.toHaveBeenCalled();
+    });
+  });
 });
 
 /**
@@ -483,7 +695,7 @@ describe('McpEndpointController — same tool name in several connectors', () =>
     };
     const controller = new McpEndpointController(
       { findById: jest.fn() } as any,
-      { getAllTools: jest.fn().mockReturnValue([]) } as any,
+      withRegistryIndexes({ getAllTools: jest.fn().mockReturnValue([]) }) as any,
       toolExecutor as any,
       { getAllowedToolIds: jest.fn() } as any,
       { lookup: jest.fn(), isEnabled: jest.fn(), captureIntentEnabled: jest.fn() } as any,
@@ -584,7 +796,7 @@ describe('McpEndpointController — structuredContent', () => {
     const toolExecutor = { executeTool: jest.fn().mockResolvedValue(executeResult) };
     const controller = new McpEndpointController(
       { findById: jest.fn() } as any,
-      { getAllTools: jest.fn().mockReturnValue([]) } as any,
+      withRegistryIndexes({ getAllTools: jest.fn().mockReturnValue([]) }) as any,
       toolExecutor as any,
       { getAllowedToolIds: jest.fn() } as any,
       { lookup: jest.fn(), isEnabled: jest.fn(), captureIntentEnabled: jest.fn() } as any,
@@ -657,7 +869,7 @@ describe('McpEndpointController — structuredContent', () => {
     };
     const controller = new McpEndpointController(
       { findById: jest.fn() } as any,
-      { getAllTools: jest.fn().mockReturnValue([]) } as any,
+      withRegistryIndexes({ getAllTools: jest.fn().mockReturnValue([]) }) as any,
       toolExecutor as any,
       { getAllowedToolIds: jest.fn() } as any,
       { lookup: jest.fn(), isEnabled: jest.fn(), captureIntentEnabled: jest.fn() } as any,
@@ -783,6 +995,17 @@ describe('McpEndpointController — knowledge graph scope', () => {
     expect(await lookupScope(controller, kgService, null)).toEqual(['c-crm', 'c-fibu']);
   });
 
+  it('kg_how_to_obtain is told which tool names the role allows, and nothing for an unrestricted caller', async () => {
+    const { controller, kgService } = make();
+    await lookupScope(controller, kgService, ['crm_get_customer']);
+    expect(kgService.lookup.mock.calls.at(-1)[2].allowedToolNames).toEqual(new Set(['crm_get_customer']));
+    await lookupScope(controller, kgService, null);
+    expect(kgService.lookup.mock.calls.at(-1)[2].allowedToolNames).toBeNull();
+    // A role without any tool on this server: an empty set, not "everything".
+    await lookupScope(controller, kgService, []);
+    expect(kgService.lookup.mock.calls.at(-1)[2].allowedToolNames).toEqual(new Set());
+  });
+
   it('publishes the knowledge-graph resource, scoped to the role, built on read', async () => {
     const { controller, kgService } = make();
     const server = fakeServer();
@@ -798,6 +1021,7 @@ describe('McpEndpointController — knowledge graph scope', () => {
       connectorIds: ['c-crm'],
       mcpServerId: 'srv-1',
       serverName: 'Sales',
+      allowedToolNames: new Set(['crm_get_customer']),
     });
     expect(result.contents[0]).toEqual({
       uri: 'anythingmcp://server/srv-1/knowledge-graph',
@@ -828,7 +1052,7 @@ describe('McpEndpointController — skills_save_to_workspace', () => {
   function plan(serverTools: any[], create = jest.fn().mockResolvedValue({ id: 'sk-1', status: 'pending' })) {
     const controller = new McpEndpointController(
       { findById: jest.fn() } as any,
-      { getAllTools: jest.fn().mockReturnValue([]) } as any,
+      withRegistryIndexes({ getAllTools: jest.fn().mockReturnValue([]) }) as any,
       { executeTool: jest.fn() } as any,
       { getAllowedToolIds: jest.fn() } as any,
       { lookup: jest.fn(), isEnabled: jest.fn(), captureIntentEnabled: jest.fn() } as any,
@@ -1124,7 +1348,7 @@ describe('McpEndpointController — resources and instructions follow the tool p
     };
     controller = new McpEndpointController(
       service,
-      { getAllTools: () => TOOLS } as any,
+      withRegistryIndexes({ getAllTools: () => TOOLS }) as any,
       { executeTool: jest.fn() } as any,
       rolesService,
       kgService,
@@ -1411,6 +1635,39 @@ describe('McpEndpointController — resources and instructions follow the tool p
     await client.close();
   });
 
+  it('reminds a learning project\'s expert after a read tool at most every ten minutes', async () => {
+    resetReadReminders();
+    const exec = jest.fn(async () => ({ content: [{ type: 'text', text: 'ok' }] }));
+    (controller as any).toolExecutor = { executeTool: exec };
+    const active = {
+      projectId: 'lp-1',
+      organizationId: ORG_A,
+      userId: 'u-1',
+      mcpServerId: 'srv-1',
+      name: 'Pricing',
+      consentAt: new Date('2026-11-17T00:00:00Z'),
+      full: true,
+      topics: [],
+    };
+    (controller as any).learning = { activeFor: jest.fn().mockResolvedValue(active) };
+    const client = await connect(['crm_get']);
+    const first: any = await client.callTool({ name: 'crm_get', arguments: {} });
+    const texts = (r: any) => r.content.map((c: any) => c.text);
+    expect(texts(first)).toEqual(['ok', expect.stringContaining('call learning_record')]);
+    // The next read result within ten minutes carries no reminder.
+    const second: any = await client.callTool({ name: 'crm_get', arguments: {} });
+    expect(texts(second)).toEqual(['ok']);
+    await client.close();
+
+    // Somebody without a learning project never gets it.
+    resetReadReminders();
+    (controller as any).learning = { activeFor: jest.fn().mockResolvedValue(null) };
+    const other = await connect(['crm_get']);
+    const plain: any = await other.callTool({ name: 'crm_get', arguments: {} });
+    expect(texts(plain)).toEqual(['ok']);
+    await other.close();
+  });
+
   it('adds what the workspace remembers to kg_how_to_obtain, within the caller\'s memory access', async () => {
     kgService.lookup.mockResolvedValue({ query: 'customer', entities: [{ entity: 'customer' }], skills: [] });
     const factsAbout = jest.fn(async () => [
@@ -1628,5 +1885,136 @@ describe('McpEndpointController — stateless response framing', () => {
     expect(init.status).toBe(200);
     expect(init.headers.get('content-type')).toMatch(/^text\/event-stream/);
     expect(await init.text()).toContain('"serverInfo"');
+  });
+});
+
+/**
+ * Agent file uploads: file_upload_link and file_public_url appear only on a
+ * server with a tool that sends a file, and the workspace comes from the
+ * session, never from the arguments.
+ */
+describe('McpEndpointController — file upload tools', () => {
+  const fileTool = {
+    id: 't-img',
+    connectorId: 'c-etsy',
+    organizationId: 'org-A',
+    name: 'etsy_add_listing_image',
+    description: 'Add a photo from a public image URL.',
+    parameters: { type: 'object', properties: { image_url: { type: 'string', description: 'Public image URL.' } } },
+    connectorConfig: { envVars: {} },
+    endpointMapping: { method: 'POST', path: '/images', bodyMapping: { image: { __file: '$image_url' } } },
+  };
+  const plainTool = {
+    ...fileTool,
+    id: 't-get',
+    name: 'etsy_get_shop',
+    parameters: { type: 'object', properties: {} },
+    endpointMapping: { method: 'GET', path: '/shop' },
+  };
+
+  function make(enabled = true) {
+    const uploads = {
+      enabled: jest.fn(() => enabled),
+      createLink: jest.fn().mockResolvedValue({ file_ref: 'amcp-file:0123456789abcdef01234567' }),
+      publicUrl: jest.fn().mockResolvedValue({ public_url: 'https://x/f' }),
+    };
+    const controller = new McpEndpointController(
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      { create: jest.fn(), hasVisible: jest.fn().mockResolvedValue(false) } as any,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      uploads as any,
+    );
+    return { controller: controller as any, uploads };
+  }
+
+  const params = (serverTools: any[]) => ({
+    serverTools,
+    allowedToolIds: null,
+    captureIntent: false,
+    kgEnabled: false,
+    invocationContext: {
+      organizationId: 'org-A',
+      userId: 'user-1',
+      authMethod: 'jwt',
+      mcpServerId: 'srv-1',
+      mcpServerName: 'Etsy',
+      connectorIds: ['c-etsy'],
+    },
+  });
+
+  function fakeServer() {
+    const tools = new Map<string, { meta: any; handler: any }>();
+    return {
+      tools,
+      registerTool: jest.fn((name, meta, handler) => {
+        tools.set(name, { meta, handler });
+        return { remove: jest.fn() };
+      }),
+    };
+  }
+
+  it('offers both tools on a server with a file tool and hints the file parameter', async () => {
+    const { controller, uploads } = make();
+    const entries = controller.planToolSet(params([fileTool, plainTool]));
+    const names = entries.map((e: any) => e.name);
+    expect(names).toEqual(expect.arrayContaining(['file_upload_link', 'file_public_url']));
+
+    const server = fakeServer();
+    entries.forEach((e: any) => e.register(server));
+    const imageParam = server.tools.get('etsy_add_listing_image')!.meta.inputSchema.image_url;
+    // Optional parameters wrap the described schema.
+    expect(imageParam.description ?? imageParam.unwrap?.().description).toContain('amcp-file:<id>');
+
+    expect(server.tools.get('file_upload_link')!.meta._meta.ui.resourceUri).toBe('ui://anythingmcp/file-upload');
+    const linkResult = await server.tools.get('file_upload_link')!.handler({ filename: 'cover.png', organizationId: 'org-EVIL' });
+    // The upload box reads the link from structuredContent.
+    expect(linkResult.structuredContent).toEqual({ file_ref: 'amcp-file:0123456789abcdef01234567' });
+    expect(uploads.createLink).toHaveBeenCalledWith(
+      expect.objectContaining({ organizationId: 'org-A', userId: 'user-1', mcpServerId: 'srv-1', filename: 'cover.png' }),
+    );
+    await server.tools.get('file_public_url')!.handler({ file_ref: 'amcp-file:0123456789abcdef01234567' });
+    expect(uploads.publicUrl).toHaveBeenCalledWith('amcp-file:0123456789abcdef01234567', 'org-A');
+  });
+
+  it('offers nothing on a server without file tools, or when uploads are off', () => {
+    const names = (c: any, tools: any[]) => c.planToolSet(params(tools)).map((e: any) => e.name);
+    expect(names(make().controller, [plainTool])).not.toContain('file_upload_link');
+    expect(names(make(false).controller, [fileTool])).not.toContain('file_upload_link');
+  });
+});
+
+describe('McpEndpointController — upload box resource', () => {
+  it('serves the MCP App with our origin as the only network target', async () => {
+    process.env.SERVER_URL = 'https://cloud.example.com/';
+    const controller: any = new McpEndpointController(
+      {} as any, {} as any, {} as any, {} as any, {} as any, {} as any, {} as any,
+      { create: jest.fn(), hasVisible: jest.fn().mockResolvedValue(false) } as any,
+    );
+    const registered: any[] = [];
+    const server = { registerResource: jest.fn((name, uri, meta, read) => { registered.push({ name, uri, meta, read }); return {}; }) };
+    controller.registerUploadUiResource(server, 'srv-1');
+    expect(registered).toHaveLength(1);
+    const r = registered[0];
+    expect(r.uri).toBe('ui://anythingmcp/file-upload');
+    expect(r.meta.mimeType).toBe('text/html;profile=mcp-app');
+    const read = await r.read();
+    expect(read.contents[0]._meta.ui.csp.connectDomains).toEqual(['https://cloud.example.com']);
+    expect(read.contents[0].text).toContain('ui/initialize');
+    // ui/message carries a ContentBlock[] (MCP Apps spec), not a single block.
+    expect(read.contents[0].text).toContain("request('ui/message', { role: 'user', content: block })");
+    expect(read.contents[0].text).not.toMatch(/<script[^>]+src=/);
   });
 });

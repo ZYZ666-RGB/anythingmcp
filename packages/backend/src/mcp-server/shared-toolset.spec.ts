@@ -1,8 +1,11 @@
 import { Client } from '@modelcontextprotocol/client';
 import { InMemoryTransport, McpServer } from '@modelcontextprotocol/server';
 import { RegisteredTool } from './tool-registry';
+import { getAdapter, listAdapters } from '../adapters/catalog';
 import {
   CHATGPT_EXTRA_TOOL_NAMES,
+  GENERATIVE_MEDIA_ADAPTERS,
+  GENERATIVE_MEDIA_TOOLS,
   SHARED_TOOL_NAMES,
   SHARED_TOOLSET_INSTRUCTIONS,
   SharedToolsetDeps,
@@ -363,6 +366,57 @@ describe('shared /mcp tool set', () => {
     expect(list.body.readToolsOnlyHere).toBeUndefined();
   });
 
+  it('keeps image, video and audio generation off the default profile, and betting odds off ChatGPT', async () => {
+    const adapterTool = (name: string, slug: string, connectorId: string) =>
+      tool({ name, connectorId, connectorConfig: { baseUrl: '', authType: 'API_KEY', config: { adapterSlug: slug } } });
+    const SPEECH = adapterTool('elevenlabs_create_speech', 'elevenlabs', 'c-voice');
+    const IMAGE = adapterTool('openai_generate_image', 'openai', 'c-openai');
+    const ANSWER = adapterTool('openai_create_response', 'openai', 'c-openai');
+    const ODDS = adapterTool('the_odds_api_get_odds', 'the-odds-api', 'c-odds');
+
+    expect(sharedEndpointAccess('stability-ai', 'default')).toBe('none');
+    expect(sharedEndpointAccess('stability-ai', 'chatgpt')).toBe('all');
+    expect(sharedEndpointAccess('openai', 'default')).toBe('all');
+    expect(sharedEndpointAccess('the-odds-api', 'default')).toBe('all');
+    expect(sharedEndpointAccess('the-odds-api', 'chatgpt')).toBe('none');
+    expect(excludedOnSharedEndpoint(IMAGE, 'default')).toBe(true);
+    expect(excludedOnSharedEndpoint(IMAGE, 'chatgpt')).toBe(false);
+    expect(excludedOnSharedEndpoint(ANSWER, 'default')).toBe(false);
+    expect(excludedOnSharedEndpoint(ODDS, 'chatgpt')).toBe(true);
+
+    const { client, deps } = await connect([CRM_READ, SPEECH, IMAGE, ANSWER, ODDS]);
+    const names = (await call(client, 'anythingmcp_search_tools', {})).body.tools.map((t: any) => t.name);
+    expect(names).toEqual(expect.arrayContaining(['openai_create_response', 'the_odds_api_get_odds']));
+    expect(names).not.toContain('openai_generate_image');
+    expect(names).not.toContain('elevenlabs_create_speech');
+
+    const image = await call(client, 'anythingmcp_run_write_tool', { tool: 'openai_generate_image', arguments: {} });
+    expect(image.isError).toBe(true);
+    expect(image.body.error).toMatch(/generates images, video or audio/);
+    const speech = await call(client, 'anythingmcp_run_write_tool', { tool: 'elevenlabs_create_speech', arguments: {} });
+    expect(speech.body.error).toMatch(/image, video or audio generation connector/);
+    expect(deps.execute).not.toHaveBeenCalled();
+
+    const list = await call(client, 'anythingmcp_list_connectors');
+    expect(list.body.notServedHere).toEqual(['c-voice']);
+    expect(list.body.generationToolsNotServedHere).toEqual(['c-openai']);
+    expect(list.body.readToolsOnlyHere).toBeUndefined();
+
+    const chatgpt = await connect([CRM_READ, IMAGE, ODDS], makeDeps(), 'chatgpt');
+    const chatgptNames = (await call(chatgpt.client, 'anythingmcp_search_tools', {})).body.tools.map((t: any) => t.name);
+    expect(chatgptNames).toContain('openai_generate_image');
+    expect(chatgptNames).not.toContain('the_odds_api_get_odds');
+  });
+
+  it('names only generation tools that exist in the catalog', () => {
+    const catalog = new Map(listAdapters().map((a) => [a.slug, a]));
+    for (const slug of GENERATIVE_MEDIA_ADAPTERS) expect(catalog.has(slug)).toBe(true);
+    for (const [slug, names] of Object.entries(GENERATIVE_MEDIA_TOOLS)) {
+      const tools = (getAdapter(slug)?.tools ?? []).map((t) => t.name);
+      for (const name of names) expect(tools).toContain(name);
+    }
+  });
+
   it('keeps kg_how_to_obtain listed and says so when the graph is off', async () => {
     const { client } = await connect(
       [CRM_READ],
@@ -442,12 +496,181 @@ describe('connectors that are not set up yet', () => {
     expect(deps.execute).not.toHaveBeenCalled();
   });
 
+  it('say up front that the trial ended, with the reactivation link, and still list the connectors', async () => {
+    const notice = {
+      message: "This workspace's AnythingMCP trial ended on 9 October 2026. … Show this link to the user: https://cloud.example.com/reactivate/tok",
+      reactivateUrl: 'https://cloud.example.com/reactivate/tok',
+    };
+    const ended = await connect([CRM_READ], makeDeps({ trialEnded: jest.fn(async () => notice) }));
+    const list = await call(ended.client, 'anythingmcp_list_connectors');
+    expect(Object.keys(list.body)[0]).toBe('trialEnded');
+    expect(list.body.trialEnded).toMatchObject(notice);
+    expect(list.body.trialEnded.hint).toContain('reactivateUrl');
+    expect(list.body.connectors.map((c: any) => c.id)).toEqual(['c-crm']);
+
+    const active = await connect([CRM_READ], makeDeps({ trialEnded: jest.fn(async () => null) }));
+    expect((await call(active.client, 'anythingmcp_list_connectors')).body.trialEnded).toBeUndefined();
+    const failing = await connect([CRM_READ], makeDeps({ trialEnded: jest.fn(async () => { throw new Error('db'); }) }));
+    expect((await call(failing.client, 'anythingmcp_list_connectors')).body.trialEnded).toBeUndefined();
+  });
+
   it('drop the empty-workspace hint when the only connector is waiting for setup', async () => {
     const { client } = await connect([ETSY_PENDING]);
     const list = await call(client, 'anythingmcp_list_connectors');
     expect(list.body.connectors).toEqual([]);
     expect(list.body.hint).toBeUndefined();
     expect(list.body.needsSetup).toHaveLength(1);
+  });
+});
+
+describe('an app the provider approved, with the sign-in still missing', () => {
+  const ETSY_WAITING = tool({
+    name: 'etsy_get_shop',
+    connectorId: 'c-etsy',
+    setupStatus: 'needs_authorization',
+    connectorConfig: { baseUrl: 'https://openapi.etsy.com/v3/application', authType: 'OAUTH2', config: { adapterSlug: 'etsy' } },
+  });
+  const SIGN_IN_URL = 'https://cloud.example.com/connectors/c-etsy?signin=1';
+  /** The connectors as read from the database: the watch says whether the app was approved. */
+  const depsWith = (appApproved: boolean, more: Partial<SharedToolsetDeps> = {}) =>
+    makeDeps({
+      connectors: jest.fn(async (ids: string[]) =>
+        ids.map((id) => ({
+          id,
+          name: id === 'c-etsy' ? 'My Etsy shop' : 'Acme CRM',
+          hasGuide: id === 'c-crm',
+          ...(id === 'c-etsy' && appApproved ? { appApproved: true } : {}),
+        })),
+      ),
+      signInUrl: (id: string) => `https://cloud.example.com/connectors/${id}?signin=1`,
+      ...more,
+    });
+
+  it('is said first in anythingmcp_list_connectors, with the link of the email', async () => {
+    const { client } = await connect([CRM_READ, ETSY_WAITING], depsWith(true));
+    const list = await call(client, 'anythingmcp_list_connectors');
+    expect(Object.keys(list.body)[0]).toBe('appApproved');
+    expect(list.body.appApproved.connectors).toEqual([
+      { name: 'My Etsy shop', provider: 'Etsy', finishSignInUrl: SIGN_IN_URL },
+    ]);
+    expect(list.body.appApproved.hint).toBe(
+      "The provider approved the user's app for these connectors; only the sign-in is left. Before anything else, tell the user and show them the finishSignInUrl as a clickable link: it starts the provider's sign-in, and the connector's tools work as soon as they approve the access there.",
+    );
+    // The same connector in needsSetup carries the same link, not a second one.
+    expect(list.body.needsSetup).toEqual([
+      {
+        name: 'My Etsy shop',
+        status: 'needs_authorization',
+        whatIsMissing: 'Etsy approved the app; only the sign-in is left',
+        finishSetupUrl: SIGN_IN_URL,
+      },
+    ]);
+    expect(list.body.connectors.map((c: any) => c.id)).toEqual(['c-crm']);
+  });
+
+  it('comes after an ended trial, which pauses everything', async () => {
+    const trialEnded = jest.fn(async () => ({ message: 'ended', reactivateUrl: 'https://cloud.example.com/reactivate/tok' }));
+    const { client } = await connect([CRM_READ, ETSY_WAITING], depsWith(true, { trialEnded }));
+    const list = await call(client, 'anythingmcp_list_connectors');
+    expect(Object.keys(list.body).slice(0, 2)).toEqual(['trialEnded', 'appApproved']);
+  });
+
+  it('is absent while the app is still pending or was never refused', async () => {
+    const { client } = await connect([CRM_READ, ETSY_WAITING], depsWith(false));
+    const list = await call(client, 'anythingmcp_list_connectors');
+    expect(list.body.appApproved).toBeUndefined();
+    expect(list.body.needsSetup).toEqual([
+      {
+        name: 'My Etsy shop',
+        status: 'needs_authorization',
+        whatIsMissing: 'it has to be authorized with the provider',
+        finishSetupUrl: 'https://cloud.example.com/connectors/c-etsy',
+      },
+    ]);
+    const guide = await call(client, 'anythingmcp_get_workspace_guide');
+    expect(guide.body).toBe('## Acme CRM\nUse emails in lower case.');
+  });
+
+  it('is absent once the user signed in: the connector is then listed like any other', async () => {
+    // Signed in: the registry reports the connector ready, whatever the watch still says.
+    const ready = { ...ETSY_WAITING, setupStatus: 'ready' as const };
+    const { client } = await connect([CRM_READ, ready], depsWith(true));
+    const list = await call(client, 'anythingmcp_list_connectors');
+    expect(list.body.appApproved).toBeUndefined();
+    expect(list.body.needsSetup).toBeUndefined();
+    expect(list.body.connectors.map((c: any) => c.id).sort()).toEqual(['c-crm', 'c-etsy']);
+    expect(JSON.stringify(list.body)).not.toContain('signin=1');
+  });
+
+  it('is absent for a connector that waits for credentials, not for the sign-in', async () => {
+    const needsInput = { ...ETSY_WAITING, setupStatus: 'needs_input' as const };
+    const { client } = await connect([CRM_READ, needsInput], depsWith(true));
+    const list = await call(client, 'anythingmcp_list_connectors');
+    expect(list.body.appApproved).toBeUndefined();
+    expect(list.body.needsSetup[0].finishSetupUrl).toBe('https://cloud.example.com/connectors/c-etsy');
+  });
+
+  it('opens the workspace guide, and its answer when the workspace has no notes', async () => {
+    const withGuide = await connect([CRM_READ, ETSY_WAITING], depsWith(true));
+    const guide = await call(withGuide.client, 'anythingmcp_get_workspace_guide');
+    expect(guide.body).toBe(
+      `Before anything else: Etsy approved the user's app for the connector 'My Etsy shop'; only the sign-in is left. Tell the user and show this link: ${SIGN_IN_URL}\n\n## Acme CRM\nUse emails in lower case.`,
+    );
+    // One connector's notes are that connector's only.
+    const one = await call(withGuide.client, 'anythingmcp_get_workspace_guide', { connector: 'Acme CRM' });
+    expect(one.body).toBe('## Acme CRM\nUse emails in lower case.');
+
+    const noGuide = await connect([CRM_READ, ETSY_WAITING], depsWith(true, { guide: jest.fn(async () => undefined) }));
+    const empty = await call(noGuide.client, 'anythingmcp_get_workspace_guide');
+    expect(Object.keys(empty.body)[0]).toBe('appApproved');
+    expect(empty.body.appApproved.connectors[0].finishSignInUrl).toBe(SIGN_IN_URL);
+    expect(empty.body.guide).toBeNull();
+  });
+
+  it('answers a search for the app and a call of its tools with the same link', async () => {
+    const { client, deps } = await connect([CRM_READ, ETSY_WAITING], depsWith(true));
+    const search = await call(client, 'anythingmcp_search_tools', { query: 'etsy orders' });
+    expect(search.body.notReadyYet).toEqual([
+      {
+        connector: 'My Etsy shop',
+        whatIsMissing: 'Etsy approved the app; only the sign-in is left',
+        finishSetupUrl: SIGN_IN_URL,
+      },
+    ]);
+    expect(search.body.hint).toBe(
+      "The provider approved the user's app; only the sign-in is left. Tell the user first and give them the finishSetupUrl as a clickable link: it starts the provider's sign-in.",
+    );
+    const run = await call(client, 'anythingmcp_run_read_tool', { tool: 'etsy_get_shop', arguments: {} });
+    expect(run.isError).toBe(true);
+    expect(run.body.error).toBe(
+      `'etsy_get_shop' belongs to the connector 'My Etsy shop', which is not set up yet (Etsy approved the app; only the sign-in is left). Give the user this link to finish it: ${SIGN_IN_URL}`,
+    );
+    expect(deps.execute).not.toHaveBeenCalled();
+  });
+
+  it('adds no tool and renames none: the reviewed tool list is unchanged', async () => {
+    const approved = await connect([CRM_READ, ETSY_WAITING], depsWith(true));
+    const plain = await connect([CRM_READ], makeDeps());
+    const listed = (await approved.client.listTools()).tools;
+    expect(listed.map((t) => t.name)).toEqual([...SHARED_TOOL_NAMES]);
+    expect(JSON.stringify(listed)).toEqual(JSON.stringify((await plain.client.listTools()).tools));
+    expect(approved.client.getInstructions()).toBe(SHARED_TOOLSET_INSTRUCTIONS);
+    expect([...SHARED_TOOL_NAMES]).toEqual([
+      'anythingmcp_list_connectors',
+      'anythingmcp_search_tools',
+      'anythingmcp_describe_tool',
+      'anythingmcp_run_read_tool',
+      'anythingmcp_run_write_tool',
+      'anythingmcp_get_workspace_guide',
+      'kg_how_to_obtain',
+      'anythingmcp_get_configuration_url',
+    ]);
+  });
+
+  it('falls back to the connector page when no sign-in link is given', async () => {
+    const { client } = await connect([ETSY_WAITING], depsWith(true, { signInUrl: undefined }));
+    const list = await call(client, 'anythingmcp_list_connectors');
+    expect(list.body.appApproved.connectors[0].finishSignInUrl).toBe('https://cloud.example.com/connectors/c-etsy');
   });
 });
 
@@ -661,7 +884,7 @@ describe('ChatGPT tool set', () => {
             isError: true,
             body: {
               error: 'Trial limit reached (10 connectors).',
-              whatTheUserCanDo: 'Add a card to continue the trial on the full plan, or remove a connector.',
+              whatTheUserCanDo: 'Add a payment method to continue the trial on the full plan, or remove a connector.',
               upgradeUrl: 'https://cloud.example.com/start-trial',
             },
           },
@@ -694,5 +917,46 @@ describe('ChatGPT tool set', () => {
     const out = await call(client, 'anythingmcp_add_connector', { adapter: 'etsy' });
     expect(out.isError).toBe(true);
     expect(out.body.dashboardUrl).toBe('https://cloud.example.com/connectors');
+  });
+});
+
+describe('shared toolset — agent file uploads', () => {
+  const ETSY_FILE = tool({
+    name: 'etsy_upload_listing_file',
+    connectorId: 'c-etsy',
+    endpointMapping: { method: 'POST', path: '/files', bodyEncoding: 'form-data', bodyMapping: { file: { __file: '$file_url' } } } as any,
+    parameters: { type: 'object', properties: { file_url: { type: 'string', description: 'Public URL of the file.' } }, required: ['file_url'] },
+  });
+  const uploads = () => ({
+    createLink: jest.fn(async (filename: string, size: number | null) => ({ file_ref: 'amcp-file:0123456789abcdef01234567', filename, size, browser_upload_url: 'https://cloud.example.com/upload/tok' })),
+    publicUrl: jest.fn(async (ref: string) => ({ public_url: `https://cloud.example.com/api/uploads/f/${ref.slice(10)}` })),
+  });
+
+  it('runs file_upload_link and file_public_url through the write tool, for the caller workspace', async () => {
+    const fileUploads = uploads();
+    const { client } = await connect([ETSY_FILE], makeDeps({ fileUploads }));
+    const link = await call(client, 'anythingmcp_run_write_tool', { tool: 'file_upload_link', arguments: { filename: 'pattern.zip', size_bytes: 1200 } });
+    expect(link).toEqual({ isError: false, body: expect.objectContaining({ file_ref: 'amcp-file:0123456789abcdef01234567', browser_upload_url: expect.any(String) }) });
+    expect(fileUploads.createLink).toHaveBeenCalledWith('pattern.zip', 1200);
+    const pub = await call(client, 'anythingmcp_run_write_tool', { tool: 'file_public_url', arguments: { file_ref: 'amcp-file:0123456789abcdef01234567' } });
+    expect(pub.isError).toBe(false);
+    expect((await call(client, 'anythingmcp_run_read_tool', { tool: 'file_upload_link', arguments: { filename: 'a.png' } })).isError).toBe(true);
+    expect((await call(client, 'anythingmcp_run_write_tool', { tool: 'file_upload_link', arguments: {} })).body.error).toMatch(/filename/);
+  });
+
+  it('describes the upload tools and hints file parameters', async () => {
+    const { client } = await connect([ETSY_FILE], makeDeps({ fileUploads: uploads() }));
+    const d = await call(client, 'anythingmcp_describe_tool', { tool: 'file_upload_link' });
+    expect(d.body).toMatchObject({ name: 'file_upload_link', runWith: 'anythingmcp_run_write_tool' });
+    const etsy = await call(client, 'anythingmcp_describe_tool', { tool: 'etsy_upload_listing_file' });
+    expect(etsy.body.inputSchema.properties.file_url.description).toContain('amcp-file:');
+    expect(etsy.body.description).toContain('file_upload_link');
+  });
+
+  it('knows nothing about uploads when they are off', async () => {
+    const { client } = await connect([ETSY_FILE]);
+    expect((await call(client, 'anythingmcp_run_write_tool', { tool: 'file_upload_link', arguments: { filename: 'a.png' } })).body.error).toMatch(/No tool named/);
+    const etsy = await call(client, 'anythingmcp_describe_tool', { tool: 'etsy_upload_listing_file' });
+    expect(etsy.body.inputSchema.properties.file_url.description).toBe('Public URL of the file.');
   });
 });

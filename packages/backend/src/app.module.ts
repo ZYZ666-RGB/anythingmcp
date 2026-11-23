@@ -1,3 +1,4 @@
+import { PlanCapsModule } from './plan-caps/plan-caps.module';
 import { Module, MiddlewareConsumer, NestModule, Logger, ClassSerializerInterceptor } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { join } from 'path';
@@ -16,9 +17,11 @@ import { UsersModule } from './users/users.module';
 import { AuditModule } from './audit/audit.module';
 import { HealthModule } from './health/health.module';
 import { SettingsModule } from './settings/settings.module';
+import { MemberVisibilityModule } from './settings/member-visibility.module';
 import { RolesModule } from './roles/roles.module';
 import { KgModule } from './knowledge-graph/kg.module';
 import { MemoryModule } from './memory/memory.module';
+import { FileUploadsModule } from './file-uploads/file-uploads.module';
 import { KnowledgeFoldersModule } from './knowledge-folders/knowledge-folders.module';
 import { McpServersModule } from './mcp-servers/mcp-servers.module';
 import { FileSearchModule } from './file-search/file-search.module';
@@ -36,6 +39,8 @@ import {
 } from './auth/authorize-pkce.middleware';
 import { ResourceIndicatorMiddleware } from './auth/resource-indicator.middleware';
 import { AuthorizationIssuerMiddleware } from './auth/authorization-issuer.middleware';
+import { AuthorizationAttemptMiddleware } from './auth/authorization-attempt.middleware';
+import { CallbackGuardMiddleware } from './auth/callback-guard.middleware';
 import { IdentityProvidersModule } from './identity-providers/identity-providers.module';
 import { LocalOAuthProvider } from './auth/local-oauth.provider';
 import { PrismaOAuthStore } from './auth/prisma-oauth.store';
@@ -47,6 +52,7 @@ import { OrganizationsModule } from './organizations/organizations.module';
 import { PublicStatsModule } from './public-stats/public-stats.module';
 import { CloudModule } from './ee/cloud/cloud.module';
 import { LicensingModule } from './ee/licensing/licensing.module';
+import { LearningModule } from './ee/learning/learning.module';
 import { SupportModule } from './ee/support/support.module';
 import { supportModuleEnabled } from './ee/support/support-config';
 import { getRequiredSecret } from './common/secrets.util';
@@ -175,14 +181,18 @@ if (useOAuth) {
     IdentityProvidersModule,
     HealthModule,
     SettingsModule,
+    MemberVisibilityModule,
     RolesModule,
     KgModule,
     MemoryModule,
+    FileUploadsModule,
     KnowledgeFoldersModule,
     McpServersModule,
     FileSearchModule,
     LicenseModule,
+    PlanCapsModule,
     LicensingModule,
+    LearningModule,
 
     // Cloud-specific modules (conditionally loaded)
     ...cloudImports,
@@ -244,6 +254,12 @@ export class AppModule implements NestModule {
       // `authorization_response_iss_parameter_supported` in the metadata.
       consumer.apply(ResourceIndicatorMiddleware).forRoutes('authorize');
       consumer.apply(AuthorizationIssuerMiddleware).forRoutes('callback');
+      // Statistics only: lets the `authorization_code_issued` event carry the
+      // device and the page arm of the attempt (authorization-attempt.ts).
+      consumer.apply(AuthorizationAttemptMiddleware).forRoutes('callback');
+      // A browser without an open authorization gets a page instead of the
+      // library's JSON 400, and the sign-in cookie ends with the code.
+      consumer.apply(CallbackGuardMiddleware).forRoutes('callback');
     }
 
     // Apply legacy auth middleware for MCP endpoint. In 'both' it passes every

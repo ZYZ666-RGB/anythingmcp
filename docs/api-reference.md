@@ -70,6 +70,16 @@ curl -s http://localhost:4000/api/auth/invite \
   -d '{"email":"user@example.com","role":"EDITOR","mcpRoleId":"optional-role-id"}'
 ```
 
+Inviting an address that already has a pending invitation reuses its link,
+sends the mail again and applies the `role` and MCP roles of this call to it.
+
+### Create a workspace
+
+`POST /api/organizations` with `{"name":"..."}` creates a workspace and makes
+the caller its ADMIN. Cloud: any signed-in user. Self-hosted: only an ADMIN of
+the active workspace (403 otherwise); see
+[who may create a workspace](operations/member-visibility.md#who-may-create-a-workspace).
+
 ---
 
 ## Connector Endpoints
@@ -98,8 +108,11 @@ curl -s http://localhost:4000/api/auth/invite \
 single entry in `connectors`, so its file can be restored with either import
 endpoint. `authConfig` (OAuth and other stored credentials) is never exported:
 re-authorize the connector after importing it. Secret environment variables
-and headers are included only for admins; for other roles they are empty and
-named in `maskedEnvVars` / `maskedHeaders`. Per-tool `useProxy`, annotation
+and headers are included only for admins signed in to the dashboard or using a
+`MANAGEMENT_ADMIN` key. For other roles, and for any `MANAGEMENT_READ` key, they
+are empty and named in `maskedEnvVars` / `maskedHeaders`, and a secret still written in an HTTP
+base URL (a webhook token, a key, `user:password@`) shows as `********`; see
+[Secrets typed into the base URL](connectors/rest.md#secrets-typed-into-the-base-url). Per-tool `useProxy`, annotation
 overrides and role access are not exported.
 
 ```bash
@@ -282,6 +295,7 @@ See [Tool Definition Format](tool-definition.md) for the full schema.
 |--------|----------|-------------|
 | GET | `/api/audit/invocations` | List invocations (with filters) |
 | GET | `/api/audit/stats` | Get invocation stats (24h, 7d, total) |
+| GET | `/api/audit/tool-performance` | Per-tool latency percentiles, failure rates and last recorded errors |
 
 ### Query Invocations
 
@@ -310,6 +324,68 @@ Response:
   "total": 8721
 }
 ```
+
+### Tool Performance
+
+The **Tool performance** table on `/analytics` shows calls, failure rate,
+p50/p95/p99 latency and the last recorded error for each tool and MCP server.
+Its own time selector defaults to the last 24 hours; connector and MCP server
+filters narrow the results. This view is available on Cloud and self-hosted
+editions, using the invocation history still retained by the instance.
+
+```bash
+curl -s "http://localhost:4000/api/audit/tool-performance?hours=24&connectorId=<connectorId>&mcpServerId=<serverId>&limit=25&offset=0" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+All results belong to the signed-in user's organization. Optional parameters:
+
+| Parameter | Default | Bounds / meaning |
+|-----------|---------|------------------|
+| `hours` | `24` | Integer from 1 to 2160 (90 days), rolling window |
+| `connectorId` | All connectors | A connector in the user's organization |
+| `mcpServerId` | All servers | An MCP server in the user's organization |
+| `limit` | `25` | Integer from 1 to 100 |
+| `offset` | `0` | Non-negative integer; increase by `limit` for the next page |
+
+Response:
+
+```json
+{
+  "items": [{
+    "toolId": "tool-1",
+    "toolName": "search_orders",
+    "connectorId": "connector-1",
+    "connectorName": "Orders",
+    "mcpServerId": null,
+    "mcpServerName": null,
+    "calls": 10,
+    "errors": 2,
+    "errorRate": 20,
+    "latencySampleCount": 8,
+    "p50Ms": 120,
+    "p95Ms": 430,
+    "p99Ms": 486,
+    "lastError": "Request timed out",
+    "lastErrorAt": "2026-11-04T10:00:00.000Z"
+  }],
+  "hasMore": false
+}
+```
+
+`errors` includes both `ERROR` and `TIMEOUT`; `errorRate` is a percentage.
+Counts include the repeated failures represented by each stored record.
+Percentiles use only stored, non-null duration samples, without repeating the
+first duration for every deduplicated failure. `latencySampleCount` reports
+that sample count; absent latencies are `null`, while `0` is a valid duration.
+Repeated failures retain their first recorded server, so server attribution
+and the last recorded error reflect the saved history rather than every
+individual request. A null server means direct calls without a recorded MCP
+server. Same-name tools from different connectors remain separate.
+
+Rows are ordered by call count, with stable identity-based tie-breaking.
+`hasMore` indicates whether another page exists. The rolling window may change
+between page requests as new calls arrive.
 
 ### Replay a Tool Call
 
@@ -340,6 +416,11 @@ Export your key as `AMCP_MCP_API_KEY` (or `AMCP_ACCESS_TOKEN` when the server op
 | DELETE | `/api/roles/:id` | Delete a role |
 | GET | `/api/roles/:id/tools` | List tool access for a role |
 | PUT | `/api/roles/:id/tools` | Set tool access whitelist |
+| PUT | `/api/roles/:id/tools/:toolId/rate-limit` | Update rate limits on an existing tool grant |
+| GET | `/api/roles/members` | List members with every MCP role they hold and the connectors those roles reach |
+| GET | `/api/roles/assignments/:userId` | List a member's MCP roles, with where each comes from |
+| PUT | `/api/roles/assignments/:userId` | Replace a member's manual MCP roles |
+| PUT | `/api/roles/assign/:userId` | Deprecated: set one MCP role. Use `PUT /api/roles/assignments/:userId` |
 
 ### Create Role with Tool Whitelist
 
@@ -356,6 +437,117 @@ curl -s -X PUT http://localhost:4000/api/roles/$ROLE_ID/tools \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"toolIds": ["tool-id-1", "tool-id-2", "tool-id-3"]}'
+```
+
+### Assign roles to members
+
+A member can hold several MCP roles and may call the **union** of their tools:
+each role adds tools, none takes any away. A role comes from one of two
+sources:
+
+- `manual`: set by an admin, under **Settings → Roles** or with
+  `PUT /api/roles/assignments/:userId`.
+- the single sign-on group sync (for example `entra`): set by the
+  provider's role mappings ([SSO guide](sso.md#3-map-directory-groups-to-roles)).
+  Change these in the mappings, not on the member.
+
+`PUT /api/roles/assignments/:userId` replaces only the member's **manual**
+roles in your workspace; roles from group sync stay.
+
+```bash
+curl -s -X PUT http://localhost:4000/api/roles/assignments/$USER_ID \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"roleIds": ["'$ROLE_ID'"]}'
+```
+
+`GET /api/roles/members` returns every member of your workspace with all their
+roles (`roles[]`: `roleId`, `roleName`, `source`, and `global` for a grant that
+applies in every workspace) and `connectors`, the connectors those roles reach.
+`connectors` is `null` when roles do not limit the member: a workspace ADMIN,
+or a member with no role while no role of the workspace has a tool list.
+`GET /api/users` also returns all roles of each member in `mcpRoles`; its
+`mcpRoleId` and `mcpRole` fields are deprecated and hold one role at most.
+
+### Per-tool rate limits
+
+An administrator can set optional minute and hour limits on an existing
+role/tool grant, under **Settings → Roles → Manage tools** or through the API.
+`GET /api/roles/:id/tools` returns `callsPerMinute` and `callsPerHour` on each
+grant.
+
+```bash
+curl -s -X PUT "http://localhost:4000/api/roles/$ROLE_ID/tools/tool-id-1/rate-limit" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"callsPerMinute": 100, "callsPerHour": 10000}'
+```
+
+Each value must be a positive integer (at most 2,147,483,647), or `null` for
+unlimited. Omitted fields keep their current value. New grants start unlimited.
+Updating the tool whitelist preserves limits on retained grants; removing a
+grant deletes its policy. System roles cannot be modified. Configuration is
+restricted to grants and tools in the administrator's workspace.
+
+Limits are **per principal and tool within a workspace**, shared across MCP
+servers. Each user has one budget per tool, shared by their sessions and all of
+their API keys, so creating another key does not raise it. Limits are not
+shared by every member of a role. Nested Code Mode `amcp.run` calls use the
+same budget as direct calls. A saved code tool can also have its own limit.
+
+For multiple granting roles, resolve **each window independently**: the largest
+value wins, and `null` means unlimited for that window. For example, a role
+granting 100/min and 200/hour combined with one granting 10/min and 10,000/hour
+allows **100/min and 10,000/hour**, even though neither role grants that pair
+alone. A granting role with both windows unlimited removes the per-tool limit.
+Workspace ADMINs and unrestricted members with no MCP role in a workspace
+without whitelists have no per-tool limit; the existing principal limiter
+still applies to them.
+
+Both configured windows must allow the call. Each fixed window starts on its
+first admitted call and expires after 60 or 3,600 seconds respectively. Admitted
+calls count even when answered from the response cache or when the upstream
+fails. Refused calls do not consume either budget or extend the windows. A
+refusal is an MCP tool result with `isError: true`; its text contains an error
+naming the tool and reached limit, plus `retryAfter` in seconds. If both limits
+are reached, the retry time is the longer wait. No upstream call is made.
+
+Cloud and self-hosted use the same implementation. With Redis configured,
+admission and expiry are atomic across replicas. If configured Redis is
+unavailable, calls fail open with a warning; there is no process-local fallback.
+Without Redis configured, counters are process-local, reset on restart, and
+are **not shared across replicas**. Local storage is bounded to 10,000
+principal/tool/workspace buckets; expired buckets are reclaimed when capacity
+is needed. When full, calls for new buckets are allowed without tracking and
+a warning is logged at most once a minute. Existing buckets remain enforced.
+
+Workspaces without any configured limits skip rate-policy lookups using a
+bounded, five-second presence cache. Configuration changes invalidate this
+cache immediately on the instance handling the edit; other replicas observe
+new limits within five seconds. Positive policies are still read fresh per
+call, so cached presence never replaces the caller's current role policy.
+
+### Member visibility
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/settings/member-visibility` | Any member: `{ mode, restrictedForMe }` of the current workspace |
+| PUT | `/api/admin/settings/member-visibility` | Admin: set `{ "mode": "open" }` or `{ "mode": "restricted" }` |
+
+In a workspace set to `restricted`, a member who is not an admin gets only
+their own calls from the audit endpoints, only the connectors their roles
+reach, only the MCP servers they own, and 404 for the others. A connector they can see but do not
+own comes back in a reduced view marked `memberView: true`: `id`, `name`,
+`type`, `icon`, `isActive`, `credentialScope`, `setupStatus`, `authStatus`,
+`authStatusCode`, and of each allowed tool `id`, `name`, `description` and
+`isEnabled`; no address, variables, headers, instructions or endpoint
+mappings. Admins and `open` workspaces (the default) see everything. What each endpoint returns, how it combines with
+roles and SSO group mapping, and what stays visible:
+[member visibility](operations/member-visibility.md).
+
+```bash
+amcp api GET /api/settings/member-visibility
+amcp api PUT /api/admin/settings/member-visibility --data '{"mode":"restricted"}' --yes
 ```
 
 ---

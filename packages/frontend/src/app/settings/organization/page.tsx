@@ -1,16 +1,20 @@
 'use client';
 
 import { useState, useEffect } from 'react';
+import Link from 'next/link';
 import { useLocale, useTranslations } from 'next-intl';
 import { useAuth } from '@/lib/auth-context';
-import { organizations, knowledgeGraph, type KgSettings } from '@/lib/api';
+import { organizations, knowledgeGraph, memberVisibility, roles, type KgSettings, type MemberVisibilityMode } from '@/lib/api';
+import { notifyMemberVisibilityChanged, useMemberVisibility } from '@/lib/use-member-visibility';
+import { useMemberAccess } from '@/lib/use-member-access';
 import * as Dialog from '@radix-ui/react-dialog';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { StatusPill } from '@/components/ui/badge';
+import { ActiveSubscriptionNotice, subscribedWorkspacesOf, type SubscribedWorkspace } from '@/components/active-subscription-notice';
 
 export default function OrganizationSettingsPage() {
-  const { token, user, orgName, orgs, setOrgName, switchOrg, replaceSession, logout } = useAuth();
+  const { token, user, orgName, orgs, setOrgName, switchOrg, replaceSession, logout, deploymentModeLoaded } = useAuth();
   const t = useTranslations('settingsOrg');
   const locale = useLocale();
   const [name, setName] = useState('');
@@ -33,6 +37,7 @@ export default function OrganizationSettingsPage() {
   const [deleteConfirmName, setDeleteConfirmName] = useState('');
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleteSubscribed, setDeleteSubscribed] = useState<SubscribedWorkspace[] | null>(null);
 
   // Security: force every member to sign in again
   const [revokeOpen, setRevokeOpen] = useState(false);
@@ -47,7 +52,26 @@ export default function OrganizationSettingsPage() {
   const [kg, setKg] = useState<KgSettings | null>(null);
   const [kgSaving, setKgSaving] = useState(false);
 
+  // Member visibility (admin only): what members who are not admins see.
+  const visibility = useMemberVisibility();
+  const [visibilityChoice, setVisibilityChoice] = useState<MemberVisibilityMode | null>(null);
+  const [visibilitySaving, setVisibilitySaving] = useState(false);
+  const [visibilityMessage, setVisibilityMessage] = useState('');
+  const [visibilityMessageIsError, setVisibilityMessageIsError] = useState(false);
+  // Whether a role of this workspace has a tool list. Without one, roles
+  // narrow nothing and restricted members still see every connector.
+  // null while unknown: then no warning is shown.
+  const [hasToolList, setHasToolList] = useState<boolean | null>(null);
+
   const isAdmin = user?.role === 'ADMIN';
+  // Cloud: everyone may create their own workspace. Self-hosted: admins only
+  // (the creator becomes the ADMIN of the new workspace).
+  const { canCreateWorkspace } = useMemberAccess();
+  // A restricted member is not shown the workspace's feature switches: they
+  // describe what is learned from every member's requests, and the API
+  // refuses a restricted viewer the settings behind them.
+  const restrictedMember = visibility.restrictedForMe;
+  const featuresKnown = isAdmin || visibility.loaded;
 
   useEffect(() => {
     if (!token) return;
@@ -56,8 +80,79 @@ export default function OrganizationSettingsPage() {
       setOrgId(org.id);
       setCreatedAt(org.createdAt);
     }).catch(() => {});
-    knowledgeGraph.getSettings(token).then(setKg).catch(() => {});
   }, [token]);
+
+  useEffect(() => {
+    if (!token || !featuresKnown || restrictedMember) return;
+    knowledgeGraph.getSettings(token).then(setKg).catch(() => {});
+  }, [token, featuresKnown, restrictedMember]);
+
+  useEffect(() => {
+    if (!token || !isAdmin) return;
+    roles
+      .list(token)
+      .then((list) =>
+        setHasToolList(list.some((r: any) => !r.isSystem && (r._count?.toolAccess ?? 0) > 0)),
+      )
+      .catch(() => setHasToolList(null));
+  }, [token, isAdmin]);
+
+  // The saved mode until the admin picks another one.
+  const visibilitySelected: MemberVisibilityMode = visibilityChoice ?? visibility.mode;
+  // Picked but not saved. Nothing applies until "Save" on this card, and a
+  // reload shows the saved mode again: an admin who chose Restricted and left
+  // had an Open workspace and no sign of it. So the card says which mode is
+  // active, says in so many words that the choice is not saved, and the
+  // browser asks before the page is left.
+  const visibilityDirty = visibility.loaded && visibilitySelected !== visibility.mode;
+
+  useEffect(() => {
+    if (!visibilityDirty) return;
+    const warn = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      // Chrome shows its prompt only when returnValue is set.
+      event.returnValue = '';
+    };
+    // A link inside the dashboard leaves without a page load, so the browser
+    // asks nothing. Ask here, before the click reaches the link: a refused
+    // click is cancelled and the choice stays. (The command palette and the
+    // browser's back button are not links and are not covered.)
+    const confirmLink = (event: MouseEvent) => {
+      if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      const link = (event.target as Element | null)?.closest?.('a[href]') as HTMLAnchorElement | null;
+      if (!link || link.target === '_blank' || link.origin !== window.location.origin) return;
+      if (link.pathname === window.location.pathname) return;
+      if (!window.confirm(t('visibility.confirmLeave'))) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+    window.addEventListener('beforeunload', warn);
+    document.addEventListener('click', confirmLink, true);
+    return () => {
+      window.removeEventListener('beforeunload', warn);
+      document.removeEventListener('click', confirmLink, true);
+    };
+  }, [visibilityDirty, t]);
+
+  const handleSaveVisibility = async () => {
+    if (!token || !visibility.loaded) return;
+    setVisibilitySaving(true);
+    setVisibilityMessage('');
+    try {
+      const saved = await memberVisibility.set(visibilitySelected, token);
+      notifyMemberVisibilityChanged(token, user?.organizationId, saved);
+      // Kept, not cleared: the hook picks the new mode up a moment later.
+      setVisibilityChoice(saved.mode === 'restricted' ? 'restricted' : 'open');
+      setVisibilityMessageIsError(false);
+      setVisibilityMessage(t('visibility.saved'));
+    } catch (err: any) {
+      setVisibilityMessageIsError(true);
+      setVisibilityMessage(err?.message || t('visibility.saveFailed'));
+    } finally {
+      setVisibilitySaving(false);
+    }
+  };
 
   const updateFlag = async (patch: { enabled?: boolean; llmEnabled?: boolean; captureIntent?: boolean; autoExtend?: boolean; skillAutoApply?: boolean; edgeAutoApply?: boolean }) => {
     if (!token || !kg) return;
@@ -94,12 +189,15 @@ export default function OrganizationSettingsPage() {
     if (deleteConfirmName.trim() !== name.trim()) return;
     setDeleting(true);
     setDeleteError(null);
+    setDeleteSubscribed(null);
     try {
       const result = await organizations.deleteCurrent({ confirmName: deleteConfirmName.trim() }, token);
       replaceSession(result.accessToken, result.user, result.organization?.name ?? null);
       window.location.href = '/';
     } catch (err: any) {
-      setDeleteError(err?.message || t('deleteFailed'));
+      const subscribed = subscribedWorkspacesOf(err);
+      if (subscribed && subscribed.length > 0) setDeleteSubscribed(subscribed);
+      else setDeleteError(err?.message || t('deleteFailed'));
       setDeleting(false);
     }
   };
@@ -147,6 +245,7 @@ export default function OrganizationSettingsPage() {
     setDeleteOpen(false);
     setDeleteConfirmName('');
     setDeleteError(null);
+    setDeleteSubscribed(null);
     setDeleting(false);
   };
 
@@ -242,7 +341,8 @@ export default function OrganizationSettingsPage() {
         )}
       </Card>
 
-      {/* Features */}
+      {/* Features (not for a restricted member, see restrictedMember above) */}
+      {featuresKnown && !restrictedMember && (
       <Card className="p-5 space-y-4">
         <h3 className="text-sm font-semibold text-[var(--text)]">{t('features.title')}</h3>
 
@@ -286,7 +386,7 @@ export default function OrganizationSettingsPage() {
           onToggle={() => updateFlag({ captureIntent: !kg?.captureIntent })}
         />
 
-        {kg?.llmAvailable && (
+        {kg?.llmAvailable && kg?.scheduledAvailable && (
           <FeatureToggle
             label={t('features.autoExtend.label')}
             description={t('features.autoExtend.description')}
@@ -308,6 +408,7 @@ export default function OrganizationSettingsPage() {
           />
         )}
       </Card>
+      )}
 
       {/* Security — ADMIN only. Reversible actions live here, not in the Danger Zone. */}
       {isAdmin && (
@@ -320,6 +421,107 @@ export default function OrganizationSettingsPage() {
             {t('security.button')}
           </Button>
           {revokeResult && <p className="text-xs text-[var(--ok)]">{revokeResult}</p>}
+
+          <div className="space-y-3 border-t border-[var(--border)] pt-4" data-testid="member-visibility">
+            <div className="flex flex-wrap items-center gap-2">
+              <h4 className="text-sm font-semibold text-[var(--text)]">{t('visibility.title')}</h4>
+              {visibility.loaded && (
+                <StatusPill
+                  tone={visibility.mode === 'restricted' ? 'brand' : 'neutral'}
+                  data-testid="member-visibility-active"
+                >
+                  {t('visibility.activeNow', { mode: t(`visibility.${visibility.mode}.label`) })}
+                </StatusPill>
+              )}
+            </div>
+            <p className="text-xs text-[var(--text-2)]">{t('visibility.body')}</p>
+            <div role="radiogroup" aria-label={t('visibility.title')} className="space-y-2">
+              {(['open', 'restricted'] as const).map((mode) => {
+                const checked = visibilitySelected === mode;
+                return (
+                  <label
+                    key={mode}
+                    className={`flex cursor-pointer items-start gap-3 rounded-[10px] border p-3 ${
+                      checked ? 'border-[var(--brand)] bg-[var(--brand-tint)]' : 'border-[var(--border)]'
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="member-visibility"
+                      value={mode}
+                      checked={checked}
+                      disabled={!visibility.loaded || visibilitySaving}
+                      onChange={() => {
+                        setVisibilityChoice(mode);
+                        setVisibilityMessage('');
+                      }}
+                      className="mt-0.5 accent-[var(--brand)]"
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-sm font-medium text-[var(--text)]">{t(`visibility.${mode}.label`)}</span>
+                      <span className="mt-0.5 block text-xs text-[var(--text-2)]">{t(`visibility.${mode}.description`)}</span>
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+            {/* Shown while Restricted is picked and while it is the saved mode. */}
+            {(visibilitySelected === 'restricted' || visibility.mode === 'restricted') && hasToolList === false && (
+              <p
+                role="note"
+                data-testid="member-visibility-no-tool-list"
+                className="rounded-[10px] border border-[var(--warn)]/40 bg-[var(--t-warn-bg)] px-3 py-2 text-xs text-[var(--t-warn-fg)]"
+              >
+                {t.rich('visibility.noToolList', {
+                  link: (chunks) => (
+                    <Link href="/settings/roles" className="font-medium underline">
+                      {chunks}
+                    </Link>
+                  ),
+                })}
+              </p>
+            )}
+            {visibilityDirty && (
+              <p
+                role="alert"
+                data-testid="member-visibility-unsaved"
+                className="rounded-[10px] border border-[var(--warn)]/40 bg-[var(--t-warn-bg)] px-3 py-2 text-xs font-medium text-[var(--t-warn-fg)]"
+              >
+                {visibilitySelected === 'restricted'
+                  ? t('visibility.unsavedToRestricted')
+                  : t('visibility.unsavedToOpen')}
+              </p>
+            )}
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                variant={visibilityDirty ? 'primary' : 'secondary'}
+                onClick={handleSaveVisibility}
+                disabled={!visibility.loaded || visibilitySaving || !visibilityDirty}
+              >
+                {visibilitySaving
+                  ? t('saving')
+                  : visibilityDirty
+                    ? t('visibility.saveSwitch', { mode: t(`visibility.${visibilitySelected}.label`) })
+                    : t('save')}
+              </Button>
+              {visibilityDirty && !visibilitySaving && (
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    setVisibilityChoice(null);
+                    setVisibilityMessage('');
+                  }}
+                >
+                  {t('visibility.discard')}
+                </Button>
+              )}
+              {visibilityMessage && (
+                <p className={`text-xs ${visibilityMessageIsError ? 'text-[var(--danger)]' : 'text-[var(--ok)]'}`}>
+                  {visibilityMessage}
+                </p>
+              )}
+            </div>
+          </div>
         </Card>
       )}
 
@@ -432,6 +634,9 @@ export default function OrganizationSettingsPage() {
               {deleteError && (
                 <p className="text-sm text-[var(--danger)]">{deleteError}</p>
               )}
+              {deleteSubscribed && (
+                <ActiveSubscriptionNotice workspaces={deleteSubscribed} returnPath="/settings/organization" />
+              )}
             </div>
 
             <div className="flex gap-2 justify-end mt-6">
@@ -450,7 +655,7 @@ export default function OrganizationSettingsPage() {
         </Dialog.Portal>
       </Dialog.Root>
 
-      {/* My organizations list + create new — available to ALL users */}
+      {/* My organizations list, for everyone; creating one where the member may (canCreateWorkspace) */}
       <Card className="p-5">
         <h3 className="text-sm font-semibold text-[var(--text)]">{t('myOrgs.title')}</h3>
         {orgs && orgs.length > 0 && (
@@ -484,7 +689,14 @@ export default function OrganizationSettingsPage() {
             })}
           </div>
         )}
-        <div className="space-y-2 mt-8">
+        {/* Said only once it is known: the deployment mode is a guess until the server answers. */}
+        {user && deploymentModeLoaded && !canCreateWorkspace && (
+          <p className="mt-6 text-xs text-[var(--text-3)]" data-testid="create-org-admin-only">
+            {t('myOrgs.createAdminOnly')}
+          </p>
+        )}
+        {canCreateWorkspace && (
+        <div className="space-y-2 mt-8" data-testid="create-org">
           <p className="text-xs font-medium text-[var(--text-3)]">{t('myOrgs.createTitle')}</p>
           <div className="flex flex-col sm:flex-row gap-2">
             <input
@@ -505,6 +717,7 @@ export default function OrganizationSettingsPage() {
             </p>
           )}
         </div>
+        )}
       </Card>
     </div>
   );

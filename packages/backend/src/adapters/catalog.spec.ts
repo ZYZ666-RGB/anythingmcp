@@ -79,7 +79,9 @@ const REST_HTTP_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']);
 function argumentsSent(em: Record<string, unknown>): Set<string> {
   const sent = new Set<string>();
   for (const m of String(em.path ?? '').matchAll(/\{([^{}]+)\}/g)) sent.add(m[1]);
-  const fields: unknown[] = [em.queryParams, em.headers];
+  // `download` reads its paging and filter arguments on the server, after the
+  // call: they are used, just not sent upstream (download-follow.util.ts).
+  const fields: unknown[] = [em.queryParams, em.headers, em.download];
   const sendsBody = REQUEST_BODY_METHODS.has(String(em.method).toUpperCase());
   if (sendsBody) fields.push(em.bodyMapping);
   for (const field of fields) {
@@ -94,6 +96,11 @@ function argumentsSent(em: Record<string, unknown>): Set<string> {
   if (sendsBody && typeof em.bodyTemplate === 'string') {
     for (const m of em.bodyTemplate.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g)) {
       sent.add(m[1]);
+    }
+    // XML templates: an optional block `${?a|b}…` and a repeated block
+    // `${*items}…` read their arguments too (xml-body-template.util.ts).
+    for (const m of em.bodyTemplate.matchAll(/\$\{[?*]([A-Za-z_][A-Za-z0-9_|]*)\}/g)) {
+      for (const name of m[1].split('|')) sent.add(name);
     }
   }
   return sent;
@@ -389,6 +396,13 @@ describe('adapter catalog', () => {
         // optional.
         if (cfg.tokenSource === 'cookie') {
           if (cfg.cookieMode !== 'all') expect(typeof cfg.cookieName).toBe('string');
+        } else if (cfg.tokenSource === 'header') {
+          // The token arrives in a response header of the login answer.
+          expect(typeof cfg.tokenHeaderName).toBe('string');
+        } else if (Array.isArray(cfg.tokenJsonPath)) {
+          // Several candidate paths, tried in order (tokenJsonPaths()).
+          expect(cfg.tokenJsonPath.length).toBeGreaterThan(0);
+          for (const p of cfg.tokenJsonPath) expect(typeof p === 'string' && p.length > 0).toBe(true);
         } else {
           expect(typeof cfg.tokenJsonPath).toBe('string');
         }
@@ -403,6 +417,18 @@ describe('adapter catalog', () => {
           // does not use them.
           expect(typeof cfg.username).toBe('string');
           expect(typeof cfg.password).toBe('string');
+        }
+        if (cfg.loginBasicAuth !== undefined) {
+          // Same refusals as loginBasicAuthHeader(): the engine owns the
+          // login Authorization header and the password stays out of the body.
+          expect(typeof cfg.loginBasicAuth).toBe('boolean');
+          if (cfg.loginBasicAuth) {
+            expect(cfg.signedJwt).toBeUndefined();
+            expect((cfg.passwordHashing as { scheme?: string } | undefined)?.scheme ?? 'none').toBe('none');
+            const headers = Object.keys((cfg.loginHeaders as Record<string, string>) ?? {});
+            expect(headers.map((h) => h.toLowerCase())).not.toContain('authorization');
+            expect(JSON.stringify([cfg.loginBody ?? null, cfg.loginBodyTemplate ?? null, cfg.loginHeaders ?? null])).not.toMatch(/\$\{password(Hashed)?\}/);
+          }
         }
         if (cfg.passwordHashing) {
           const ph = cfg.passwordHashing as Record<string, unknown>;
@@ -520,6 +546,14 @@ describe('adapter catalog', () => {
               | undefined) ?? {},
           ),
         );
+        // LOGIN_TOKEN with the token in the body fills these itself
+        // (`$loginToken` / `$loginAud`, or `${loginToken}` / `${loginAud}`).
+        // They are not tool parameters. A caller-supplied value cannot replace them.
+        const authCfg = adapter.connector.authConfig as { tokenPlacement?: string } | undefined;
+        const engineParams =
+          adapter.connector.authType === 'LOGIN_TOKEN' && authCfg?.tokenPlacement === 'body'
+            ? new Set(['loginToken', 'loginAud'])
+            : new Set<string>();
         for (const field of ['queryParams', 'bodyMapping', 'headers']) {
           const strings: Array<{ path: string; value: string }> = [];
           collectStrings(em[field], field, strings);
@@ -528,13 +562,19 @@ describe('adapter catalog', () => {
             // unless it's $$ (escape) or an env-var-style reference (UPPER_SNAKE_CASE,
             // resolved at runtime from connector.envVars populated at import time).
             const full = /^\$([\w$]+)$/.exec(value);
-            if (full && !value.startsWith('$$') && !/^[A-Z][A-Z0-9_]*$/.test(full[1])) {
+            if (
+              full &&
+              !value.startsWith('$$') &&
+              !/^[A-Z][A-Z0-9_]*$/.test(full[1]) &&
+              !engineParams.has(full[1])
+            ) {
               expect(declaredParams.has(full[1])).toBe(true);
             }
             // Embedded references: "...${foo}..." — all names must be declared
             // (same env-var exemption applies).
             for (const match of value.matchAll(/\$\{([\w$]+)\}/g)) {
               if (/^[A-Z][A-Z0-9_]*$/.test(match[1])) continue;
+              if (engineParams.has(match[1])) continue;
               expect(declaredParams.has(match[1])).toBe(true);
             }
           }

@@ -1,5 +1,7 @@
+import { createHash } from 'crypto';
 import type { LicenseInfo } from './license.service';
 import { CLICK_ID_KEYS, type AttributionClickId } from '../audit/signup-attribution';
+import { createReactivationToken } from './reactivation-token';
 
 /**
  * Checkout links for AnythingMCP Cloud (DEPLOYMENT_MODE=cloud only).
@@ -38,9 +40,11 @@ export const CHECKOUT_BILLING_PERIODS = ['monthly', 'yearly'] as const;
  * - trial_banner: the countdown banner at the top of every page.
  * - license_page: Settings → License.
  * - trial_ended_wall: the wall shown when the free trial is over.
- * - post_approve: "add a card" on the page after approving an AI client.
+ * - post_approve: "add a payment method" on the page after approving an AI
+ *   client.
  * - signup_prompt: the card-trial page shown once after sign-up.
- * - trial_limit / starter_pack: "add a card" next to the connector limit.
+ * - trial_limit / starter_pack: "add a payment method" next to the connector
+ *   limit.
  * - chat_setup: the plan link the setup tools give the AI in a chat.
  * - start_trial: /start-trial opened without a known source.
  * - pricing_signed_in: a plan button on the public pricing page, clicked by
@@ -48,6 +52,8 @@ export const CHECKOUT_BILLING_PERIODS = ['monthly', 'yearly'] as const;
  * - file_quota_setup / file_quota / file_search_licence: File Search's Upgrade
  *   buttons (setup scan over the plan, a sync paused at the limit, the
  *   feature locked).
+ * - mcp_reactivate: the no-login reactivation page (/reactivate/<token>) an
+ *   AI client links to when an ended trial blocks a tool call.
  * - app: a caller that did not say (DEFAULT_CHECKOUT_SOURCE).
  */
 export const CHECKOUT_SOURCES = [
@@ -67,12 +73,13 @@ export const CHECKOUT_SOURCES = [
   'file_quota_setup',
   'file_quota',
   'file_search_licence',
+  'mcp_reactivate',
   'app',
 ] as const;
 export type CheckoutSource = (typeof CHECKOUT_SOURCES)[number];
 /** The setup tools' plan links (`?source=` on /start-trial and /settings/license). */
 export const CHAT_SETUP_SOURCE: CheckoutSource = 'chat_setup';
-/** "Add a card" on the page after approving an AI client (login.controller). */
+/** "Add a payment method" on the page after approving an AI client (login.controller). */
 export const POST_APPROVE_SOURCE: CheckoutSource = 'post_approve';
 /** Sent when the app did not name an entry point, so no checkout goes without one. */
 export const DEFAULT_CHECKOUT_SOURCE: CheckoutSource = 'app';
@@ -180,6 +187,74 @@ export function marketingOrigin(env: NodeJS.ProcessEnv = process.env): string {
 export function trialReactivationUrl(env: NodeJS.ProcessEnv = process.env): string {
   const returnUrl = encodeURIComponent(`${cloudFrontendOrigin(env)}/settings/license/activate`);
   return withSourceParam(`${marketingOrigin(env)}/pricing?return_url=${returnUrl}`, 'mcp_blocked');
+}
+
+/**
+ * Which reactivation link an ended trial's AI client gets: 'page', the
+ * no-login reactivation page of the Cloud (/reactivate/<token>), or
+ * 'pricing', the public pricing page (trialReactivationUrl).
+ *
+ * From 2026-11-07 to 2026-11-17 this was a 50/50 test per workspace
+ * (sha256 `reactivate-link-v1:<org>`). It ended in a tie (page 6.3 % of 475
+ * blocked workspaces paid, pricing 7.4 % of 445; €2.19 vs €2.10 per
+ * workspace) and every workspace now gets the page: no sign-in before paying,
+ * and slightly more yearly plans. 'pricing' remains the fallback when no
+ * token can be made (trialReactivationLink).
+ */
+export type ReactivationLinkVariant = 'page' | 'pricing';
+
+export function reactivationLinkVariant(_organizationId: string): ReactivationLinkVariant {
+  return 'page';
+}
+
+/**
+ * The reactivation page's price test for workspaces whose only connectors
+ * are Telegram bots (2026-11-08): 'personal' is offered Cloud Starter monthly
+ * at the win-back Personal price (PERSONAL_OFFER, a single-use
+ * 'personal-monthly' code minted by the licence site and applied at checkout),
+ * 'list' sees the list prices. Half and half, fixed per workspace and
+ * independent of the link test above.
+ */
+export type ReactivationOfferArm = 'personal' | 'list';
+
+export function reactivationOfferArm(organizationId: string): ReactivationOfferArm {
+  const bucket = createHash('sha256').update(`reactivate-offer-v1:${organizationId}`).digest().readUInt16BE(0) % 100;
+  return bucket < 50 ? 'personal' : 'list';
+}
+
+/**
+ * The Personal price: Cloud Starter monthly, €13 off (€6 instead of €19) for
+ * the first 12 months (Stripe coupon `personal-starter-monthly`, the same as
+ * the win-back emails').
+ */
+export const PERSONAL_OFFER = { plan: 'starter', billingPeriod: 'monthly', monthlyEur: 6, months: 12 } as const;
+
+/**
+ * The reactivation link for a workspace's blocked call, and the arm it really
+ * is: a 'page' workspace gets the pricing link when no token can be made
+ * (ENCRYPTION_KEY unusable), and is then counted as 'pricing'. Neither link
+ * carries an address: the page's token holds the encrypted ids only.
+ */
+export function trialReactivationLink(
+  organizationId: string,
+  userId?: string | null,
+  env: NodeJS.ProcessEnv = process.env,
+  now: Date = new Date(),
+): { url: string; variant: ReactivationLinkVariant } {
+  if (reactivationLinkVariant(organizationId) === 'page') {
+    const token = createReactivationToken({ organizationId, userId }, now, env);
+    if (token) return { url: `${cloudFrontendOrigin(env)}/reactivate/${token}`, variant: 'page' };
+  }
+  return { url: trialReactivationUrl(env), variant: 'pricing' };
+}
+
+/** The URL of trialReactivationLink. */
+export function trialReactivationUrlFor(
+  organizationId: string,
+  userId?: string | null,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return trialReactivationLink(organizationId, userId, env).url;
 }
 
 /** Raised when the licence site cannot give us a checkout URL. */

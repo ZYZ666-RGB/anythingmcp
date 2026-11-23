@@ -1,4 +1,20 @@
 {
+  "cliAuth": {
+    "title": "Authorize the amcp CLI",
+    "intro": "{label} on this computer is requesting a management API key.",
+    "scope": "Scope",
+    "scopeRead": "Management — read-only",
+    "scopeAdmin": "Management — admin",
+    "code": "Verification code",
+    "verifyHint": "Only continue if you just started this from your terminal and this code matches the one shown there.",
+    "authorize": "Authorize",
+    "working": "Authorizing…",
+    "cancel": "Cancel",
+    "signInFirst": "Sign in to continue; this page will return automatically.",
+    "invalid": "This authorization link is invalid or did not come from the amcp CLI.",
+    "needAdmin": "This request asks for an admin key, but your role cannot grant one. Ask an admin, or request a read-only key.",
+    "error": "Could not complete the authorization."
+  },
   "nav": {
     "groups": {
       "overview": "Overview",
@@ -16,7 +32,8 @@
       "knowledgeGraph": "Knowledge Graph",
       "aiSkills": "AI Skills",
       "memory": "Memory",
-      "setup": "Setup & onboarding"
+      "setup": "Setup & onboarding",
+      "learning": "Learning projects"
     },
     "settings": "Settings",
     "switchWorkspace": "Switch workspace",
@@ -27,6 +44,10 @@
       "hide": "Hide button",
       "hideAriaLabel": "Hide Star on GitHub button"
     }
+  },
+  "memberAccess": {
+    "notAvailableTitle": "This page is not available to you",
+    "notAvailableBody": "Your role in this workspace does not include it. Ask a workspace admin if you need more."
   },
   "signIn": {
     "continueAs": "Continue as {email}",
@@ -67,6 +88,8 @@
     "title": "Create your account",
     "cloudTitle": "Create your free account",
     "cloudSubtitle": "7-day free trial · no credit card · connect Claude, ChatGPT, Copilot, Cursor or Meta Muse to your tools.",
+    "authorizationStep": "<strong>Step 1 of 2.</strong> Create your account, then you go straight back to finish connecting {client}.",
+    "authorizationStepGeneric": "<strong>Step 1 of 2.</strong> Create your account, then you go straight back to finish connecting your AI assistant.",
     "socialConsent": "By continuing you accept the <terms>Terms of Use</terms> and the <privacy>Privacy Policy</privacy>.",
     "continueWithEmail": "Continue with email",
     "name": "Name",
@@ -119,9 +142,13 @@
     "resendIn": "Resend in {seconds}s",
     "resent": "A new code has been sent to your email",
     "skip": "Skip for now",
+    "openedLink": "I opened the link in the email",
+    "checkingLink": "Checking…",
+    "notVerifiedYet": "This address is not verified yet. Open the link in the email or enter the code.",
     "errors": {
       "invalid": "Invalid verification code",
-      "resendFailed": "Failed to resend code"
+      "resendFailed": "Failed to resend code",
+      "checkFailed": "We could not check this right now. Please try again."
     }
   },
   "checkInbox": {
@@ -191,6 +218,7 @@
       "workspaces": "workspaces on AnythingMCP Cloud"
     },
     "directory": "Listed in the Claude Directory",
+    "directoryChatgpt": "Listed in the ChatGPT Plugin Directory",
     "badges": {
       "euHosted": "🇪🇺 EU-hosted · Frankfurt",
       "gdpr": "GDPR · DPA included",
@@ -258,9 +286,27 @@
     "success": "Your email has been verified successfully!",
     "goToSignIn": "Go to Sign In",
     "backToSignIn": "Back to Sign In",
+    "continueConnecting": "Continue connecting {client}",
+    "continueConnectingGeneric": "Continue connecting your AI assistant",
+    "otherDevice": "Started on another device or in another tab? Go back there and choose “I opened the link in the email”.",
     "errors": {
       "noToken": "No verification token provided",
       "failed": "Verification failed"
+    }
+  },
+  "pendingAuthorization": {
+    "label": "Unfinished connection",
+    "allow": {
+      "text": "{client} is waiting for you.",
+      "action": "Back to connecting {client}",
+      "textGeneric": "Your AI assistant is waiting for you.",
+      "actionGeneric": "Back to connecting your AI assistant"
+    },
+    "continue": {
+      "text": "{client} is not connected yet.",
+      "action": "Finish connecting {client}",
+      "textGeneric": "Your AI assistant is not connected yet.",
+      "actionGeneric": "Finish connecting your AI assistant"
     }
   },
   "acceptInvite": {
@@ -338,30 +384,37 @@
       "paysToday": "Keep your workspace running",
       "trial": "Your free trial"
     },
-    "ending": "Your free trial ends on <strong>{date}</strong>, too soon to carry on with a card trial. <strong>Your plan starts today and is billed today.</strong> Your workspace, connectors and settings stay exactly as they are.",
-    "endingSoon": "Your free trial ends soon, too soon to carry on with a card trial. <strong>Your plan starts today and is billed today.</strong> Your workspace, connectors and settings stay exactly as they are.",
-    "returning": "This email address has had an AnythingMCP subscription before, so a new free trial is not available with a card. <strong>Your plan starts today and is billed today.</strong> Your workspace, connectors and settings stay exactly as they are, and your current trial keeps running until <strong>{date}</strong> if you decide later.",
-    "returningNoDate": "This email address has had an AnythingMCP subscription before, so a new free trial is not available with a card. <strong>Your plan starts today and is billed today.</strong> Your workspace, connectors and settings stay exactly as they are.",
-    "trial": "Every feature, free until <strong>{date}</strong>. Add a card now and your plan simply carries on after the trial, with nothing charged before then. Or keep trying without payment details: the no-card trial has a <strong>lower connector limit</strong>, and you can add a card any time to unlock your full plan.",
-    "trialNoDate": "Every feature, free until your trial ends. Add a card now and your plan simply carries on after the trial, with nothing charged before then. Or keep trying without payment details: the no-card trial has a <strong>lower connector limit</strong>, and you can add a card any time to unlock your full plan.",
+    "ending": "Your free trial ends on <strong>{date}</strong>, too soon to add a payment method and keep trying for free. <strong>Your plan starts today and is billed today.</strong> Your workspace, connectors and settings stay exactly as they are.",
+    "endingSoon": "Your free trial ends soon, too soon to add a payment method and keep trying for free. <strong>Your plan starts today and is billed today.</strong> Your workspace, connectors and settings stay exactly as they are.",
+    "returning": "This email address has had an AnythingMCP subscription before, so a new free trial with a payment method is not available. <strong>Your plan starts today and is billed today.</strong> Your workspace, connectors and settings stay exactly as they are, and your current trial keeps running until <strong>{date}</strong> if you decide later.",
+    "returningNoDate": "This email address has had an AnythingMCP subscription before, so a new free trial with a payment method is not available. <strong>Your plan starts today and is billed today.</strong> Your workspace, connectors and settings stay exactly as they are.",
+    "trial": "Every feature, free until <strong>{date}</strong>. Add a payment method now and your plan simply carries on after the trial, with nothing charged before then. Or keep trying without payment details: that trial has a <strong>lower connector limit</strong>, and you can add a payment method any time to unlock your full plan.",
+    "trialNoDate": "Every feature, free until your trial ends. Add a payment method now and your plan simply carries on after the trial, with nothing charged before then. Or keep trying without payment details: that trial has a <strong>lower connector limit</strong>, and you can add a payment method any time to unlock your full plan.",
+    "trialShort": "Every feature, free until <strong>{date}</strong>. Nothing is charged before then.",
+    "trialShortNoDate": "Every feature, free until your trial ends. Nothing is charged before then.",
     "authorizationReturn": "Either way, you go straight back to finish connecting your AI client.",
     "chargesToday": "This address already had a subscription, so the checkout will charge {amount} today.",
     "start": {
       "opening": "Opening checkout…",
       "tryAgain": "Try again",
       "checkout": "Continue to checkout",
-      "withCard": "Start free trial with card"
+      "trial": "Start free trial"
     },
     "promo": "Code {code} will be applied at checkout.",
     "price": "{amount}/{period, select, yearly {year} other {month}}",
     "priceLocal": "≈ {local}/{period, select, yearly {year} other {month}} ({exact})",
     "finePrintPaysToday": "{plan}, {price}, billed today and then {period, select, yearly {every year} other {every month}}. Secure checkout by Stripe. Cancel anytime from the billing portal.",
-    "finePrintTrial": "€0 today. {plan}, billed {period, select, yearly {yearly} other {monthly}} from {date}. Secure checkout by Stripe. Cancel before then and you pay nothing.",
-    "finePrintTrialNoDate": "€0 today. {plan}, billed {period, select, yearly {yearly} other {monthly}} from the end of your trial. Secure checkout by Stripe. Cancel before then and you pay nothing.",
+    "finePrintTrial": "{plan}, billed {period, select, yearly {yearly} other {monthly}} from {date}. Secure checkout by Stripe. Cancel before then and you pay nothing.",
+    "finePrintTrialNoDate": "{plan}, billed {period, select, yearly {yearly} other {monthly}} from the end of your trial. Secure checkout by Stripe. Cancel before then and you pay nothing.",
     "notReady": "Not ready yet?",
-    "notReadyCard": "Not ready to add a card?",
+    "notReadyCard": "Not ready to add a payment method?",
     "keepFree": "Keep using the free trial",
-    "tryFree": "Try free without payment details"
+    "tryFree": "Try free without payment details",
+    "skipNote": "Without payment details the trial has a lower connector limit. You can add a payment method any time.",
+    "methods": {
+      "trial": "€0 today · card, PayPal and other methods",
+      "pay": "Card, PayPal and other methods"
+    }
   },
   "appShell": {
     "toggleTheme": "Toggle theme",
@@ -374,6 +427,7 @@
   "auditLog": {
     "title": "Audit Log",
     "subtitle": "Tool invocation history across your connectors and MCP servers.",
+    "ownCallsOnly": "You see your own calls. Workspace admins see all calls.",
     "refresh": "Refresh",
     "filters": {
       "all": "All",
@@ -439,6 +493,7 @@
   "analytics": {
     "title": "Analytics",
     "subtitle": "Tool-call volume, success rate and cost across your MCP server.",
+    "ownCallsOnly": "You see your own calls. Workspace admins see all calls.",
     "range": "{days}d",
     "loading": "Loading…",
     "loadFailed": "Failed to load",
@@ -462,6 +517,43 @@
       "dayTitleWithErrors": "{date}: {total, plural, one {# call} other {# calls}} · {errors, plural, one {# error} other {# errors}}"
     },
     "topTools": "Top tools",
+    "performance": {
+      "title": "Tool performance",
+      "description": "Calls, errors and latency by tool, connector and MCP server. This table has its own time range.",
+      "range": "Tool performance time range",
+      "ranges": {
+        "24": "Last 24 hours",
+        "168": "Last 7 days",
+        "720": "Last 30 days"
+      },
+      "connector": "Filter tool performance by connector",
+      "server": "Filter tool performance by MCP server",
+      "allConnectors": "All connectors",
+      "allServers": "All MCP servers",
+      "filtersFailed": "Could not load filter options.",
+      "loading": "Loading tool performance…",
+      "loadFailed": "Could not load tool performance.",
+      "retry": "Retry",
+      "empty": "No tool calls in this period match these filters.",
+      "noServer": "Direct / no server",
+      "columns": {
+        "tool": "Tool / connector",
+        "server": "MCP server",
+        "calls": "Calls",
+        "errorRate": "Error rate",
+        "p50": "p50",
+        "p95": "p95",
+        "p99": "p99",
+        "lastError": "Last recorded error"
+      },
+      "errors": "{count, plural, one {# error} other {# errors}}",
+      "samples": "{count, plural, one {# stored sample} other {# stored samples}}",
+      "showError": "View error",
+      "page": "Page {page}",
+      "previous": "Previous",
+      "next": "Next",
+      "samplingNote": "Latency uses stored samples. Repeated failures are counted on their first recorded server."
+    },
     "byConnector": "Calls by connector",
     "byServer": "Calls by MCP server",
     "byUser": "Calls by user",
@@ -502,6 +594,7 @@
     "active": "Active",
     "inactive": "Inactive",
     "empty": "No MCP servers configured yet.",
+    "nothingShared": "Nothing has been shared with you yet. Ask a workspace admin for a role.",
     "createFirst": "Create your first MCP Server",
     "noMatches": "No MCP servers match your search.",
     "exposes": "Exposes <b>{names}</b>",
@@ -536,6 +629,10 @@
       "open": "Open the Claude Directory",
       "body": "The directory connects your shared <code>/mcp</code> endpoint: you choose which servers it reaches when you sign in. The steps below add this server only."
     },
+    "chatgptDirectory": {
+      "title": "Quickest for company databases: the ChatGPT Plugin Directory",
+      "open": "Open in the ChatGPT Plugin Directory"
+    },
     "modal": {
       "title": "Connect to {client}",
       "runCommand": "Run this command in your terminal:",
@@ -551,16 +648,16 @@
       "apiKeyInstead": "Using an API key instead of OAuth?",
       "addToClaude": "Add to Claude",
       "claudeWebStep1": "1. Click the button below: Claude opens its <strong>Add custom connector</strong> dialog.",
-      "claudeWebStep2": "2. Enter a name and paste the MCP endpoint URL below, then click <strong>Add</strong>.",
-      "claudeWebStep3": "3. Click <strong>Connect</strong> and approve access.",
-      "claudeWebFallback": "Dialog not showing? In Claude open <strong>Customize → Connectors</strong>, click <strong>+</strong>, then <strong>Add custom connector</strong>.",
+      "claudeWebStep2": "2. Enter a name (e.g. AnythingMCP) and paste the MCP endpoint URL below, click <strong>Continue</strong>, keep the detected settings and click <strong>Continue</strong> again.",
+      "claudeWebStep3": "3. Choose <strong>Sign in now</strong>, click <strong>Add</strong>, then sign in to AnythingMCP and approve access.",
+      "claudeWebFallback": "Dialog not showing? In Claude open <strong>Plugins</strong> (or <strong>Customize</strong>) → <strong>Connectors</strong>, click <strong>+ Add</strong>, then <strong>Add custom connector</strong>.",
       "claudeDesktopRecommended": "<strong>Recommended:</strong> add this server from Claude Desktop's built-in connector settings — it runs the OAuth login for you, with no file editing. Editing <code>claude_desktop_config.json</code> with a remote URL does <em>not</em> work: that file only launches local commands, so Claude skips it as “not a valid MCP server configuration”.",
-      "claudeDesktopStep1": "1. Open <strong>Customize → Connectors</strong> (in Claude Desktop, or with the button below).",
-      "claudeDesktopStep2": "2. Click <strong>+</strong>, then <strong>Add custom connector</strong>.",
-      "claudeDesktopStep3": "3. Enter a name and paste the MCP endpoint URL below, then click <strong>Add</strong>.",
+      "claudeDesktopStep1": "1. In Claude Desktop (or with the button below), open <strong>Plugins</strong> (still called <strong>Customize</strong> on some plans) → <strong>Connectors</strong>.",
+      "claudeDesktopStep2": "2. Click <strong>+ Add</strong>, then <strong>Add custom connector</strong>.",
+      "claudeDesktopStep3": "3. Enter a name and paste the MCP endpoint URL below, click <strong>Continue</strong> twice (keep the detected settings), choose <strong>Sign in now</strong> and click <strong>Add</strong>.",
       "bridgeSummary": "Prefer the config file? Use the mcp-remote bridge",
       "bridgeBody": "Requires Node.js. The <code>mcp-remote</code> package wraps the remote server as a local command. Add to <code>claude_desktop_config.json</code> and restart Claude Desktop.",
-      "chatgptStep1": "1. Click the button below to open <strong>Plugins</strong> in ChatGPT, then click <strong>+</strong> and <strong>Add custom MCP server</strong>.",
+      "chatgptStep1": "1. Click the button below to open <strong>Plugins</strong> in ChatGPT, then click <strong>Add</strong> and <strong>Add custom MCP server</strong>.",
       "chatgptStep2": "2. Enter a name (e.g. AnythingMCP), paste the MCP endpoint URL below as the <strong>Server URL</strong> and keep <strong>Authentication</strong> on <strong>OAuth</strong>.",
       "chatgptStep3": "3. Select <strong>I understand and want to continue</strong>, then <strong>Create as a plugin</strong>, and sign in to AnythingMCP when asked.",
       "chatgptStep4": "4. Install the plugin from your personal plugins, then type <strong>@</strong> in a chat to use it.",
@@ -718,7 +815,8 @@
       "description": "Add your first API connector to start generating MCP tools.",
       "supports": "Supports {types}",
       "browse": "Browse Adapters",
-      "importBackup": "Import from Backup"
+      "importBackup": "Import from Backup",
+      "nothingShared": "Nothing has been shared with you yet. Ask a workspace admin for a role."
     },
     "filter": {
       "placeholder": "Filter connectors…",
@@ -732,7 +830,9 @@
       "active": "Active",
       "inactive": "Inactive",
       "importSpec": "Import Spec",
-      "delete": "Delete"
+      "delete": "Delete",
+      "owner": "Owner: {name}",
+      "ownerGone": "Owner: no longer a member"
     },
     "addTile": {
       "title": "Add a connector",
@@ -887,14 +987,17 @@
     "pill": {
       "signInExpired": "Sign-in expired",
       "tokenRefused": "Token refused",
+      "credentialsRefused": "Key refused",
       "expiresSoon": "Token expires soon"
     },
     "banner": {
       "signInRefused": "The provider refused the sign-in, so tool calls stop here until you authorize again.",
       "tokenRefused": "The provider refused the access token, so tool calls stop here until you save a new one.",
+      "credentialsRefused": "Every tool call of this connector fails until you save valid credentials.",
       "expiresOn": "The access token stops working on {date}.",
       "expiresSoon": "The access token stops working soon.",
-      "since": "Since {date}"
+      "since": "Since {date}",
+      "updateCredentials": "Update credentials"
     }
   },
   "authTypes": {
@@ -949,7 +1052,10 @@
       "required": "Required",
       "looksWrongExample": "Looks wrong. Example: {example}",
       "looksWrong": "Looks wrong",
+      "choose": "Choose…",
+      "chooseOne": "Choose one of the options",
       "optional": "(optional)",
+      "lookedUp": "(found for you if left empty)",
       "stored": "Stored. Leave empty to keep it",
       "hide": "Hide",
       "show": "Show",
@@ -985,6 +1091,34 @@
       "selfRegistering": "After saving you sign in at {name} once. AnythingMCP registers itself with {name}'s MCP server, so there is no app to create and no key to copy.",
       "ownApp": "You need an app of your own at {name}, then you sign in once. In the app's settings, add this callback URL (also called redirect URI) exactly as shown:"
     },
+    "tiktokShopApp": {
+      "serverApp": "This server has its own TikTok Shop app: you only sign in to Seller Center and approve it. There are no app keys to enter.",
+      "useOwn": "Use your own TikTok Shop app",
+      "ownHint": "Only for a Partner Center app of your own. Set its Redirect URL to:"
+    },
+    "wooOneClick": {
+      "title": "Connect with one click",
+      "body": "Approve a key on your shop instead of creating one and pasting it here. You sign in to WordPress as an administrator or shop manager and click Approve; WooCommerce sends the key to AnythingMCP and brings you back.",
+      "scopeLegend": "What the AI may do",
+      "read": "Read only (recommended to start)",
+      "readHint": "The AI can look at orders, products and customers, but cannot change anything.",
+      "readWrite": "Read and write",
+      "readWriteHint": "The AI can also change products, orders and customers.",
+      "connect": "Connect with one click",
+      "orPaste": "Or create a key yourself as described here and paste it below.",
+      "checking": "Checking the new key with your shop…",
+      "denied": "The key was not approved in WooCommerce. Connect again, or create a key yourself and paste it.",
+      "timeout": "Your shop did not send the key to AnythingMCP. A security plugin or firewall may block /wc-auth/ or the call to AnythingMCP. Try again, or create a key yourself and paste it.",
+      "failed": "The key could not be connected: {message}"
+    },
+    "metaLogin": {
+      "signIn": "Save and sign in with {provider}",
+      "modeSignIn": "Sign in with {provider} (recommended)",
+      "modePaste": "Paste an access token",
+      "serverApp": "This server has its own Meta app: you only sign in and approve it. There is no app id or secret to enter.",
+      "useOwn": "Use your own Meta app",
+      "ownHint": "Enter your Meta app's id and secret below (and META_CONFIG_ID for Unified Login), and register this address as the redirect URL:"
+    },
     "copy": "Copy",
     "noInput": "Nothing to enter: it works without an account.",
     "working": "Working…",
@@ -995,6 +1129,7 @@
   "setupGuide": {
     "stuck": "Stuck? Ask us",
     "intro": {
+      "back": "Back",
       "title": "Connect {name} to your AI",
       "steps": "{count, plural, one {# step} other {# steps}}",
       "examples": "Then ask your AI things like",
@@ -1048,14 +1183,14 @@
     },
     "claude": {
       "step1": "Click <b>Add to Claude</b>: Claude opens its <b>Add custom connector</b> dialog.",
-      "step2": "Enter a name (e.g. AnythingMCP), paste the URL below and click <b>Add</b>.",
-      "step3": "Click <b>Connect</b> and approve access.",
+      "step2": "Enter a name (e.g. AnythingMCP), paste the URL below and click <b>Continue</b>; keep the detected settings and click <b>Continue</b> again.",
+      "step3": "Choose <b>Sign in now</b>, click <b>Add</b>, then sign in and approve access.",
       "add": "Add to Claude",
-      "noDialog": "Dialog not showing? In Claude open <b>Customize → Connectors</b>, click <b>+</b>, then <b>Add custom connector</b>.",
+      "noDialog": "Dialog not showing? In Claude open <b>Plugins</b> (or <b>Customize</b>) → <b>Connectors</b>, click <b>+ Add</b>, then <b>Add custom connector</b>.",
       "directory": "Or add AnythingMCP from the <link>Claude Directory</link> and pick this server when you sign in."
     },
     "chatgpt": {
-      "step1": "Open <b>Plugins</b> in ChatGPT, click <b>+</b>, then <b>Add custom MCP server</b>.",
+      "step1": "Open <b>Plugins</b> in ChatGPT, click <b>Add</b>, then <b>Add custom MCP server</b>.",
       "step2": "Enter a name, paste the URL below as the <b>Server URL</b> and keep <b>Authentication</b> on <b>OAuth</b>.",
       "step3": "Select <b>I understand and want to continue</b>, then <b>Create as a plugin</b>, and sign in to AnythingMCP.",
       "step4": "Install the plugin from your personal plugins, then type <b>@</b> in a chat to use it.",
@@ -1253,7 +1388,15 @@
       "method": "Method",
       "tokenPath": "Token JSON path",
       "ttl": "Token TTL (s)",
-      "refreshOn401": "Re-login and retry automatically on a 401 response"
+      "refreshOn401": "Re-login and retry automatically on a 401 response",
+      "credentialsHint": "Only needed when the login body or headers use <code>{user}</code> / <code>{pass}</code> (or when there is no login body). Leave both empty for a token exchange that only sends a key.",
+      "tokenPathPlaceholder": "token, data.accessToken …",
+      "tokenPathHint": "Where the token is in the login answer, e.g. token or data.accessToken (several paths separated by commas are tried in order). Leave it empty when the whole answer is the token (plain text or a JSON string).",
+      "loginHeaders": "Headers for the login request",
+      "loginHeadersHint": "Sent with the login request only; the connector headers further down are not. Values can use variables such as {variable} and the placeholder {pass}.",
+      "urlRequired": "Enter the login URL.",
+      "usernameRequired": "The login uses {user}: enter a username, or remove the placeholder from the login body and headers.",
+      "passwordRequired": "The login uses {pass}: enter a password or key, or remove the placeholder from the login body and headers."
     },
     "creating": "Creating...",
     "create": "Create connector",
@@ -1307,6 +1450,10 @@
     "active": "Active",
     "inactive": "Inactive",
     "dismiss": "dismiss",
+    "memberView": {
+      "title": "Shared with you",
+      "body": "You can use the tools below through your AI client. This connector's settings are visible only to its owner and to workspace admins."
+    },
     "actions": {
       "test": "Test",
       "edit": "Edit",
@@ -1421,7 +1568,7 @@
       "noteNew": "The consumer key and secret belong to the application registered with the provider — not your login e-mail or password. Both are required to switch to OAuth 1.0a. The access token is only for APIs that act on behalf of a user (three-legged)."
     },
     "loginToken": {
-      "intro": "For APIs with short-lived tokens (e.g. HRworks): we POST your credentials to the login endpoint, read the token from the response, send it as a Bearer token, and refresh it automatically before it expires. Re-enter the password/secret to change this configuration; leave it empty to keep the current one.",
+      "intro": "For APIs with short-lived tokens (e.g. HRworks): we send the login request to the login endpoint, read the token from the response, send it with every call and renew it automatically before it expires. Leave username and password empty to keep the stored ones; settings this form does not show are kept when you save.",
       "url": "Login URL",
       "username": "Username / Access key",
       "usernamePlaceholder": "access key",
@@ -1431,7 +1578,18 @@
       "method": "Method",
       "tokenPath": "Token JSON path",
       "ttl": "Token TTL (s)",
-      "refreshOn401": "Re-login and retry automatically on a 401 response"
+      "refreshOn401": "Re-login and retry automatically on a 401 response",
+      "credentialsHint": "Only needed when the login body or headers use <code>{user}</code> / <code>{pass}</code> (or when there is no login body). Leave both empty for a token exchange that only sends a key.",
+      "tokenPathPlaceholder": "token, data.accessToken …",
+      "tokenPathHint": "Where the token is in the login answer, e.g. token or data.accessToken (several paths separated by commas are tried in order). Leave it empty when the whole answer is the token (plain text or a JSON string).",
+      "loginHeaders": "Headers for the login request",
+      "loginHeadersHint": "Sent with the login request only; the connector headers further down are not. Values can use variables such as {variable} and the placeholder {pass}.",
+      "urlRequired": "Enter the login URL.",
+      "usernameRequired": "The login uses {user}: enter a username, or remove the placeholder from the login body and headers.",
+      "passwordRequired": "The login uses {pass}: enter a password or key, or remove the placeholder from the login body and headers.",
+      "passwordPlaceholder": "secret",
+      "bodyHidden": "The stored login body contains a secret value and is not shown. Leave the field empty to keep it, or type a new body to replace it.",
+      "tokenFromSource": "This connector reads the token from the login response {source}, so the token path is not used."
     },
     "oauthCard": {
       "title": "OAuth2 Authorization",
@@ -1442,11 +1600,66 @@
       "authorizeRemote": "Authorize with Remote Server",
       "authorizeProvider": "Authorize with Provider",
       "discovering": "Discovering...",
-      "rediscover": "Re-discover Tools"
+      "rediscover": "Re-discover Tools",
+      "keysMissing": "Save your app's client ID and secret first, then authorize. The provider needs them to open its sign-in page (for Etsy: the Keystring and the Shared Secret).",
+      "keysStillEmpty": "Still empty: {names}",
+      "enterKeys": "Enter the keys",
+      "clientId": "client ID",
+      "signInStarting": "Opening the sign-in for {name}…",
+      "signInManual": "The sign-in could not start by itself. Start it with this button:"
     },
     "shopee": {
       "title": "Shopee shop authorization",
       "body": "Sign in with the shop account and approve this app. The tokens are stored encrypted and renewed automatically. Authorize again when the authorization expires or the connector asks for it."
+    },
+    "sheinShop": {
+      "title": "SHEIN shop authorization",
+      "body": "Sign in to SHEIN with the shop's main account and approve the app. SHEIN then hands this connector the shop's key, which is stored encrypted. SHEIN documents no fixed lifetime and no renewal: authorize again when SHEIN ends the authorization (the seller unbinds the app or resets the key, or it expires) and the connector asks for it."
+    },
+    "iopSeller": {
+      "title": "Seller authorization",
+      "body": "Sign in with the seller account and approve the app (Lazada, Miravia, AliExpress). The app's callback URL must be your AnythingMCP address followed by /api/iop-auth/callback. The tokens are stored encrypted and renewed automatically; authorize again when the authorization expires or the connector asks for it."
+    },
+    "tiktokShop": {
+      "title": "TikTok Shop authorization",
+      "body": "Sign in to TikTok Shop Seller Center with the shop owner account and approve the app. With an app of your own, its Redirect URL in Partner Center must be your AnythingMCP address followed by /api/tiktok-shop/callback; without one, the connector uses this server's TikTok Shop app. The tokens are stored encrypted and renewed automatically; authorize again when the authorization expires or the connector asks for it."
+    },
+    "meta": {
+      "titleFacebook": "Sign in with Instagram or Facebook",
+      "titleInstagram": "Sign in with Instagram",
+      "bodyFacebook": "Sign in with the Instagram account or with Facebook and approve the app. With Unified Login (AnythingMCP Cloud, and every Meta app created since autumn 2026) you choose the business portfolio and the Instagram account to share, no Facebook Page needed, and the token does not expire. With an older app you sign in with a Facebook user who manages the Page linked to the Instagram account, and the token is renewed before it expires. The token and the account id are stored on this connector, encrypted. With an app of your own, set META_APP_ID, META_APP_SECRET and, for Unified Login, META_CONFIG_ID, and register your AnythingMCP address followed by /api/meta/callback as the redirect URL.",
+      "bodyInstagram": "Sign in with the Instagram business or creator account and approve the app; no Facebook Page is needed. The token and the account id are stored on this connector, encrypted, and the token is refreshed before it expires. With an app of your own, set INSTAGRAM_APP_ID and INSTAGRAM_APP_SECRET and add your AnythingMCP address followed by /api/meta/callback to its OAuth redirect URIs.",
+      "authorizeFacebook": "Authorize with Instagram or Facebook",
+      "authorizeInstagram": "Authorize with Instagram"
+    },
+    "metaBanner": {
+      "dismiss": "Dismiss",
+      "connected": {
+        "title": "Instagram is connected",
+        "titleAs": "Instagram is connected as {account}",
+        "body": "The sign-in worked and the token is stored on this connector. Test the connection, then use the tools from your AI assistant.",
+        "bodyAs": "Signed in, and the connector uses {account}. Test the connection, then use the tools from your AI assistant."
+      },
+      "choose": {
+        "title": "Choose the Instagram account",
+        "body": "The sign-in reaches several Instagram accounts. Pick the one this connector should use; you can switch later."
+      },
+      "no_account": {
+        "title": "Signed in, but no Instagram account was shared",
+        "body": "The sign-in worked and is kept, but Meta returned no Instagram account for it. Authorize again and, in the Meta dialog, select the business portfolio and tick the Instagram business or creator account. Or enter the account id below if you know it.",
+        "bodyNoAssets": "Meta approved the permissions but shared no Instagram account with the app. This happens when the business portfolio chosen in the dialog does not own the account (it is only shared with it). Authorize again and choose the portfolio that owns the Instagram account, then tick the account."
+      },
+      "error": {
+        "title": "The sign-in did not finish",
+        "body": "Meta did not complete the sign-in. Authorize again."
+      },
+      "testNow": "Test connection",
+      "switchAccount": "Use another account",
+      "authorizeAgain": "Authorize again",
+      "manualLabel": "Instagram account id",
+      "manualSave": "Use this account id",
+      "manualHint": "Enter the account id that Meta's API returns for the Instagram professional account (usually a number starting with 1784; the asset id shown in Business settings can differ). It is checked with the stored sign-in before it is saved.",
+      "manualInvalid": "Enter the numeric Instagram account id (digits only), not the username."
     },
     "env": {
       "title": "Environment Variables",
@@ -1494,7 +1707,9 @@
       "envSavedWarnings": "Environment variables saved. {warnings}",
       "discoveryFailed": "Discovery failed: {message}",
       "authorizationFailed": "Authorization failed: {message}"
-    }
+    },
+    "owner": "Owner: {name}",
+    "ownerGone": "Owner: no longer a member of this workspace"
   },
   "userCredentials": {
     "scopeError": "Could not change the sign-in mode.",
@@ -1523,6 +1738,27 @@
       "saving": "Saving…",
       "switch": "Switch"
     }
+  },
+  "webhook": {
+    "title": "Inbound webhooks",
+    "body": "Receive events from the provider (Stripe) and read them back from the connector's own URL.",
+    "enable": "Enabled",
+    "urlLabel": "Delivery URL",
+    "copy": "Copy",
+    "copied": "Copied",
+    "copyFailed": "Could not copy",
+    "secretLabel": "Signing secret",
+    "secretPlaceholder": "Paste the provider's signing secret",
+    "secretSaved": "Secret saved",
+    "secretError": "Could not save the secret.",
+    "save": "Save",
+    "saving": "Saving…",
+    "toggleError": "Could not change this setting.",
+    "eventsLabel": "Last deliveries",
+    "refresh": "Refresh",
+    "loading": "Loading…",
+    "noEvents": "No deliveries yet.",
+    "unknownType": "Unknown event"
   },
   "connectorTools": {
     "title": "MCP Tools ({count})",
@@ -1575,6 +1811,7 @@
       "import": "Import"
     },
     "empty": "No tools configured. Import from a spec, Postman collection, or cURL command, or add tools manually.",
+    "emptyReadOnly": "No tools configured.",
     "card": {
       "enabled": "enabled",
       "disabled": "disabled",
@@ -1597,7 +1834,7 @@
       "disable": "Disable",
       "enable": "Enable",
       "proxy": "Proxy",
-      "proxyTitle": "Route this tool's request through the configured proxy / web-unblocker. Recommended for anti-bot, geo-restricted, or rate-limited APIs.",
+      "proxyTitle": "Route this tool's request through the configured proxy / web-unblocker. Recommended for anti-bot, geo-restricted, or rate-limited APIs. Calls through it leave from changing IP addresses: keep it off for a server that only accepts approved IPs.",
       "delete": "Delete",
       "showSql": "Show full SQL",
       "showPath": "Show full path",
@@ -1931,7 +2168,32 @@
     },
     "apiKeys": {
       "title": "MCP API Keys",
-      "body": "API keys are now managed per MCP server. Go to <link>MCP Servers</link> to generate and manage keys for each server."
+      "body": "API keys are now managed per MCP server. Go to <link>MCP Servers</link> to generate and manage keys for each server.",
+      "management": {
+        "title": "Management API keys",
+        "intro": "Management keys drive your whole instance from the amcp CLI and the management API (/api/*) — connectors, MCP servers, users, roles and settings. Read-only keys can only read; admin keys can change things, still limited by your own role.",
+        "name": "Name",
+        "namePlaceholder": "e.g. ops laptop",
+        "scope": "Scope",
+        "scopeRead": "Management — read-only",
+        "scopeAdmin": "Management — admin",
+        "scopeAdminOnly": "Only workspace admins can mint admin keys.",
+        "generate": "Generate key",
+        "generating": "Generating…",
+        "created": "Copy your key now — it is shown only once.",
+        "copy": "Copy",
+        "copied": "Copied",
+        "revoke": "Revoke",
+        "delete": "Delete",
+        "confirmDelete": "Delete this key permanently? Any client using it stops working.",
+        "empty": "No management keys yet.",
+        "active": "Active",
+        "revoked": "Revoked",
+        "created_toast": "Management key created",
+        "revoked_toast": "Key revoked",
+        "deleted_toast": "Key deleted",
+        "error": "Could not complete that"
+      }
     },
     "danger": {
       "title": "Danger Zone",
@@ -2018,14 +2280,35 @@
         "description": "On a schedule (roughly daily), let the AI extend the graph and generate skills from the captured user intents — so your network and skills keep improving on their own. Cost-careful: it only runs every so often, skips when nothing changed, and stays off until you enable it. Requires AI enrichment + Capture user intent."
       },
       "skillAutoApply": {
-        "label": "Auto-apply high-confidence skills",
-        "description": "When AI generates a skill it is confident about (≥ 0.90), apply it automatically instead of leaving it as a suggestion to review. Lower-confidence skills still wait for manual approval."
+        "label": "Auto-apply skills learned from fixed errors",
+        "description": "When the same failed call was fixed in the same way at least 3 times, apply the skill learned from it automatically. Skills generated by AI always wait for your review."
       }
     },
     "security": {
       "title": "Security",
       "body": "Sign every member out of the dashboard and of every connected AI client, including clients that hold a refresh token. Nobody loses their role or access; everyone simply has to sign in again. Use it after a suspected credential leak or a change in your identity provider. MCP API keys are not sessions and are left alone unless you say otherwise.",
       "button": "Sign everyone out"
+    },
+    "visibility": {
+      "title": "Member visibility",
+      "body": "Decide what members who are not admins see in the dashboard and the API. Admins always see everything. AI clients are not affected: roles already decide which tools they can call. A change can take up to 30 seconds to apply.",
+      "open": {
+        "label": "Open",
+        "description": "Every member sees every connector, MCP server and tool call of the workspace. This is the default."
+      },
+      "restricted": {
+        "label": "Restricted",
+        "description": "Members who are not admins see only their own tool calls, the connectors their roles reach (an Editor also the connectors they own) and the MCP servers they own. Pages for running the workspace are not listed for them."
+      },
+      "noToolList": "Restricted does not narrow which connectors members see yet. No role in this workspace has a tool list, so every member still sees every connector by name, status and tools (not its settings); only their tool calls are narrowed to their own. Create a role with a tool list under <link>Roles</link> and assign it. From then on a member without a role sees no connector.",
+      "saved": "Member visibility saved.",
+      "saveFailed": "Could not save member visibility.",
+      "activeNow": "Active now: {mode}",
+      "unsavedToRestricted": "Not saved yet. This workspace is still Open: every member sees everything until you save.",
+      "unsavedToOpen": "Not saved yet. This workspace is still Restricted until you save.",
+      "saveSwitch": "Save: switch to {mode}",
+      "discard": "Discard",
+      "confirmLeave": "The member visibility you chose is not saved yet. Leave this page without saving?"
     },
     "revokeDialog": {
       "title": "Sign everyone out",
@@ -2060,7 +2343,8 @@
       "createTitle": "Create New Organization",
       "createPlaceholder": "New organization name",
       "creating": "Creating...",
-      "create": "Create Organization"
+      "create": "Create Organization",
+      "createAdminOnly": "Only admins can create a workspace on this instance."
     }
   },
   "settingsUsers": {
@@ -2121,11 +2405,12 @@
       "email": "Email",
       "appRole": "App Role",
       "mcpRole": "MCP Tool Role",
-      "noRestriction": "No restriction (full access)",
+      "noRestriction": "No role",
       "emailFailed": "Failed to send email:",
       "link": "Invitation link (share manually):",
       "sending": "Sending...",
-      "send": "Send Invitation"
+      "send": "Send Invitation",
+      "restrictedRoleHint": "Member visibility is restricted here. A Viewer sees only what their MCP roles reach. An Editor also creates connectors and always sees the ones they own."
     },
     "bulk": {
       "selected": "{count} selected · Skill learning:",
@@ -2177,7 +2462,7 @@
     "confirmDelete": "Delete role \"{name}\"? Users with this role will be unassigned.",
     "deleted": "Role deleted",
     "toolAccessUpdated": "Tool access updated",
-    "assigned": "MCP role assigned",
+    "assigned": "MCP roles saved",
     "accessDenied": {
       "title": "Access Denied",
       "body": "Only administrators can access this page.",
@@ -2186,7 +2471,7 @@
     "dismiss": "dismiss",
     "loading": "Loading...",
     "title": "Custom Roles",
-    "intro": "Create roles to control which MCP tools different users can access. Users without a role have full access. ADMIN always has full access.",
+    "intro": "Create roles to control which MCP tools different users can access. While no role has a tool list, users without a role can use every tool; as soon as one role has a tool list, users without a role get no tools. ADMIN always has full access.",
     "cancel": "Cancel",
     "createRole": "Create Role",
     "form": {
@@ -2215,16 +2500,36 @@
       "all": "All",
       "none": "None",
       "saving": "Saving...",
-      "save": "Save ({count} tools)"
+      "save": "Save ({count} tools)",
+      "limitsHint": "Optional: limit how often each member with this role may call a ticked tool, per minute and per hour. Leave a field empty for no limit. The limit counts per user and tool, across all their API keys and sessions; workspace admins are never limited. Refused calls show up under Logs.",
+      "perMinute": "/min",
+      "perHour": "/h",
+      "limitMinuteLabel": "Calls per minute for {tool}",
+      "limitHourLabel": "Calls per hour for {tool}",
+      "invalidLimit": "Limits must be whole numbers of 1 or more, or empty for no limit ({tool}).",
+      "limitedCount": "{count} limited"
     },
     "assign": {
       "title": "User MCP Role Assignment",
-      "intro": "Assign MCP roles to users to control which tools they can access via MCP. Users without a role have unrestricted access. ADMIN users always have full access.",
+      "intro": "Assign MCP roles to users to control which tools they can access via MCP. While no role has a tool list, users without a role can use every tool; as soon as one role has a tool list, users without a role get no tools. ADMIN users always have full access.",
       "user": "User",
       "appRole": "App Role",
       "mcpRole": "MCP Tool Role",
       "fullAccess": "Full access (admin)",
-      "noRestriction": "No restriction (full access)"
+      "unionHint": "A member can use the tools of all their roles together. Each role adds tools; none takes any away.",
+      "reach": "Connectors reached",
+      "fromSso": "from single sign-on group",
+      "allWorkspaces": "all workspaces",
+      "allWorkspacesHint": "This role applies in every workspace and cannot be changed here.",
+      "ssoHint": "Roles from a single sign-on group follow the group. Change them in",
+      "ssoLink": "Settings → Single sign-on → Role mappings",
+      "manualPlaceholder": "Choose roles",
+      "deactivated": "Deactivated",
+      "allConnectors": "All connectors",
+      "noConnectors": "None",
+      "connectorCount": "{count, plural, one {# connector} other {# connectors}}",
+      "noRoleOpen": "No role. Can use every tool while no role has a tool list.",
+      "noRoleClosed": "No role, so no tools."
     }
   },
   "settingsAdmin": {
@@ -2350,6 +2655,25 @@
       "manage": "Manage subscription & billing",
       "cancel": "Cancel subscription"
     },
+    "invoiceEmail": {
+      "title": "Invoices by email",
+      "body": "Get every invoice as a PDF by email as soon as it is paid. All invoices are always in the billing portal too.",
+      "recipientLabel": "Send invoices to",
+      "billingContact": "Billing contact",
+      "otherAddress": "Another address",
+      "otherAddressHint": "For example your accounting team. The previous address gets a short notice when you change it.",
+      "addressPlaceholder": "accounting@company.com",
+      "saveRecipient": "Save address",
+      "saving": "Saving…",
+      "savedOn": "Invoices will be emailed from the next payment on.",
+      "savedOff": "Invoices are no longer emailed.",
+      "savedRecipient": "Address saved.",
+      "invalidAddress": "Enter one valid email address.",
+      "saveError": "Could not save. Please try again.",
+      "loadError": "The invoice email settings could not be loaded. Reload the page to try again.",
+      "lastSent": "Last invoice sent: {number} on {date} to {to}",
+      "allInvoices": "All invoices: Manage subscription & billing, above."
+    },
     "features": {
       "title": "Features",
       "yes": "Yes",
@@ -2388,6 +2712,13 @@
       "activating": "Activating your license…",
       "key": "Key:",
       "goToSettings": "Go to License Settings"
+    },
+    "dpa": {
+      "title": "Data Processing Agreement",
+      "body": "Your plan includes our Data Processing Agreement under Art. 28 GDPR. Accept it online on anythingmcp.com, in English or German: you get the PDF with the acceptance record by email, with no signature or scan needed.",
+      "open": "Open the DPA",
+      "opening": "Opening…",
+      "error": "Could not open the DPA page. Please try again."
     }
   },
   "settingsSso": {
@@ -2868,7 +3199,8 @@
       "hideHistory": "Hide history",
       "history": "History ({count, plural, one {# earlier version} other {# earlier versions}})",
       "replaced": "replaced {date}",
-      "historyProcedure": "Procedure: {count, number} characters"
+      "historyProcedure": "Procedure: {count, number} characters",
+      "draftOnly": "Draft: served to its member only"
     },
     "sources": {
       "llm": "AI-generated",
@@ -2876,7 +3208,8 @@
       "mergedByAi": "merged by AI",
       "errors": "learned from fixed errors",
       "finder": "from Skills Finder",
-      "manual": "written by hand"
+      "manual": "written by hand",
+      "learning": "from a learning project"
     },
     "form": {
       "titlePlaceholder": "Title",
@@ -3370,6 +3703,42 @@
       "body": "File Search indexes the PDF, Word, Excel and Outlook files on your NAS, server or storage and keeps the index in sync, so the AI finds what is written in them, not only the file names.",
       "cta": "Set up File Search",
       "for": "Opens the wizard for {name}."
+    },
+    "authorize": {
+      "banner": "You are connecting a folder for your AI assistant. When the folder is active, you go back to the chat.",
+      "skip": "Skip and go back to the chat",
+      "opening": "Opening the folder setup…",
+      "openFailedTitle": "The folder setup could not be opened",
+      "openFailed": "This page has expired.",
+      "openFailedHint": "Go back to the chat and connect again, or sign in to the dashboard and set up the folder there.",
+      "openWizard": "Set up the folder in the dashboard"
+    },
+    "reach": {
+      "title": {
+        "private": "This address only works inside your network",
+        "quickconnect": "QuickConnect links do not work here",
+        "unreachable": "AnythingMCP Cloud could not reach the server"
+      },
+      "intro": {
+        "private": "AnythingMCP Cloud runs on the internet, so it cannot open addresses like 192.168.x.x or nas.local. Give the NAS an address that is reachable from the internet:",
+        "quickconnect": "Synology QuickConnect only relays Synology's own apps, not SFTP or WebDAV. Give the NAS an address that is reachable from the internet:",
+        "unreachable": "If the NAS is in your home or office network, the router keeps AnythingMCP Cloud out. Give the NAS an address that is reachable from the internet:"
+      },
+      "synology": {
+        "title": "Synology: WebDAV over HTTPS with a free synology.me address",
+        "steps": "Control Panel → External Access → DDNS: add a name like yourname.synology.me and turn on the free Let's Encrypt certificate. Package Center: install WebDAV Server and turn on HTTPS (port 5006). On your router, forward TCP port 5006 to the NAS. Here choose WebDAV and enter https://yourname.synology.me:5006."
+      },
+      "tunnel": {
+        "title": "Without opening a router port: a tunnel",
+        "steps": "Cloudflare Tunnel (with your own domain on Cloudflare) or Tailscale Funnel publishes the NAS's WebDAV server under an https:// address. Choose WebDAV here and enter that address."
+      },
+      "other": {
+        "title": "QNAP, Fritz!Box and other NAS",
+        "steps": "Turn on WebDAV over HTTPS (or SFTP), give the NAS a dynamic DNS name (myQNAPcloud, MyFRITZ! or similar) and forward that port on the router."
+      },
+      "firewall": "To keep everyone else out, allow only {count, plural, one {this address} other {these addresses}} in the NAS or router firewall:",
+      "selfHosted": "Prefer not to open the NAS to the internet? A self-hosted AnythingMCP inside your network reaches it directly.",
+      "useWebdav": "Switch to WebDAV"
     }
   },
   "fileShare": {
@@ -3467,6 +3836,412 @@
       "download": "Download",
       "preparing": "Preparing…",
       "warning": "Only open files from people you trust. AnythingMCP does not check files for viruses."
+    }
+  },
+  "networkNote": {
+    "title": "Server only accepts approved IP addresses?",
+    "body": "AnythingMCP calls the API from {count, plural, one {this address} other {these addresses}}. If the server or account only accepts approved IPs (a firewall, an IP allowlist), add {count, plural, one {it} other {them}} there; otherwise there is nothing to do.",
+    "requiredTitle": "Register the IP address",
+    "requiredBody": "{name} only accepts calls from IP addresses registered with it. Register {count, plural, one {this address} other {these addresses}} in your {name} account before you start, or every call is refused.",
+    "requiredNoIps": "{name} only accepts calls from IP addresses registered with it. Register the public IP address of the server AnythingMCP runs on (your network admin knows it) before you start, or every call is refused.",
+    "proxy": "Leave the \"Proxy\" option off on the tools of a server with an allowlist: proxied calls leave from changing addresses.",
+    "copy": "Copy",
+    "copied": "Copied"
+  },
+  "licenseWall": {
+    "title": "Keep your AI connected to your apps",
+    "body": "Your 7-day trial has ended. Subscribe and {client} keeps working with your connectors. Everything you set up is kept.",
+    "yourAi": "your AI",
+    "loading": "Loading your plans…",
+    "trust": {
+      "cancel": "Cancel any time",
+      "stripe": "Secure payment by Stripe",
+      "hosted": "Hosted in Frankfurt",
+      "gdpr": "GDPR · DPA"
+    },
+    "workspaces": "{count} workspaces on AnythingMCP Cloud",
+    "directory": "Listed in the Claude Directory",
+    "directoryChatgpt": "Listed in the ChatGPT Plugin Directory",
+    "directoryBoth": "Listed in the Claude and ChatGPT directories",
+    "workspaceLabel": "Workspace:",
+    "reasons": {
+      "paymentFailed": {
+        "title": "Your payment didn’t go through",
+        "bodyAdmin": "Your last payment didn’t go through, so your subscription is on hold. Update your payment method and it resumes right away: the open payment is taken as soon as the new one is saved. Your connectors and configurations are preserved.",
+        "bodyMember": "The last payment for this workspace’s subscription didn’t go through, so the subscription is on hold. Ask a workspace admin to update the payment method. Your connectors and configurations are preserved."
+      },
+      "noLicense": {
+        "title": "License Required",
+        "body": "This workspace doesn’t have an active license. Start a trial or purchase a plan to continue."
+      },
+      "trialEnded": {
+        "title": "Your Trial Has Expired",
+        "body": "Your 7-day trial period has ended. Purchase a license to continue using AnythingMCP Cloud. Your connectors and configurations are preserved."
+      },
+      "lapsed": {
+        "title": "Your Subscription Is Not Active",
+        "body": "Your subscription is not active — usually a renewal payment that did not go through. Update your payment method in the billing portal and it resumes; buying a new plan would start a second subscription beside this one. Your connectors and configurations are preserved."
+      },
+      "expired": {
+        "title": "Your License Has Expired",
+        "body": "Your license is no longer active. Purchase or renew a license to continue using AnythingMCP. Your connectors and configurations are preserved."
+      }
+    },
+    "startTrial": {
+      "start": "Start 7-Day Free Trial",
+      "starting": "Starting…",
+      "failed": "Could not start the trial. Please try again or contact support."
+    },
+    "viewPlans": "View Plans & Purchase License",
+    "openingCheckout": "Opening checkout…",
+    "subscribeTo": "Subscribe to {plan}",
+    "comparePlans": "Compare plans",
+    "opening": "Opening…",
+    "payment": {
+      "update": "Update payment method",
+      "updated": "I’ve updated my payment method",
+      "checking": "Checking…",
+      "openFailed": "Could not open the payment page. Please try again or contact support.",
+      "notYet": "The payment has not come through yet. If you just updated your payment method, try again in a minute.",
+      "checkFailed": "Could not check right now. Please try again in a minute."
+    },
+    "updateBilling": "Update Billing",
+    "switchWorkspace": "Switch to another workspace",
+    "alreadyPurchased": "Already purchased?",
+    "enterKey": "Enter your license key",
+    "notContinuing": "Not continuing?",
+    "deleteAccount": "Delete your account"
+  },
+  "planFit": {
+    "title": "What changes with {plan}",
+    "fits": "Everything you use today fits {plan}.",
+    "chooseTeam": "Choose Team instead",
+    "showDetails": "See which ones",
+    "hideDetails": "Hide",
+    "keep": "Stay active",
+    "pause": "Paused",
+    "groups": {
+      "connectors": "Connectors",
+      "mcpServers": "MCP servers",
+      "fileSearch": "File Search folders"
+    },
+    "unnamed": "Unnamed",
+    "lines": {
+      "connectors": "{paused} of {total} connectors paused (least used). You choose which.",
+      "mcpServers": "{paused} of {total} MCP servers paused (least used).",
+      "mcpServersChoose": "{paused} of {total} MCP servers paused (least used). You choose which.",
+      "users": "{max, plural, one {# user} other {# users}} included, you have {current}. Nobody loses access.",
+      "fileSearch": "File Search: up to {maxFolders, plural, one {# folder} other {# folders}} and {maxFiles, number} files.",
+      "fileSearchStorage": "File Search: up to {maxSize} of storage.",
+      "codeTools": "{max} saved code tools (you have {current}).",
+      "inline": "No inline code (code_execute)."
+    }
+  },
+  "planSwap": {
+    "badge": "Paused: plan limit",
+    "activate": "Activate",
+    "title": {
+      "connectors": "Your plan includes {max, plural, one {# active connector} other {# active connectors}}",
+      "mcpServers": "Your plan includes {max, plural, one {# active MCP server} other {# active MCP servers}}",
+      "fileSearchConnectors": "Your plan includes {max, plural, one {# File Search folder} other {# File Search folders}}"
+    },
+    "body": "Pause one to activate {name}.",
+    "bodyCreate": "Pause one to add a new one, or upgrade.",
+    "listLabel": "Active now, most used first",
+    "listLabelPlain": "Active now",
+    "calls": "{count, plural, =0 {no calls in 30 days} one {# call in 30 days} other {# calls in 30 days}}",
+    "pauseAndActivate": "Pause and activate",
+    "pauseOnly": "Pause",
+    "working": "Switching…",
+    "cancel": "Cancel",
+    "upgradeTeam": "Upgrade to Team",
+    "askEnterprise": "Ask about Enterprise",
+    "loading": "Loading…",
+    "empty": "Nothing active to pause.",
+    "error": "Could not switch: {message}",
+    "pausedDone": "{name} is paused. You can add the new one now.",
+    "notice": {
+      "connectors": "Your plan includes {max, plural, one {# active connector} other {# active connectors}}. Pause one or upgrade.",
+      "mcpServers": "Your plan includes {max, plural, one {# active MCP server} other {# active MCP servers}}. Pause one or upgrade.",
+      "fileSearchConnectors": "Your plan includes {max, plural, one {# File Search folder} other {# File Search folders}}. Pause one or upgrade.",
+      "users": "Your plan includes {max, plural, one {# user} other {# users}}. Upgrade to invite more."
+    },
+    "pauseOne": "Pause one"
+  },
+  "planUsage": {
+    "title": "Usage on {plan}",
+    "titleTrial": "Usage in your trial (Team limits)",
+    "connectors": "Connectors",
+    "mcpServers": "MCP servers",
+    "users": "Users",
+    "fileSearchFolders": "File Search folders",
+    "fileSearchFiles": "File Search files",
+    "fileSearchStorage": "File Search storage",
+    "codeTools": "Saved code tools",
+    "codeRuns": "Code runs this month",
+    "inlineCode": "Inline code",
+    "included": "Included",
+    "notIncluded": "Not included",
+    "inUseNotIncluded": "In use, not included",
+    "unlimited": "{current} · no limit",
+    "paused": "{count} paused by your plan",
+    "starterTitle": "On Starter",
+    "seeStarter": "See what changes with Starter",
+    "hideStarter": "Hide"
+  },
+  "activeSubscription": {
+    "title": "Cancel the subscription first",
+    "body": "This workspace still has a subscription, and deleting the workspace does not cancel it: you would go on being charged. Cancel it first, then come back and delete.",
+    "cancelButton": "Cancel subscription",
+    "opening": "Opening…",
+    "after": "You will return here once it is cancelled.",
+    "openFailed": "Could not open the cancellation page.",
+    "licensePage": "Open Settings → License"
+  },
+  "planPicker": {
+    "periodLabel": "Billing period",
+    "planLabel": "Plan",
+    "monthly": "Monthly",
+    "yearly": "Yearly",
+    "twoMonthsFree": "2 months free",
+    "mostPopular": "Most popular",
+    "summary": "{connectors} connectors · {mcpServers} MCP servers · {users, plural, one {# user} other {up to # users}}",
+    "price": "{amount}/{period, select, yearly {year} other {month}}",
+    "priceLocal": "≈ {amount}/{period, select, yearly {year} other {month}}",
+    "exactly": "{price} exactly",
+    "yearlyPerMonth": "≈ {amount}/month",
+    "outgrown": "This workspace has {items}",
+    "usage": {
+      "connectors": "{count, plural, one {# connector} other {# connectors}}",
+      "mcpServers": "{count, plural, one {# MCP server} other {# MCP servers}}",
+      "users": "{count, plural, one {# user} other {# users}}"
+    },
+    "footer": {
+      "vat": "Prices in EUR, VAT included.",
+      "noVat": "Prices in EUR.",
+      "local": "Prices in EUR, paid in {currency} at checkout.",
+      "localVat": "Prices in EUR, paid in {currency} at checkout, VAT included."
+    },
+    "enterpriseQuestion": "More users, single sign-on or SCIM?",
+    "pastTeam": "This workspace goes past Team.",
+    "enterpriseLink": "Ask about Enterprise",
+    "listSeparator": ", "
+  },
+  "cardCheckout": {
+    "failed": "We could not open the checkout. Please try again in a moment."
+  },
+  "trialBanner": {
+    "today": "Your trial expires today.",
+    "tomorrow": "Your trial expires tomorrow.",
+    "daysLeft": "Trial: {days} days left.",
+    "includesTeam": "Your trial includes everything in Team.",
+    "aboveStarter": {
+      "link": "Above Starter: see what changes",
+      "title": "Your workspace is above Starter",
+      "body": "Your trial includes everything in Team. If you choose Starter, this changes when the trial ends. Team keeps everything as it is.",
+      "close": "Close"
+    },
+    "choosePlan": "Choose a plan",
+    "openingCheckout": "Opening checkout…",
+    "addPaymentBefore": "Add a payment method: no charge before {date}",
+    "addPayment": "Add a payment method",
+    "upgrade": "Upgrade now"
+  },
+  "learning": {
+    "title": "Learning projects",
+    "intro": "A learning project keeps what one colleague teaches the AI on one MCP server: their corrections and explanations become skills for everyone. Nothing is kept before they accept, and they can stop at any time.",
+    "loading": "Loading…",
+    "loadFailed": "Could not load the learning projects",
+    "allowance": {
+      "unlimited": "Your plan includes learning projects without a limit.",
+      "some": "{used} of {max} learning projects in use."
+    },
+    "upsell": {
+      "cloudTitle": "Learning projects are part of the Team and Enterprise plans",
+      "cloudBody": "Keep what an experienced colleague teaches the AI before they leave: their corrections become skills the whole team's AI assistants use. Team includes one project, Enterprise has no limit.",
+      "cloudCta": "See plans",
+      "selfTitle": "Learning projects are part of AnythingMCP Enterprise",
+      "selfBody": "Keep what an experienced colleague teaches the AI before they leave: their corrections become skills the whole team's AI assistants use. The 30-day evaluation includes one project.",
+      "contact": "Contact us about Enterprise",
+      "key": "Enter a license key"
+    },
+    "new": {
+      "button": "New learning project",
+      "title": "New learning project",
+      "name": "Name",
+      "namePlaceholder": "e.g. Hardware for old windows",
+      "member": "Learn from",
+      "memberPlaceholder": "Choose a member",
+      "server": "On the MCP server",
+      "serverPlaceholder": "Choose an MCP server",
+      "folder": "File the skills in",
+      "noFolder": "No folder",
+      "endsAt": "Ends on (optional)",
+      "tags": "Labels (optional)",
+      "tagsHint": "Separated by commas, e.g. windows, hardware",
+      "publishMode": "Publishing",
+      "publishManual": "A person publishes each topic",
+      "publishConfirmed": "Lessons the member confirms are published",
+      "showName": "Show the member's name to everyone, not to admins only",
+      "create": "Start and ask the member",
+      "creating": "Starting…",
+      "cancel": "Cancel",
+      "created": "Started. The member accepts it under Settings → Profile; nothing is kept before that.",
+      "limitReached": "Your plan's learning projects are all in use. End or pause one to start another."
+    },
+    "status": {
+      "draft": "Waiting for the member",
+      "active": "Active",
+      "paused": "Paused",
+      "ended": "Ended",
+      "overPlan": "Not in your plan"
+    },
+    "card": {
+      "expert": "Learning from {name}",
+      "expertHidden": "Member shown to admins only",
+      "server": "on {name}",
+      "noServer": "its MCP server was deleted",
+      "lessons": "{confirmed} confirmed · {draft} to confirm",
+      "topics": "{count} topic(s)",
+      "open": "Open",
+      "ends": "ends {date}"
+    },
+    "empty": "No learning project yet.",
+    "detail": {
+      "back": "All learning projects",
+      "notFound": "Learning project not found",
+      "tabs": {
+        "topics": "Topics",
+        "lessons": "Lessons",
+        "settings": "Settings"
+      },
+      "pause": "Pause",
+      "resume": "Resume",
+      "end": "End",
+      "delete": "Delete",
+      "confirmEnd": "End this learning project? Its lessons and published skills are kept; it cannot be started again.",
+      "confirmDelete": "Delete this learning project and all its lessons? Published skills are kept.",
+      "waiting": "Waiting for {name} to accept under Settings → Profile. Nothing is kept before that.",
+      "waitingHidden": "Waiting for the member to accept under Settings → Profile. Nothing is kept before that.",
+      "overPlan": "This project is beyond the number your plan includes, so nothing is captured. End another project or upgrade the plan."
+    },
+    "topics": {
+      "empty": "No lessons yet. They appear when the member corrects the AI or explains something on this server.",
+      "when": "When:",
+      "published": "Published {date}",
+      "notPublished": "Not published",
+      "changes": "Confirmed changes to publish",
+      "counts": "{confirmed} confirmed · {draft} to confirm",
+      "preview": "Preview",
+      "hidePreview": "Hide preview",
+      "publish": "Publish",
+      "publishing": "Publishing…",
+      "publishedMsg": "Published: {count} lesson(s) are now a skill for everyone on this server.",
+      "nothing": "Nothing confirmed to publish yet.",
+      "dropped": "{count} older lesson(s) did not fit in the text and were left out.",
+      "viewSkill": "Open AI Skills",
+      "titleLabel": "Topic",
+      "titleHint": "e.g. Spare parts for old windows",
+      "whenLabel": "When to use",
+      "whenHint": "When a colleague's assistant should use this skill",
+      "folderLabel": "File the skills in",
+      "projectFolder": "The project's folder",
+      "add": "Add a topic",
+      "addHint": "Set the topics in advance: the member's assistant files lessons under them first and starts a new topic only when none fits.",
+      "added": "Topic \"{title}\" added.",
+      "edit": "Edit",
+      "save": "Save",
+      "saved": "Saved. The topic's skills follow the new name and folder.",
+      "cancel": "Cancel",
+      "inFolder": "Folder: {name}",
+      "inProjectFolder": "Folder: {name} (project)",
+      "noFolder": "No folder"
+    },
+    "lessons": {
+      "filter": {
+        "all": "All",
+        "draft": "To confirm",
+        "confirmed": "Confirmed",
+        "rejected": "Rejected"
+      },
+      "empty": "No lessons here.",
+      "kind": {
+        "rule": "Rule",
+        "fact": "Fact",
+        "correction": "Correction",
+        "example": "Example"
+      },
+      "source": {
+        "model": "reported by the AI",
+        "diff": "seen in the work",
+        "interview": "from an interview",
+        "manual": "edited by a curator"
+      },
+      "status": {
+        "draft": "To confirm",
+        "confirmed": "Confirmed",
+        "rejected": "Rejected",
+        "superseded": "Replaced"
+      },
+      "before": "Instead of:",
+      "after": "Use:",
+      "reason": "Why:",
+      "askWhy": "No reason given yet",
+      "seen": "said {count}×",
+      "confirm": "Confirm",
+      "reject": "Reject",
+      "reopen": "Reopen",
+      "edit": "Reword",
+      "save": "Save",
+      "cancel": "Cancel",
+      "more": "Show more"
+    },
+    "settings": {
+      "name": "Name",
+      "folder": "File the skills in",
+      "folderHint": "Applies to topics without a folder of their own, started from now on.",
+      "endsAt": "Ends on",
+      "tags": "Labels",
+      "publishMode": "Publishing",
+      "showName": "Show the member's name to everyone, not to admins only",
+      "save": "Save",
+      "saved": "Saved."
+    },
+    "profile": {
+      "title": "Learning projects",
+      "ask": "Your admin asks to keep what you teach the AI on the MCP server “{server}”, for the learning project “{name}”.",
+      "notice": "On the MCP server “{server}”, when you correct the AI or explain how the work is done, the AI saves that as a lesson for the learning project “{name}”. Lessons become skills your colleagues' AI assistants can use. Kept: the lessons. Not kept: the conversation itself, your work on other servers, and any figures about your work. You confirm each lesson before it is shared. Workspace admins and editors can read the lessons. You can stop at any time on this page and erase everything that was not published.",
+      "nameHidden": "Your name is shown to admins only.",
+      "nameShown": "Your name is shown with the skills learned from you.",
+      "accept": "Accept",
+      "decline": "Decline",
+      "accepted": "Accepted. Refresh the tools list of this connector in your AI client to get the learning tools.",
+      "active": "“{name}” is active on “{server}” since {date}.",
+      "paused": "“{name}” is paused by your admin.",
+      "stop": "Stop",
+      "erase": "Also erase my lessons that were not published",
+      "stopped": "Stopped.",
+      "failed": "Could not save your answer"
+    }
+  },
+  "fileUpload": {
+    "page": {
+      "loading": "Loading…",
+      "unavailable": "This upload link is not available",
+      "notFound": "This upload link does not exist.",
+      "title": "Upload a file for your AI",
+      "intro": "Your AI assistant asked for this file. Save the file from the chat, then choose it here.",
+      "limit": "Up to {size} · the link works until {time}",
+      "choose": "Choose file",
+      "drop": "or drop it here",
+      "uploading": "Uploading {name}…",
+      "done": "Uploaded. Go back to the chat and tell the AI it is uploaded.",
+      "already": "This file is already uploaded. Go back to the chat.",
+      "expired": "This link has expired or was already used. Ask the AI for a new one.",
+      "tooBig": "This file is {size}; the limit is {limit}.",
+      "failed": "The upload did not go through: {error}",
+      "network": "The upload did not go through. Check your connection and try again.",
+      "note": "The file is kept for a few hours so the AI can send it on, then deleted."
     }
   }
 }

@@ -19,7 +19,7 @@ import {
 } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { ApiTags, ApiOperation, ApiExcludeEndpoint } from '@nestjs/swagger';
-import { Throttle } from '@nestjs/throttler';
+import { SkipThrottle, Throttle } from '@nestjs/throttler';
 import { ConfigService } from '@nestjs/config';
 import type { Request, Response } from 'express';
 import { randomBytes, timingSafeEqual } from 'crypto';
@@ -121,8 +121,14 @@ export class McpOAuthCallbackController {
    * the redirect URI, and retries every one that is not answered 200. They
    * are acknowledged here and dropped: nothing reads them, and nothing in the
    * body is trusted or stored.
+   *
+   * Not rate limited: Mercado Libre sends them from a few addresses, in
+   * bursts (1,101 in one minute on 2026-11-19), and answers a 429 with more
+   * retries. The handler does no work, so the global 100-per-minute cap only
+   * multiplied the traffic.
    */
   @Post('api/mcp-oauth/callback')
+  @SkipThrottle()
   @HttpCode(200)
   @ApiExcludeEndpoint()
   acknowledgeNotification(): Record<string, never> {
@@ -134,7 +140,7 @@ export class McpOAuthCallbackController {
     summary: 'OAuth2 redirect target for connector authorization',
     description:
       'Checks the state and forwards the code to the dashboard, which completes ' +
-      'the authorization with POST /api/mcp-oauth/complete.',
+      'the authorization for the user who started it.',
   })
   async oauthCallback(
     @Query('code') rawCode: unknown,
@@ -197,9 +203,12 @@ export class McpOAuthCallbackController {
     return res.redirect(this.completePage({ state, code }));
   }
 
+  // Called by the dashboard's completion page with the code the callback
+  // forwarded; not an API to drive by hand, so it stays out of the OpenAPI doc.
   @Post('api/mcp-oauth/complete')
   @UseGuards(AuthGuard('jwt'))
   @HttpCode(200)
+  @ApiExcludeEndpoint()
   @ApiOperation({
     summary: 'Complete a connector authorization (dashboard, authenticated)',
     description:
@@ -651,6 +660,7 @@ export class McpOAuthCallbackController {
         clientAssertion: flow.clientAssertion,
         userAgent: flow.userAgent,
         resource: flow.resource,
+        ...(flow.tokenResponsePath ? { tokenResponsePath: flow.tokenResponsePath } : {}),
       });
     } catch (err: any) {
       if (flow.dynamicClient && /invalid_client|unauthorized_client/i.test(String(err?.message))) {

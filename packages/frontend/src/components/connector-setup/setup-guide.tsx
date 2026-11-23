@@ -75,6 +75,7 @@ export function GuideIntro({
   onShowForm,
   skipTo,
   onSkip,
+  onBack,
 }: {
   info: AdapterSetupInfo;
   guide: SetupGuide;
@@ -86,12 +87,23 @@ export function GuideIntro({
   /** A connector being finished: the step to jump to when the rest is done. */
   skipTo?: { index: number; title: string } | null;
   onSkip?: () => void;
+  /** Back to where the user picked this app (another app, or none for now). */
+  onBack?: () => void;
 }) {
   const t = useTranslations('setupGuide');
   const effortLabel = useEffortLabel();
   const short = info.name.split(' ')[0];
   return (
     <div className="space-y-5">
+      {onBack && (
+        <button
+          type="button"
+          onClick={onBack}
+          className="-mt-1 text-sm text-[var(--text-2)] hover:text-[var(--text)] hover:underline"
+        >
+          ← {t('intro.back')}
+        </button>
+      )}
       <div className="flex items-start gap-3">
         <ConnectorLogo icon={info.icon} name={info.name} />
         <div className="min-w-0">
@@ -329,6 +341,7 @@ export function GuideStepView({
   total,
   redirectUri,
   actionUrl,
+  onActionOpened,
   confirmed,
   onConfirm,
   children,
@@ -339,6 +352,8 @@ export function GuideStepView({
   redirectUri: string | null;
   /** The action's URL with {{VAR}} filled in; null while a value it needs is empty. */
   actionUrl: string | null;
+  /** The action's link was followed (a click, or a middle click into a new tab). */
+  onActionOpened?: () => void;
   confirmed: boolean;
   onConfirm: (v: boolean) => void;
   children?: ReactNode;
@@ -362,6 +377,10 @@ export function GuideStepView({
             href={actionUrl}
             target="_blank"
             rel="noopener noreferrer"
+            onClick={onActionOpened}
+            onAuxClick={(e) => {
+              if (e.button === 1) onActionOpened?.();
+            }}
             className={cn(buttonVariants({ variant: 'secondary', size: 'md' }), 'gap-1.5')}
           >
             {step.action.label}

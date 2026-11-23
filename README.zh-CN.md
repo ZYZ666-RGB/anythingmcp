@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/badges/banner.zh-CN.png" alt="AnythingMCP 将 Claude、ChatGPT、Copilot 和 Gemini 连接到 ERP、电子商务、REST、SOAP 和 SQL 系统以及你的文件服务器：694 个连接器，还有企业记忆、技能和文件搜索。" width="100%" />
+  <img src="https://raw.githubusercontent.com/HelpCode-ai/anythingmcp/badges/banner.zh-CN.png" alt="AnythingMCP 将 Claude、ChatGPT、Copilot 和 Gemini 连接到 ERP、电子商务、REST、SOAP 和 SQL 系统以及你的文件服务器：958 个连接器，还有企业记忆、技能和文件搜索。" width="100%" />
 </p>
 
 <h1 align="center">AnythingMCP：成为你企业大脑的开源 MCP 网关</h1>
@@ -11,6 +11,7 @@
       <img src="https://api.star-history.com/badge?repo=HelpCode-ai/anythingmcp&type=trending" alt="GitHub Trending Repository of the Day" height="64" />
     </picture>
   </a>
+  <a href="https://www.producthunt.com/products/anythingmcp?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-anythingmcp" target="_blank" rel="noopener noreferrer"><img alt="AnythingMCP - Open-source MCP gateway and company brain | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1321607&amp;theme=light&amp;t=1795006241059"></a>
 </p>
 
 <p align="center">
@@ -20,11 +21,12 @@
 <p align="center">
   <strong>AnythingMCP 是一个开源、可自行托管的 MCP 网关，无需编写 MCP 服务器，即可将 Claude、ChatGPT、Copilot 和 Gemini 连接到你公司运行的软件以及文件服务器上的文档。</strong><br/>
   在网关之上，它还为你维护企业大脑：一张描述各系统如何关联的知识图谱、AI 技能和企业记忆，由所有 AI 客户端共享，并按每个用户的角色限制访问。<br/>
-  694 个现成连接器，提供 12,000 多个工具，涵盖 SAP、Odoo、weclapp 和 Amazon Seller 等；其中 35 个无需 API 密钥。
+  958 个现成连接器，提供 12,000 多个工具，涵盖 SAP、Odoo、weclapp 和 Amazon Seller 等；其中 51 个无需 API 密钥。
 </p>
 
 <p align="center">
   <a href="https://claude.ai/directory/anythingmcp"><img src="https://img.shields.io/badge/Claude-%E5%AE%98%E6%96%B9%E7%9B%AE%E5%BD%95%E6%94%B6%E5%BD%95-D97757?logo=claude&logoColor=white&labelColor=0b1220" alt="已收录于 Claude 官方目录"></a>
+  <a href="https://chatgpt.com/plugins/plugin_asdk_app_6ade03541ce08191b35bbad1dc5b4121"><img src="https://img.shields.io/badge/ChatGPT-%E6%8F%92%E4%BB%B6%E7%9B%AE%E5%BD%95%E6%94%B6%E5%BD%95-10A37F?logo=openai&logoColor=white&labelColor=0b1220" alt="已收录于 ChatGPT 插件目录"></a>
   <a href="https://github.com/HelpCode-ai/anythingmcp/stargazers"><img src="https://img.shields.io/github/stars/HelpCode-ai/anythingmcp?style=flat&logo=github&logoColor=white&color=2563eb&labelColor=0b1220" alt="GitHub Stars"></a>
   <a href="https://github.com/HelpCode-ai/anythingmcp/releases"><img src="https://img.shields.io/github/v/release/HelpCode-ai/anythingmcp?include_prereleases&color=2563eb&labelColor=0b1220" alt="Release"></a>
   <a href="https://github.com/HelpCode-ai/anythingmcp/blob/main/LICENSE"><img src="https://img.shields.io/badge/open%20source-AGPL--3.0-2563eb?labelColor=0b1220" alt="Open source, AGPL-3.0"></a>
@@ -36,7 +38,7 @@
 </p>
 
 <p align="center">
-  <a href="https://cloud.anythingmcp.com/login?mode=register"><strong>免费试用云版 7 天</strong></a> · <a href="https://claude.ai/directory/anythingmcp">添加到 Claude</a> · <a href="#run-it-yourself">自己运行</a> · <a href="docs/guides.md">文档</a> · <a href="https://anythingmcp.com/zh/guides">连接器指南</a> · <a href="https://github.com/HelpCode-ai/anythingmcp/discussions">Discussions</a>
+  <a href="https://cloud.anythingmcp.com/login?mode=register"><strong>免费试用云版 7 天</strong></a> · <a href="https://claude.ai/directory/anythingmcp">添加到 Claude</a> · <a href="https://chatgpt.com/plugins/plugin_asdk_app_6ade03541ce08191b35bbad1dc5b4121">添加到 ChatGPT</a> · <a href="#run-it-yourself">自己运行</a> · <a href="docs/guides.md">文档</a> · <a href="https://anythingmcp.com/zh/guides">连接器指南</a> · <a href="https://github.com/HelpCode-ai/anythingmcp/discussions">Discussions</a>
 </p>
 
 **在 Claude 中提一个问题，答案来自 Etsy、SAP 和一个物流 API。**
@@ -53,7 +55,7 @@ https://github.com/user-attachments/assets/cc8c9ef3-11cf-4eab-aa4d-98472dc554b3
 
 | | 作用 | 版本 |
 |---|---|---|
-| **所有系统，一个端点** | 692 个目录连接器，或你自己的 REST/OpenAPI、SOAP、GraphQL、OData、SQL、IMAP/SMTP 或 MCP 数据源。工具在运行时注册。[连接器](#connect-any-api-soap-service-or-database) | 全部 |
+| **所有系统，一个端点** | 696 个目录连接器，或你自己的 REST/OpenAPI、SOAP、GraphQL、OData、SQL、IMAP/SMTP 或 MCP 数据源。工具在运行时注册。[连接器](#connect-any-api-soap-service-or-database) | 全部 |
 | **File Search（文件搜索）** | 为 SFTP、FTP/FTPS、WebDAV（Nextcloud、NAS）、S3 或网络共享建立索引：PDF 的每一页、带列名的 Excel 行、Word、PowerPoint，以及带附件的 Outlook 邮件。AI 回答时会注明文件、页码和日期。[File Search](docs/connectors/file-search.md) | Cloud；自行托管需 Enterprise |
 | **File Share（文件分享）** | 为你文件夹中的文件或 AI 生成的文件（CSV 导出、报告）创建临时下载链接，可选内部或公开，支持过期时间和撤销。[File Share](docs/connectors/file-search.md) | Cloud；自行托管需 Enterprise |
 | **企业记忆** | 在一个 AI 客户端中保存的事实和偏好，可以在任何其他客户端中再次找到：在 Claude 里说过一次，Copilot 也能用上。分为个人和公司两种范围，支持文件夹和角色限制。[记忆](docs/memory.md) | Enterprise |
@@ -138,7 +140,7 @@ docker compose up -d
 
 ## 连接器目录
 
-共 694 个适配器，提供 12,000 多个工具。每个适配器都在 [anythingmcp.com/zh/guides](https://anythingmcp.com/zh/guides) 上提供七种语言的配置指南。
+共 958 个适配器，提供 12,000 多个工具。每个适配器都在 [anythingmcp.com/zh/guides](https://anythingmcp.com/zh/guides) 上提供七种语言的配置指南。
 
 | 类别 | 示例 |
 |---|---|
@@ -250,8 +252,8 @@ docker compose up -d
 
 同一个 MCP 服务器适用于所有支持 MCP 的客户端，因此连接器只需构建一次：
 
-- **Claude。** 在 *Customize → Connectors* 中把服务器 URL 添加为**自定义连接器**，即可在 Claude.ai、Claude Desktop 和 Claude Code 中使用。开箱即支持 OAuth 2.0。使用 AnythingMCP Cloud 时，也可以从 [Claude 目录](https://claude.ai/directory/anythingmcp)一键添加。[Claude 配置](docs/integrations/claude.md)
-- **ChatGPT。** ChatGPT 中的应用基于 MCP。在 ChatGPT 的 *Plugins* 中添加服务器（*+ → Add custom MCP server*），或将其作为 Apps SDK 应用的工具层。[ChatGPT 配置](docs/integrations/chatgpt.md)
+- **Claude。** 在 **Plugins**（部分套餐中仍为 **Customize**）→ **Connectors** 中把服务器 URL 添加为**自定义连接器**，即可在 Claude.ai、Claude Desktop 和 Claude Code 中使用。开箱即支持 OAuth 2.0。使用 AnythingMCP Cloud 时，也可以从 [Claude 目录](https://claude.ai/directory/anythingmcp)一键添加。[Claude 配置](docs/integrations/claude.md)
+- **ChatGPT。** ChatGPT 中的应用基于 MCP。在 ChatGPT 的 *Plugins* 中添加服务器（*Add → Add custom MCP server*），或将其作为 Apps SDK 应用的工具层。[ChatGPT 配置](docs/integrations/chatgpt.md)
 - **Meta Muse。** 在 Muse 中打开 *Settings → Connectors → Add custom connector*，粘贴服务器 URL，然后登录 AnythingMCP。[Muse 配置](docs/integrations/muse.md)
 - **Copilot、Gemini、Cursor** 及其他 MCP 客户端：[客户端配置指南](docs/guides.md)。
 

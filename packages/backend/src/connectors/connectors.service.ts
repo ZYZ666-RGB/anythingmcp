@@ -1,3 +1,4 @@
+import { withCatalogUserAgent } from './catalog-user-agent.util';
 import {
   BadRequestException,
   ConflictException,
@@ -5,18 +6,24 @@ import {
   InternalServerErrorException,
   Logger,
   NotFoundException,
+  OnApplicationBootstrap,
   Optional,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../common/prisma.service';
 import { Connector, ConnectorType, AuthType } from '../generated/prisma/client';
+import type { Prisma } from '../generated/prisma/client';
 import { RestEngine } from './engines/rest.engine';
+import { isLoginRequestError } from './engines/login-token.service';
 import { attachResponseMeta } from './engines/response-headers.util';
 import { SoapEngine, WsdlReadError } from './engines/soap.engine';
 import { wsdlUrlForLog } from './parsers/wsdl.parser';
 import { connectorSecretValues } from './connector-secrets.util';
+import { moveUrlCredentials, urlUserinfo } from './database-url-credentials.util';
+import { BASE_URL_SECRET_RULES, baseUrlSecrets } from './base-url-secrets.util';
+import { SECRET_GUARDED_TYPES, SecretExtractor } from './secret-extraction.util';
 import { GraphqlEngine } from './engines/graphql.engine';
-import { DatabaseEngine } from './engines/database.engine';
+import { DatabaseEngine, assertSafeSqlIdentifierVars } from './engines/database.engine';
 import { McpClientEngine } from './engines/mcp-client.engine';
 import { UserCredentialError, UserCredentialsService } from './user-credentials.service';
 import { withoutUserTokens } from './user-credential.util';
@@ -25,6 +32,7 @@ import { FilesWorkerClient } from '../file-search/files-worker.client';
 import { localRootsFromEnv, parseFileSearchConfig, pickSecrets } from '../file-search/file-search-config';
 import { openEnvVarsStrict, sealEnvVars } from '../common/crypto/env-vars-at-rest';
 import { getRequiredSecret } from '../common/secrets.util';
+import { CASCADE_DELETE_TRANSACTION } from '../common/cascade-delete-transaction';
 import { describeInvalidHeaderNames, invalidConnectorHeaderNames } from '../common/http-header-name.util';
 import {
   interpolateConnectorConfig,
@@ -36,8 +44,9 @@ import { assertAbsoluteBaseUrl } from '../common/base-url-variable.util';
 import { extractSsrfBlockedHostname } from '../common/ssrf.util';
 import { connectorPageUrl, normalizeConnectorBaseUrl } from '../common/url.util';
 import { resolveAdapterIcon } from './connector-icon.util';
-import { envVarsForMcpTool, mcpPathOf } from './mcp-connector-config.util';
-import { applySchemaDefaults } from '../common/schema-defaults.util';
+import { envVarsForMcpTool, mcpPathOf, resolveMcpFixedArguments } from './mcp-connector-config.util';
+import { applyEnvDefaults, applySchemaDefaults } from '../common/schema-defaults.util';
+import { missingRequiredDefault } from '../mcp-server/required-env-defaults';
 import { renderStaticResponse } from './static-response.util';
 import { ODataEngine, isODataBuiltinMethod } from './engines/odata.engine';
 import { EmailEngine } from './engines/email.engine';
@@ -45,8 +54,9 @@ import { EmailConnectorError } from './email/email-settings';
 import { OAuth2TokenService } from './engines/oauth2-token.service';
 import { ConnectorAuthStatusService, authCredentialRef } from './engines/connector-auth-status.service';
 import { BearerTokenRenewalService, withTokenRenewal } from './engines/bearer-token-renewal.service';
-import { connectorErrorWhen } from './error-when.util';
+import { connectorErrorWhen, connectorLargeIntegers } from './error-when.util';
 import { ResponseBodyError } from './engines/response-error.util';
+import { metaLoginFlavourOfSlug } from './engines/meta-login.util';
 
 /** Whether a URL has a query string (`?singleWsdl`), so `?wsdl` cannot simply be added. */
 function hasQueryString(url: string): boolean {
@@ -57,8 +67,32 @@ function hasQueryString(url: string): boolean {
   }
 }
 
+/**
+ * What a log line may say about a failed write: the error's code or class,
+ * never its message. A Prisma message can quote the arguments of the call,
+ * and here those include a connection string.
+ */
+function errorKind(err: unknown): string {
+  const { code, name } = (err ?? {}) as { code?: unknown; name?: unknown };
+  if (typeof code === 'string' && code) return code;
+  return typeof name === 'string' && name ? name : 'Error';
+}
+
+/** A catalog connector's install-time base URL (`config.baseUrlBaseline`), or null. */
+function baselineOf(config: unknown): string | null {
+  const value = (config as { baseUrlBaseline?: unknown } | null | undefined)?.baseUrlBaseline;
+  return typeof value === 'string' ? value : null;
+}
+
+/** Connector ids for a log line: the first few, then how many more. */
+function idsForLog(ids: string[], max = 20): string {
+  if (ids.length === 0) return '';
+  const more = ids.length > max ? `, and ${ids.length - max} more` : '';
+  return ` (${ids.slice(0, max).join(', ')}${more})`;
+}
+
 @Injectable()
-export class ConnectorsService {
+export class ConnectorsService implements OnApplicationBootstrap {
   private readonly logger = new Logger(ConnectorsService.name);
   private readonly encryptionKey: string;
 
@@ -84,6 +118,19 @@ export class ConnectorsService {
     );
   }
 
+  onApplicationBootstrap() {
+    // Not awaited, so a large table never holds up the start. The pass
+    // catches its own errors; the catch here is for anything it did not
+    // foresee, so that nothing it does can stop the boot. The base URL pass
+    // runs after the database one, so the two never read the table at once.
+    void this.repairDatabaseUrlCredentials()
+      .catch((err) =>
+        this.logger.error(`Database connection strings not checked: ${errorKind(err)}`),
+      )
+      .then(() => this.repairBaseUrlSecrets())
+      .catch((err) => this.logger.error(`Base URL secrets not checked: ${errorKind(err)}`));
+  }
+
   async findAll(): Promise<Connector[]> {
     return this.prisma.connector.findMany({
       include: { tools: true },
@@ -105,6 +152,28 @@ export class ConnectorsService {
   ): Promise<Array<Connector & { icon: string | null }>> {
     const rows = await this.prisma.connector.findMany({
       where: { organizationId },
+      include: { tools: true },
+      orderBy: { createdAt: 'desc' },
+      ...(opts?.limit !== undefined ? { take: opts.limit } : {}),
+      ...(opts?.offset !== undefined ? { skip: opts.offset } : {}),
+    });
+    return rows.map((c) => ({ ...c, icon: resolveAdapterIcon(c) }));
+  }
+
+  /**
+   * `findByOrg` narrowed by an extra `where` (member visibility, see
+   * settings/member-visibility.service.ts `connectorWhere`). The filter is
+   * added to the workspace filter with AND, in the query, so `limit` and
+   * `offset` page over visible connectors only. Each row keeps all its tools;
+   * the caller filters them.
+   */
+  async findVisibleByOrg(
+    organizationId: string,
+    visibility: Prisma.ConnectorWhereInput,
+    opts?: { limit?: number; offset?: number },
+  ): Promise<Array<Connector & { icon: string | null }>> {
+    const rows = await this.prisma.connector.findMany({
+      where: { AND: [{ organizationId }, visibility] },
       include: { tools: true },
       orderBy: { createdAt: 'desc' },
       ...(opts?.limit !== undefined ? { take: opts.limit } : {}),
@@ -155,6 +224,11 @@ export class ConnectorsService {
     },
   ): Promise<Connector> {
     assertValidHeaderNames(data.headers, data.authConfig);
+    // A password typed into a connection string goes to the encrypted
+    // authConfig; the engine splices it back in at call time.
+    const moved =
+      data.type === 'DATABASE' ? moveUrlCredentials(data.baseUrl, data.authConfig) : null;
+    if (moved) data = { ...data, baseUrl: moved.baseUrl, authConfig: moved.authConfig };
     const encryptedAuth = data.authConfig
       ? encrypt(JSON.stringify(data.authConfig), this.encryptionKey)
       : null;
@@ -211,8 +285,37 @@ export class ConnectorsService {
       webhookSecret: string;
     }>,
   ): Promise<Connector> {
-    const existing = await this.findById(id);
+    // Only the type (base URL normalisation), the stored credential (auth
+    // status below) and the stored base URL (DATABASE credentials) are
+    // needed: loading every tool, resource and prompt here made each save as
+    // heavy as the connector was large.
+    const existing = await this.prisma.connector.findUnique({
+      where: { id },
+      select: { type: true, authConfig: true, baseUrl: true },
+    });
+    if (!existing) {
+      throw new NotFoundException(`Connector ${id} not found`);
+    }
     assertValidHeaderNames(data.headers, data.authConfig);
+
+    if (existing.type === 'DATABASE' && data.baseUrl !== undefined) {
+      let authConfig = data.authConfig ?? this.readAuthConfig(existing.authConfig);
+      // Credentials retyped into the URL replace the ones in authConfig, as
+      // the URL is where the database form asks for them (the Basic Auth
+      // fields send authConfig themselves). An unchanged userinfo keeps the
+      // rule that credentials already in authConfig are left alone.
+      const typed = urlUserinfo(data.baseUrl);
+      const retyped = !data.authConfig && typed !== urlUserinfo(existing.baseUrl);
+      if (retyped) {
+        const { username: _username, password: _password, ...rest } = authConfig;
+        authConfig = rest;
+      }
+      const moved = moveUrlCredentials(data.baseUrl, authConfig);
+      if (moved) data = { ...data, baseUrl: moved.baseUrl, authConfig: moved.authConfig };
+      // Not movable (no password, or {{VAR}} references) but typed with a
+      // username: the URL's credentials are the ones to use from now on.
+      else if (retyped && typed !== '' && !typed.startsWith(':')) data = { ...data, authConfig };
+    }
 
     const updateData: any = { ...data };
     if (data.authConfig) {
@@ -262,6 +365,232 @@ export class ConnectorsService {
   }
 
   /**
+   * Move the credentials still written in stored DATABASE connection strings
+   * into the encrypted `auth_config`, as `create` and `update` do for a
+   * connector saved today. Connectors saved before those did it kept
+   * `user:password@` in the plaintext `base_url` until someone opened Edit
+   * and saved; this does it for them at boot.
+   *
+   * - Same rule as a save: `moveUrlCredentials` decides, and what it declines
+   *   (credentials already in authConfig, a string `new URL` cannot parse
+   *   such as ADO.NET or multi-host MongoDB, `{{VAR}}` references, no
+   *   password) stays exactly as stored and is counted as left as is. Such a
+   *   password is still masked on read (`toPublicConnector`).
+   * - The credential does not change, only where it is stored, so the token
+   *   caches and the auth status that `update` resets are not touched.
+   * - Instance-level maintenance, like `reconcileEnvVarsAtRest`: one query
+   *   over every workspace's connectors, outside `tenantTx`. Each row is then
+   *   written by id, and only if its URL and authConfig are still what was
+   *   read, so a save in between, or a second instance running the same
+   *   pass, wins. A second run finds nothing to move.
+   * - An authConfig that cannot be decrypted is never overwritten.
+   * - Never throws. Logs connector ids and counts only: no connection
+   *   string, user name, password or error message.
+   */
+  async repairDatabaseUrlCredentials(): Promise<{
+    moved: string[];
+    leftAsIs: string[];
+    failed: string[];
+  }> {
+    const moved: string[] = [];
+    const leftAsIs: string[] = [];
+    const failed: string[] = [];
+    let rows: Array<{ id: string; baseUrl: string; authConfig: string | null }>;
+    try {
+      // Userinfo needs an `@`: the rows without one, nearly all of them, are
+      // filtered out by the database.
+      rows = await this.prisma.connector.findMany({
+        where: { type: 'DATABASE', baseUrl: { contains: '@' } },
+        select: { id: true, baseUrl: true, authConfig: true },
+        orderBy: { id: 'asc' },
+      });
+    } catch (err) {
+      this.logger.error(`Database connection strings not checked: ${errorKind(err)}`);
+      return { moved, leftAsIs, failed };
+    }
+
+    for (const row of rows) {
+      let authConfig: Record<string, unknown>;
+      try {
+        authConfig = row.authConfig
+          ? (JSON.parse(decrypt(row.authConfig, this.encryptionKey)) as Record<string, unknown>)
+          : {};
+        if (!authConfig || typeof authConfig !== 'object' || Array.isArray(authConfig)) {
+          throw new Error('not an object');
+        }
+      } catch {
+        failed.push(row.id);
+        this.logger.warn(
+          `Connector ${row.id}: the stored auth config could not be read (wrong ENCRYPTION_KEY?), its connection string is left as is`,
+        );
+        continue;
+      }
+      try {
+        const next = moveUrlCredentials(row.baseUrl, authConfig);
+        if (!next) {
+          leftAsIs.push(row.id);
+          continue;
+        }
+        const { count } = await this.prisma.connector.updateMany({
+          where: { id: row.id, baseUrl: row.baseUrl, authConfig: row.authConfig },
+          data: {
+            baseUrl: normalizeConnectorBaseUrl(next.baseUrl, 'DATABASE'),
+            // Stored as `create` and `update` store it: the JSON, encrypted.
+            authConfig: encrypt(JSON.stringify(next.authConfig), this.encryptionKey),
+          },
+        });
+        // No row: it was saved, or repaired by another instance, in between.
+        (count > 0 ? moved : leftAsIs).push(row.id);
+      } catch (err) {
+        failed.push(row.id);
+        this.logger.warn(
+          `Connector ${row.id}: moving the connection string credentials failed (${errorKind(err)}), the connector is left as is`,
+        );
+      }
+    }
+
+    const summary =
+      `Database connection strings: credentials of ${moved.length} connector${moved.length === 1 ? '' : 's'} ` +
+      `moved into the encrypted auth config${idsForLog(moved)}; ` +
+      `${leftAsIs.length} left as is${idsForLog(leftAsIs)}; ` +
+      `${failed.length} failed${idsForLog(failed)}`;
+    if (failed.length > 0) this.logger.warn(summary);
+    else this.logger.log(summary);
+    return { moved, leftAsIs, failed };
+  }
+
+  /**
+   * Move the secrets still written in stored HTTP base URLs (a Bitrix24,
+   * Slack, Discord, Teams, Zapier or Make webhook token, a Telegram bot
+   * token, a `?api_key=` value, `user:password@`) into the connector's
+   * encrypted variables, leaving `{{VAR}}` in the URL. A save has done this
+   * since the extraction existed (SecretExtractor), and for webhook URLs and
+   * userinfo since its rules learned them; connectors stored before kept the
+   * secret in the plaintext `base_url` until someone saved them. This does
+   * it for them at boot, like `repairDatabaseUrlCredentials`.
+   *
+   * - The rules are a save's, minus the long-random-token heuristic
+   *   (base-url-secrets.util.ts): nobody sees a notice for what this pass
+   *   moves, so it only moves shapes that are certain. Only the secret
+   *   segment moves; host and path stay readable. `config.baseUrlBaseline`
+   *   (catalog connectors) holds the same URL and gets the same variable.
+   * - Calls are unchanged: `{{VAR}}` in a base URL is replaced verbatim from
+   *   the variables on every call (env-interpolation.util.ts), so the URL
+   *   sent is byte for byte the one stored before. A variable that already
+   *   holds the value is reused.
+   * - Variables are read as stored and decrypted strictly: a row whose
+   *   variables cannot be decrypted is never written (its secret stays, and
+   *   stays masked on read).
+   * - Instance-level maintenance, outside `tenantTx`, like the database
+   *   pass. Each row is written by id, and only if its base URL and
+   *   `updatedAt` are still what was read, so a save in between, or a
+   *   second instance running the same pass, wins. A second run finds
+   *   nothing to move.
+   * - Never throws. Logs connector ids and counts only: no URL, variable
+   *   value or error message.
+   */
+  async repairBaseUrlSecrets(): Promise<{
+    moved: string[];
+    leftAsIs: string[];
+    failed: string[];
+  }> {
+    const moved: string[] = [];
+    const leftAsIs: string[] = [];
+    const failed: string[] = [];
+    type Row = {
+      id: string;
+      name: string;
+      type: string;
+      baseUrl: string;
+      config: unknown;
+      updatedAt: Date;
+    };
+    let candidates: Row[];
+    let storedEnv: Map<string, unknown>;
+    try {
+      const rows: Row[] = await this.prisma.connector.findMany({
+        where: { type: { in: [...SECRET_GUARDED_TYPES] as ConnectorType[] } },
+        select: { id: true, name: true, type: true, baseUrl: true, config: true, updatedAt: true },
+        orderBy: { id: 'asc' },
+      });
+      candidates = rows.filter(
+        (r) => baseUrlSecrets(r.baseUrl).length > 0 || baseUrlSecrets(baselineOf(r.config)).length > 0,
+      );
+      storedEnv = new Map();
+      if (candidates.length > 0) {
+        // Raw on purpose: what is stored, before the at-rest extension, so
+        // that "cannot be decrypted" is told apart from "no variables".
+        const ids = candidates.map((r) => r.id);
+        const envRows = await this.prisma.$queryRaw<Array<{ id: string; env_vars: unknown }>>`
+          SELECT id, env_vars FROM connectors WHERE id = ANY(${ids})`;
+        for (const r of envRows) storedEnv.set(r.id, r.env_vars);
+      }
+    } catch (err) {
+      this.logger.error(`Base URL secrets not checked: ${errorKind(err)}`);
+      return { moved, leftAsIs, failed };
+    }
+
+    for (const row of candidates) {
+      const env = openEnvVarsStrict(storedEnv.get(row.id));
+      if (env === null) {
+        failed.push(row.id);
+        this.logger.warn(
+          `Connector ${row.id}: its variables could not be read (wrong ENCRYPTION_KEY?), the secret in its base URL is left as is`,
+        );
+        continue;
+      }
+      try {
+        const strings = Object.fromEntries(
+          Object.entries(env).filter(([, v]) => typeof v === 'string'),
+        ) as Record<string, string>;
+        const secrets = new SecretExtractor(row.name, strings);
+        const baseUrl = secrets.extractUrl(row.baseUrl, 'baseUrl', BASE_URL_SECRET_RULES);
+        const baseline = baselineOf(row.config);
+        const cleanedBaseline =
+          baseline === null
+            ? null
+            : secrets.extractUrl(baseline, 'config.baseUrlBaseline', BASE_URL_SECRET_RULES);
+        if (baseUrl === row.baseUrl && cleanedBaseline === baseline) {
+          leftAsIs.push(row.id);
+          continue;
+        }
+        const data: Prisma.ConnectorUpdateManyMutationInput = { baseUrl };
+        if (Object.keys(secrets.newEnvVars).length > 0) {
+          // Every stored key is kept, non-string values included; the
+          // extension encrypts the whole object on write.
+          data.envVars = { ...env, ...secrets.newEnvVars } as Prisma.InputJsonValue;
+        }
+        if (cleanedBaseline !== baseline) {
+          data.config = {
+            ...(row.config as Record<string, unknown>),
+            baseUrlBaseline: cleanedBaseline,
+          } as Prisma.InputJsonValue;
+        }
+        const { count } = await this.prisma.connector.updateMany({
+          where: { id: row.id, baseUrl: row.baseUrl, updatedAt: row.updatedAt },
+          data,
+        });
+        // No row: it was saved, or repaired by another instance, in between.
+        (count > 0 ? moved : leftAsIs).push(row.id);
+      } catch (err) {
+        failed.push(row.id);
+        this.logger.warn(
+          `Connector ${row.id}: moving the secret in its base URL failed (${errorKind(err)}), the connector is left as is`,
+        );
+      }
+    }
+
+    const summary =
+      `Base URL secrets: secrets of ${moved.length} connector${moved.length === 1 ? '' : 's'} ` +
+      `moved into encrypted variables${idsForLog(moved)}; ` +
+      `${leftAsIs.length} left as is${idsForLog(leftAsIs)}; ` +
+      `${failed.length} failed${idsForLog(failed)}`;
+    if (failed.length > 0) this.logger.warn(summary);
+    else this.logger.log(summary);
+    return { moved, leftAsIs, failed };
+  }
+
+  /**
    * Merges `patch` into the connector's existing (decrypted) authConfig and
    * re-encrypts it, instead of replacing the whole object. Used by the OAuth
    * callback so storing the freshly-issued tokens does not drop static config
@@ -288,6 +617,21 @@ export class ConnectorsService {
     // old ones, or the error the old refresh token got, no longer applies.
     this.oauth2TokenService?.forget(id);
     await this.authStatus?.clear(id, { exceptRef: authCredentialRef(merged) });
+    return updated;
+  }
+
+  /**
+   * Store a complete authConfig the caller already merged (the Login → Token
+   * settings, where a merge also removes fields). Clears a recorded
+   * credential refusal that no longer applies, as updateAuthConfigMerge does.
+   */
+  async replaceAuthConfig(id: string, authConfig: Record<string, unknown>): Promise<Connector> {
+    await this.findByIdInternal(id);
+    const updated = await this.prisma.connector.update({
+      where: { id },
+      data: { authConfig: encrypt(JSON.stringify(authConfig), this.encryptionKey) },
+    });
+    await this.authStatus?.clear(id, { exceptRef: authCredentialRef(authConfig) });
     return updated;
   }
 
@@ -368,7 +712,23 @@ export class ConnectorsService {
   }
 
   async remove(id: string): Promise<void> {
-    await this.findById(id);
+    const connector = await this.findById(id);
+    const slug = (connector.config as { adapterSlug?: unknown } | null)?.adapterSlug;
+    if (metaLoginFlavourOfSlug(slug)) {
+      // Meta Platform Terms: Instagram data goes when the user deletes the
+      // connector. Its tool-call log rows (with tool outputs) would cascade
+      // with its tools anyway; delete them explicitly, in the same
+      // transaction, so that keeps holding if the relation ever changes.
+      // A busy connector has many log rows and its delete cascades further,
+      // which can take longer than Prisma's default 5 s transaction timeout.
+      await this.prisma.$transaction([
+        this.prisma.toolInvocation.deleteMany({
+          where: { connectorId: id, organizationId: connector.organizationId },
+        }),
+        this.prisma.connector.delete({ where: { id } }),
+      ], CASCADE_DELETE_TRANSACTION);
+      return;
+    }
     await this.prisma.connector.delete({ where: { id } });
   }
 
@@ -458,9 +818,9 @@ export class ConnectorsService {
       }
       const authConfig = withTokenRenewal(connector.authType, storedAuth, connector.config, envVars);
       const baseUrl = interpolateDeep(connector.baseUrl, envVars);
-      const headers = interpolateDeep(
-        (connector.headers as Record<string, string>) || undefined,
-        envVars,
+      const headers = withCatalogUserAgent(
+        interpolateDeep((connector.headers as Record<string, string>) || undefined, envVars),
+        connector.config,
       );
       // Masked in the engines' log lines.
       const logSecrets = connectorSecretValues(connector);
@@ -501,6 +861,7 @@ export class ConnectorsService {
               // spent one, and its next refresh was refused as revoked.
               connectorId: credentialKey,
               errorWhen: connectorErrorWhen(connector.config),
+              largeIntegers: connectorLargeIntegers(connector.config),
               logSecrets,
             },
             { method: 'GET', path },
@@ -523,8 +884,10 @@ export class ConnectorsService {
           );
           break;
         case 'DATABASE':
+          // The interpolated URL, as on a tool call: a connection string
+          // written with {{VAR}} tests the way it runs.
           await this.databaseEngine.testConnection({
-            baseUrl: connector.baseUrl,
+            baseUrl,
             authType: connector.authType,
             authConfig,
           });
@@ -782,13 +1145,33 @@ export class ConnectorsService {
 
     // HTTP responses (axios)
     const status: number | undefined = error?.response?.status;
+    // The Login → Token login failed: the healthcheck was never sent, so the
+    // result names the login and its answer, not the healthcheck path.
+    if (isLoginRequestError(error)) {
+      const kind =
+        status === 401 || status === 403
+          ? 'auth_failed'
+          : status === 404 || status === 405
+            ? 'not_found'
+            : status === undefined && /ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|timeout|SSRF guard/i.test(String(error?.message ?? ''))
+              ? 'unreachable'
+              : 'error';
+      return {
+        ok: false,
+        kind,
+        ...(typeof status === 'number' ? { httpStatus: status } : {}),
+        message: [error.message, error.hint].filter((v) => typeof v === 'string' && v).join(' '),
+      };
+    }
     if (status === 401 || status === 403) {
       return {
         ok: false,
         kind: 'auth_failed',
         httpStatus: status,
         message:
-          'Auth handshake reached the API, but the credentials were rejected. Update authConfig and retry.',
+          'Auth handshake reached the API, but the credentials were rejected. Update authConfig and retry.' +
+          // A Login → Token header that replaced a connector header says so.
+          (typeof error?.hint === 'string' && error.hint ? ` ${error.hint}` : ''),
       };
     }
     if (status === 404) {
@@ -891,7 +1274,15 @@ export class ConnectorsService {
           Object.entries(injected).filter(([k]) => params[k] === undefined),
         ) }
       : params;
-    const mergedParams = applySchemaDefaults(parameters, withEnv);
+    // A parameter left out takes the variable the tool names for it (envDefaults).
+    const mergedParams = applySchemaDefaults(parameters, applyEnvDefaults(endpointMapping, withEnv, envVars));
+    // Refused before sending, as on a real call (DynamicMcpTools).
+    const missingDefault = missingRequiredDefault(
+      (connector.config as { adapterSlug?: string } | null | undefined)?.adapterSlug,
+      endpointMapping,
+      mergedParams,
+    );
+    if (missingDefault) throw missingDefault;
 
     // Static response tools — return text immediately without engine dispatch.
     //
@@ -935,6 +1326,15 @@ export class ConnectorsService {
       authConfig = resolved.authConfig;
       credentialKey = resolved.credentialKey;
     }
+    // Table-name variables of a DATABASE connector (config.sqlIdentifierVars)
+    // are checked before they become SQL text, exactly as DynamicMcpTools does.
+    if ((connector.type as string) === 'DATABASE') {
+      assertSafeSqlIdentifierVars(
+        (connector.config as { sqlIdentifierVars?: unknown } | null)?.sqlIdentifierVars,
+        endpointMapping.path,
+        envVars ?? {},
+      );
+    }
     const { config: resolved, endpointMapping: resolvedMapping } =
       interpolateConnectorConfig(
         {
@@ -961,6 +1361,17 @@ export class ConnectorsService {
       toolName ? `the connector behind ${toolName}` : `the "${connector.name}" connector`,
       connectorPageUrl(connector.id),
     );
+    // Arguments an MCP bridge sends with every call (mcpFixedArguments), as
+    // on a real call (DynamicMcpTools).
+    const mcpFixedArguments =
+      connector.type === 'MCP' ? resolveMcpFixedArguments(connector.config, envVars) : undefined;
+    if (mcpFixedArguments) {
+      assertNoUnresolvedPlaceholders(
+        { body: mcpFixedArguments },
+        toolName ? `the connector behind ${toolName}` : `the "${connector.name}" connector`,
+        connectorPageUrl(connector.id),
+      );
+    }
     assertAbsoluteBaseUrl(
       {
         baseUrl: resolved.baseUrl,
@@ -976,14 +1387,18 @@ export class ConnectorsService {
       baseUrl: resolved.baseUrl,
       authType: connector.authType,
       authConfig: withTokenRenewal(connector.authType, authConfig, connector.config, envVars),
-      headers: resolved.headers as Record<string, string>,
+      headers: withCatalogUserAgent(resolved.headers as Record<string, string>, connector.config) as Record<string, string>,
       specUrl: connector.specUrl ?? undefined,
       connectorId: credentialKey ?? connector.id,
       errorWhen: connectorErrorWhen(connector.config),
+      largeIntegers: connectorLargeIntegers(connector.config),
       logSecrets: connectorSecretValues(connector),
+      // Lets the test run take an uploaded file (amcp-file:) of this workspace.
+      organizationId: connector.organizationId,
       ...(options.useProxy && process.env.CONNECTOR_PROXY_URL
         ? { proxyUrl: process.env.CONNECTOR_PROXY_URL }
         : {}),
+      ...(mcpFixedArguments ? { fixedArguments: mcpFixedArguments } : {}),
     };
 
     if (

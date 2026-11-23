@@ -1,6 +1,31 @@
-import { deriveErrorHint, hostFromAxiosConfig } from './error-hints';
+import { codeHint, deriveErrorHint, hostFromAxiosConfig, providerErrorCode } from './error-hints';
+import { getAdapter } from '../adapters/catalog';
 
 describe('deriveErrorHint', () => {
+  it('names the outbound address when a firewall in front of the API refuses the call', () => {
+    // 3 Nov 2026: a self-hosted Bitrix24 behind an IP allowlist answered every
+    // call with a 403 "Access Restricted" page; the model told the user the
+    // webhook was broken.
+    const hint = deriveErrorHint({
+      host: 'crm.example.com',
+      status: 403,
+      body: '<!DOCTYPE html><html lang="en"><head><title>Access Restricted</title></head></html>',
+      adapterSlug: 'bitrix24',
+      cloud: true,
+      egressIps: ['104.248.242.235'],
+    });
+    expect(hint).toMatch(/104\.248\.242\.235/);
+    expect(hint).toMatch(/Retrying will not help/);
+    // The vendor's own rule still wins: Bitrix24's HTML 404 is a wrong webhook URL.
+    expect(
+      deriveErrorHint({ status: 404, body: '<html><body>Not found</body></html>', adapterSlug: 'bitrix24', egressIps: ['1.2.3.4'] }),
+    ).toMatch(/inbound webhook/);
+    // A JSON permission error is not an allowlist.
+    expect(
+      deriveErrorHint({ host: 'crm.example.com', status: 403, body: { error: 'ACCESS_DENIED' }, egressIps: ['1.2.3.4'] }),
+    ).toBeUndefined();
+  });
+
   it('says nothing for an ordinary failure', () => {
     expect(
       deriveErrorHint({ host: 'api.example.com', status: 500, body: { message: 'boom' } }),
@@ -46,6 +71,28 @@ describe('deriveErrorHint', () => {
     // Another model's own mobile field keeps the generic advice.
     expect(
       deriveErrorHint({ status: 500, body: { message: "Invalid field 'mobile' on 'hr.employee'" } }),
+    ).toMatch(/fields_get/);
+  });
+
+  it('names is_company when Odoo saas-19.3+ refuses the dropped company_type field on contacts', () => {
+    // Nov 2026: 5 workspaces on saas-19.3, saas-19.4 and 20.0 (read, create, write).
+    const read = deriveErrorHint({
+      host: 'acme.odoo.com',
+      status: 500,
+      body: { name: 'builtins.ValueError', message: "Invalid field 'company_type' on 'res.partner'" },
+    });
+    expect(read).toMatch(/`is_company`/);
+    expect(
+      deriveErrorHint({ status: 500, body: { name: 'builtins.ValueError', message: "Invalid field 'company_type' in 'res.partner'" } }),
+    ).toMatch(/`is_company`/);
+    expect(
+      deriveErrorHint({ status: 500, body: { name: 'builtins.KeyError', message: 'company_type', arguments: ['company_type'] } }),
+    ).toMatch(/`is_company`/);
+  });
+
+  it('gives the field-list hint for the "in" wording of create and write', () => {
+    expect(
+      deriveErrorHint({ status: 500, body: { name: 'builtins.ValueError', message: "Invalid field 'x_foo' in 'sale.order'" } }),
     ).toMatch(/fields_get/);
   });
 
@@ -99,10 +146,10 @@ describe('deriveErrorHint', () => {
       }
     });
 
-    it('leaves an unrelated "Access Denied" page alone', () => {
-      expect(
-        deriveErrorHint({ host: 'example.com', status: 403, body: '<html><title>Access Denied</title></html>' }),
-      ).toBeUndefined();
+    it('leaves an unrelated "Access Denied" page to the firewall rule, not the Odoo one', () => {
+      const hint = deriveErrorHint({ host: 'example.com', status: 403, body: '<html><title>Access Denied</title></html>' });
+      expect(hint).not.toMatch(/Odoo/);
+      expect(hint).toMatch(/IP allowlist/);
     });
   });
 
@@ -299,6 +346,51 @@ describe('deriveErrorHint — SQL-backed customer APIs', () => {
     expect(deriveErrorHint({ host: 'example.com', status: 400, body: 'app_not_installed' })).toBeUndefined();
   });
 
+  it('names the scope to add when Shopify denies a field, the top failure of working Shopify connectors', () => {
+    // As stored for failed calls in Oct-Nov 2026: with and without the scope named.
+    const bare =
+      'GraphQL errors: [{"message":"Access denied for orders field.","locations":[{"line":1,"column":124}],"extensions":{"code":"ACCESS_DENIED","documentation":"https://shopify.dev/api/usage/access-scopes"},"path":["orders"]}]';
+    const named =
+      'GraphQL errors: [{"message":"Access denied for themes field. Required access: `read_themes` access scope.","extensions":{"code":"ACCESS_DENIED"}}]';
+    for (const message of [bare, named]) {
+      const hint = deriveErrorHint({ host: 'acme.myshopify.com', status: 200, message })!;
+      expect(hint).toMatch(/no access scope/);
+      expect(hint).toMatch(/Versions page, click Release/);
+      expect(hint).toMatch(/approve the new access/);
+      // Not the OAuth advice: a Shopify connector has no "Authorize with Provider".
+      expect(hint).not.toMatch(/Authorize with Provider/);
+    }
+    // Protected customer data is its own case, and another host is left alone.
+    expect(
+      deriveErrorHint({
+        host: 'acme.myshopify.com',
+        status: 200,
+        message: 'GraphQL errors: [{"message":"This app is not approved to access the Customer object.","extensions":{"code":"ACCESS_DENIED"}}]',
+      }),
+    ).toMatch(/API access requests/);
+    expect(deriveErrorHint({ host: 'api.example.com', status: 200, message: bare })).toBeUndefined();
+  });
+
+  it("gives the Shopify adapter's own words for a token refusal Shopify names by code", () => {
+    const verifyHints = getAdapter('shopify')!.verifyHints;
+    const refusal = (code: string) =>
+      deriveErrorHint({
+        host: 'acme.myshopify.com',
+        status: 400,
+        message: `400 Bad Request: Request failed with status code 400: body={"error":"${code}","error_description":"x"}`,
+        adapterSlug: 'shopify',
+        verifyHints,
+        connectorPage: 'https://amcp.example/connectors/c1',
+      })!;
+    expect(refusal('shop_not_permitted')).toMatch(/different Shopify organizations/);
+    expect(refusal('shop_not_permitted')).toMatch(/Retrying will not help\. The connector's settings are at https:\/\/amcp\.example\/connectors\/c1/);
+    expect(refusal('application_cannot_be_found')).toMatch(/no app with this Client ID/);
+    // The rule keyed on the host still answers first.
+    expect(refusal('app_not_installed')).toMatch(/Tell the user exactly that/);
+    // A code the adapter has no hint for: nothing is invented.
+    expect(refusal('something_else')).toBeUndefined();
+  });
+
   it('sends the Shopify owner to protected customer data access', () => {
     const hint = deriveErrorHint({
       host: 'acme.myshopify.com',
@@ -324,6 +416,66 @@ describe('deriveErrorHint — SQL-backed customer APIs', () => {
       body: { error: "Expected string value for 'property_name' (got NULL)." },
     });
     expect(hint).toMatch(/etsy_read_listing_inventory/);
+  });
+
+  describe('Etsy tag limit', () => {
+    const refusal = { error: 'There was a problem with /tags : cannot be more than 20 characters' };
+
+    it('names each tag over the limit with its length, and nothing else from the call', () => {
+      const hint = deriveErrorHint({
+        host: 'openapi.etsy.com',
+        status: 400,
+        body: refusal,
+        args: { tags: 'mug, handmade ceramic coffee mug,blue,personalised gift for her', title: 'Secret title' },
+      });
+      expect(hint).toBe(
+        'tag "handmade ceramic coffee mug" has 27 characters; tag "personalised gift for her" has 25 characters; ' +
+          'Etsy allows at most 20 characters per tag on English listings. ' +
+          'Shorten or replace them and call again with the other tags unchanged.',
+      );
+      expect(hint).not.toMatch(/mug,|blue|Secret/);
+    });
+
+    it('takes the limit from Etsy\'s message and counts an emoji as one character', () => {
+      const hint = deriveErrorHint({
+        adapterSlug: 'etsy',
+        body: { error: 'There was a problem with /tags : cannot be more than 5 characters' },
+        args: { tags: ['🎁🎁🎁🎁🎁', 'gifts!'] },
+      });
+      expect(hint).toBe(
+        'tag "gifts!" has 6 characters; Etsy allows at most 5 characters per tag on English listings. ' +
+          'Shorten or replace it and call again with the other tags unchanged.',
+      );
+    });
+
+    it('reads the limit from the array-shaped refusal of a new draft listing', () => {
+      // etsy_create_listing_draft, Nov 2026.
+      const hint = deriveErrorHint({
+        host: 'openapi.etsy.com',
+        status: 400,
+        body: [{ path: '/tags', type: 'too_long', message: 'cannot be more than 20 characters', transformed: false }],
+        args: { tags: ['mug', 'handmade ceramic coffee mug'] },
+      });
+      expect(hint).toBe(
+        'tag "handmade ceramic coffee mug" has 27 characters; Etsy allows at most 20 characters per tag on English listings. ' +
+          'Shorten or replace it and call again with the other tags unchanged.',
+      );
+    });
+
+    it('still states the limit when the arguments hold no tag over it', () => {
+      expect(deriveErrorHint({ host: 'openapi.etsy.com', status: 400, body: refusal, args: {} })).toBe(
+        'Etsy allows at most 20 characters per tag on English listings. Shorten every longer tag (spaces count) and call again.',
+      );
+    });
+
+    it('cuts a very long tag when quoting it', () => {
+      const hint = deriveErrorHint({ host: 'openapi.etsy.com', body: refusal, args: { tags: 'x'.repeat(500) } });
+      expect(hint).toMatch(new RegExp(`^tag "${'x'.repeat(60)}…" has 500 characters;`));
+    });
+
+    it('says nothing for the same text from another API', () => {
+      expect(deriveErrorHint({ host: 'api.example.com', status: 400, body: refusal, args: { tags: 'x'.repeat(30) } })).toBeUndefined();
+    });
   });
 
   it('still says nothing about an error it does not recognise', () => {
@@ -359,8 +511,24 @@ describe('deriveErrorHint — SQL-backed customer APIs', () => {
         deriveErrorHint({ host, status: 400, body: { description: 'Bad Request: failed to get HTTP URL content' } }),
       ).toMatch(/public https link/);
     });
+    it('asks for a chat_id when the connector has no default chat', () => {
+      expect(
+        deriveErrorHint({ host, status: 400, body: { ok: false, error_code: 400, description: 'Bad Request: chat_id is empty' } }),
+      ).toMatch(/TELEGRAM_DEFAULT_CHAT_ID is empty.*telegram_bot_get_updates/);
+    });
     it('stays quiet for another host answering Not Found', () => {
       expect(deriveErrorHint({ host: 'api.example.com', status: 404, body: '"Not Found"' })).toBeUndefined();
+    });
+  });
+
+  describe('Outlook search paging', () => {
+    const body = { error: { code: 'SearchWithSkip', message: 'This request does not support skip with search.' } };
+    it('points at skip_token when Graph refuses skip with search', () => {
+      expect(deriveErrorHint({ adapterSlug: 'microsoft-outlook', host: 'graph.microsoft.com', status: 400, body })).toMatch(/skip_token.*\$skiptoken/);
+      expect(deriveErrorHint({ host: 'graph.microsoft.com', status: 400, body })).toMatch(/without skip/);
+    });
+    it('stays quiet for the same code from another API', () => {
+      expect(deriveErrorHint({ host: 'api.example.com', status: 400, body })).toBeUndefined();
     });
   });
 
@@ -502,5 +670,40 @@ describe('Meta Graph API error 190', () => {
   it('stays quiet for other Meta errors and other hosts', () => {
     expect(deriveErrorHint({ host: graph, status: 400, body: { error: { code: 4, message: 'rate' } } })).toBeUndefined();
     expect(deriveErrorHint({ host: 'api.example.com', status: 400, body: body(467) })).toBeUndefined();
+  });
+});
+
+describe('providerErrorCode', () => {
+  it("reads the code out of a provider's refusal", () => {
+    expect(providerErrorCode('Request failed with status code 400: {"error":"app_not_installed","error_description":"The application is not installed on this shop."}')).toBe('app_not_installed');
+    expect(providerErrorCode('<title>400 - Oauth error shop_not_permitted</title>')).toBe('shop_not_permitted');
+    expect(providerErrorCode('{"errors":[{"extensions":{"code":"ACCESS_DENIED"}}]}')).toBe('ACCESS_DENIED');
+  });
+
+  it('takes no sentence, number or key for a code', () => {
+    expect(providerErrorCode('{"errors":"Not Found"}')).toBeUndefined();
+    expect(providerErrorCode('{"error":"Could not find the shop"}')).toBeUndefined();
+    expect(providerErrorCode('{"code":404}')).toBeUndefined();
+    expect(providerErrorCode(`{"error":"${'k9'.repeat(20)}"}`)).toBeUndefined();
+    expect(providerErrorCode(`{"error":"${'x'.repeat(41)}"}`)).toBeUndefined();
+    expect(providerErrorCode('')).toBeUndefined();
+    expect(providerErrorCode(undefined)).toBeUndefined();
+  });
+});
+
+describe('codeHint', () => {
+  const hints = { app_not_installed: 'Install it.', not_found: 'Wrong address.', '404': 'Wrong address.' };
+
+  it('finds the hint filed under the code, in either case', () => {
+    expect(codeHint(hints, 'app_not_installed')).toBe('Install it.');
+    expect(codeHint(hints, 'APP_NOT_INSTALLED')).toBe('Install it.');
+  });
+
+  it('leaves the failure kinds to the classifier and never reaches the prototype', () => {
+    // `not_found` in the body of a missing record is not a refused setup.
+    expect(codeHint(hints, 'not_found')).toBeUndefined();
+    expect(codeHint(hints, 'constructor')).toBeUndefined();
+    expect(codeHint(hints, undefined)).toBeUndefined();
+    expect(codeHint(undefined, 'app_not_installed')).toBeUndefined();
   });
 });

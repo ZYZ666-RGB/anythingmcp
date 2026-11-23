@@ -65,6 +65,25 @@ curl -s http://localhost:4000/api/connectors \
   }'
 ```
 
+### Where the password is stored
+
+You can type the username and password into the connection string, as above. When the connector is saved, AnythingMCP moves them into the connector's encrypted credentials and stores the connection string without them; the database engine puts them back when it connects.
+
+- The dashboard and the API show the connection string without `user:password@`. An older connection string that still holds its password shows it as `********`.
+- To change the password, type `user:password@` into the connection string again. A string that still shows `********` keeps the stored password.
+- An API request that sends `authConfig` replaces it whole, the moved username and password included.
+- No export contains a password that has moved, an admin export included, so a connector restored from a backup needs it typed in again.
+- A connection string the parser cannot read, such as a multi-host MongoDB URL typed with its credentials, keeps them in place; the password is shown as `********`.
+- `scripts/secret-literals/report.ts` finds a DATABASE connector whose connection string still carries its password (and the same literal-secret cases other connector types have); `repair.ts` moves it, dry run by default, with a backup table before `--apply`. The backend also moves these at every start (below); the scripts are for checking what that pass could not move, and for an instance that has not restarted onto it yet.
+
+Connectors saved before v0.55.0 kept `user:password@` in the stored connection string. The backend moves those too: every start checks the stored database connection strings once and moves the credentials it still finds, the same way a save does. This needs no setting and works the same on AnythingMCP Cloud and self-hosted. The backend log shows the result with connector ids and counts, never a connection string:
+
+```
+Database connection strings: credentials of 2 connectors moved into the encrypted auth config (cm1…, cm2…); 1 left as is (cm3…); 0 failed
+```
+
+"Left as is" are connection strings that contain an `@` and that a save would not change either: no password in them, `{{VARIABLE}}` references, a string the parser cannot read, or a connector whose username or password is also set in its credentials. "Failed" names connectors whose stored credentials could not be read or written; they stay unchanged and the next start tries again.
+
 ---
 
 ## Auto-Generated Tools

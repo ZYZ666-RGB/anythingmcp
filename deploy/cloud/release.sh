@@ -98,8 +98,11 @@
 # boot: only the NEW backend runs it during a release (the old one ran it at
 # its own boot), and its safe-class resync is idempotent. License re-verify
 # at startup returns immediately in cloud mode. The onboarding-reminder cron
-# is an HTTP call from GitHub Actions, served by whichever backend Caddy
-# routes it to — one.
+# is a host systemd service (anythingmcp-onboarding-cron, hourly at :17)
+# whose one HTTP call runs 3 to 8 minutes on whichever backend Caddy routed
+# it to. Stopping that backend cut the run (2026-11-19 11:19, HTTP 502 after
+# about 20 mails), so step 5 waits for the units in CRON_UNITS to finish,
+# up to CRON_WAIT_TIMEOUT, before it stops the old colour.
 #
 # What does NOT overlap well is in-memory state. The tool registry is loaded
 # at boot and kept current by the process that makes a change; a connector
@@ -113,6 +116,22 @@
 # set, a session opened on the old backend gets 404 "Session not found" from
 # the new one, and spec-compliant clients start a new session — again, what
 # a restart did.
+#
+# ── Logs of the replaced containers ─────────────────────────────────────────
+# A container's `docker logs` go with it, and every release replaces the
+# backend and the frontend (and the files worker when its image or its
+# definition changed): on 2026-11-05/06, ten releases in 24 h left 1.6 min
+# of backend log. So before removing one of them the script saves its whole
+# log (stdout and stderr, with Docker's timestamps), gzipped, to
+#   /opt/anythingmcp-cloud/logs/<container>-<UTC time>.log.gz
+# (directory 700, files 600: the lines carry user and org ids) and deletes
+# saved files older than RELEASE_LOG_KEEP_DAYS (14). The old colour is saved
+# after the switch, once it is stopped, so the save never delays it; a
+# rejected new colour is saved too (amcp-cloud-backend-blue-…). A save that
+# fails or takes longer than RELEASE_LOG_TIMEOUT (300 s) is a warning, never
+# a failed release. Search them with zgrep, e.g.
+#   zgrep -h '"orgId":"<id>"' /opt/anythingmcp-cloud/logs/amcp-cloud-backend-2*.log.gz
+# (the names sort by time; the live container is still `docker logs`).
 #
 # Every name is overridable so the script can be exercised against a
 # throwaway stack (see deploy/cloud/release.test.sh).
@@ -130,6 +149,11 @@ BACKEND_NAME="${BACKEND_NAME:-${PREFIX}-backend}"
 FRONTEND_NAME="${FRONTEND_NAME:-${PREFIX}-frontend}"
 CADDY_CONTAINER="${CADDY_CONTAINER:-${PREFIX}-caddy}"
 PREVIEW_CONTAINER="${PREVIEW_CONTAINER:-${PREFIX}-caddy-preview}"
+FILES_WORKER_NAME="${FILES_WORKER_NAME:-${PREFIX}-files-worker}"
+# Where the logs of replaced containers are kept (see the header).
+RELEASE_LOG_DIR="${RELEASE_LOG_DIR:-$APP_DIR/logs}"
+RELEASE_LOG_KEEP_DAYS="${RELEASE_LOG_KEEP_DAYS:-14}"
+RELEASE_LOG_TIMEOUT="${RELEASE_LOG_TIMEOUT:-300}"
 BACKEND_PORT="${BACKEND_PORT:-4000}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-300}"
 PROBE_TRIES="${PROBE_TRIES:-12}"
@@ -144,6 +168,9 @@ MAINTENANCE_FILE="${MAINTENANCE_FILE-/var/lib/anythingmcp-probe/maintenance}"
 # For release.test.sh only: a command run after the preview checks passed and
 # before the switch, to break a release at the one point nothing else can.
 RELEASE_HOOK_BEFORE_CUTOVER="${RELEASE_HOOK_BEFORE_CUTOVER:-}"
+# Host services that hold one long request on the backend (see "Work that
+# must not run twice"). Empty: wait for nothing.
+CRON_UNITS="${CRON_UNITS-anythingmcp-onboarding-cron.service}"
 
 RESTART=0
 case "${1:-}" in
@@ -163,6 +190,8 @@ SWAP_MODE=$(tunable SWAP_MODE auto)                          # auto | overlap | 
 RELEASE_MIN_AVAILABLE_MB=$(tunable RELEASE_MIN_AVAILABLE_MB 2500)
 RELEASE_MEM_ABORT_MB=$(tunable RELEASE_MEM_ABORT_MB 500)
 DRAIN_TIMEOUT=$(tunable DRAIN_TIMEOUT 120)
+CRON_WAIT_TIMEOUT=$(tunable CRON_WAIT_TIMEOUT 600)
+CRON_POLL=$(tunable CRON_POLL 5)
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
@@ -194,6 +223,30 @@ mem_available_mb() { awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo
 # Rewrite a file in place: Caddy's bind mount follows the inode, and `mv`
 # would give the host a new file the container never sees.
 write_in_place() { cat "$1" > "$2"; }
+
+# Save the given containers' logs before they are removed, and drop saved
+# logs older than RELEASE_LOG_KEEP_DAYS (see the header). Never fails: a lost
+# log is a warning, not a reason to stop a release.
+save_logs() {
+  local c f limit=()
+  command -v timeout >/dev/null 2>&1 && limit=(timeout "$RELEASE_LOG_TIMEOUT")
+  if ! { mkdir -p "$RELEASE_LOG_DIR" && chmod 700 "$RELEASE_LOG_DIR"; } 2>/dev/null; then
+    echo "::warning::cannot create ${RELEASE_LOG_DIR}: not saving the logs of $*"
+    return 0
+  fi
+  for c in "$@"; do
+    { [ -n "$c" ] && exists "$c"; } || continue
+    f="${RELEASE_LOG_DIR}/${c}-$(date -u +%Y%m%dT%H%M%SZ).log.gz"
+    if (umask 077; ${limit[@]+"${limit[@]}"} docker logs --timestamps "$c" 2>&1 </dev/null | nice -n 10 gzip > "$f") 2>/dev/null; then
+      log "saved the log of $c to $f ($(du -h "$f" 2>/dev/null | cut -f1))"
+    else
+      echo "::warning::could not save the whole log of $c (${f}); removing the container anyway"
+    fi
+  done
+  find "$RELEASE_LOG_DIR" -maxdepth 1 -type f -name '*.log.gz' \
+    -mmin "+$((RELEASE_LOG_KEEP_DAYS * 1440))" -delete 2>/dev/null || true
+  return 0
+}
 
 # The live colour is one word in a file inside the Caddy container, read by
 # the Caddyfile on every request (see the header of deploy/cloud/Caddyfile).
@@ -350,6 +403,25 @@ drain() {
   done
 }
 
+# A cron run in progress holds one long request on a backend; stopping the
+# old colour under it cuts the run halfway. Wait for it, up to
+# CRON_WAIT_TIMEOUT. Hosts without systemd (and the test stack) skip this.
+wait_for_crons() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local u deadline=$((SECONDS + CRON_WAIT_TIMEOUT)) said
+  for u in $CRON_UNITS; do
+    said=0
+    while systemctl is-active --quiet "$u" 2>/dev/null; do
+      if [ "$SECONDS" -ge "$deadline" ]; then
+        echo "::warning::$u still running after ${CRON_WAIT_TIMEOUT}s; stopping the old colour anyway"
+        return 0
+      fi
+      [ "$said" = 1 ] || { log "waiting for $u to finish before stopping the old colour"; said=1; }
+      sleep "$CRON_POLL"
+    done
+  done
+}
+
 PREVIEW_URL=""
 preview_up() {
   local net img port
@@ -389,6 +461,8 @@ abort() {
     echo "--- last lines of ${NEW_BACKEND} ---"; docker logs --tail 60 "$NEW_BACKEND" 2>&1 || true
   fi
   preview_down
+  # Why it was rejected outlives the release (see the header).
+  save_logs "$NEW_BACKEND" "$NEW_FRONTEND"
   remove_new_colour
   # Keep the local :latest meaning "what is serving", as the pre-blue/green
   # rollback did: a later --restart must not pick up the rejected image.
@@ -529,10 +603,17 @@ if [ "$LIVE" != none ]; then
     legacy) OLD_HOSTS="backend|frontend" ;;
     *) OLD_HOSTS="backend-${LIVE}|frontend-${LIVE}" ;;
   esac
+  wait_for_crons
   drain "$OLD_HOSTS"
   for c in "$OLD_BACKEND" "$OLD_FRONTEND"; do
     [ -n "$c" ] || continue
     docker stop -t 30 "$c" >/dev/null 2>&1 || true
+  done
+  # Stopped, so the log is complete and the old process's memory is free;
+  # the new colour has been serving since step 3 (see the header).
+  save_logs "$OLD_BACKEND" "$OLD_FRONTEND"
+  for c in "$OLD_BACKEND" "$OLD_FRONTEND"; do
+    [ -n "$c" ] || continue
     docker rm -f "$c" >/dev/null 2>&1 || true
   done
   log "stopped and removed ${OLD_BACKEND} ${OLD_FRONTEND}"
@@ -558,6 +639,19 @@ fi
 # ── 7. The rest of the stack ────────────────────────────────────────────────
 # Named services only, and with the live colour's profile on, so that
 # --remove-orphans can only ever mean a service deleted from the file.
+# Compose recreates the files worker (profile `files`) when its image or its
+# definition (compose's config hash) changed, and its log goes with it: save
+# it first. When in doubt, save.
+if exists "$FILES_WORKER_NAME"; then
+  fw_svc=$(service_of "$FILES_WORKER_NAME")
+  fw_want=$(compose config --hash "${fw_svc:-files-worker}" 2>/dev/null | awk '{print $2}' || true)
+  fw_have=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$FILES_WORKER_NAME" 2>/dev/null || true)
+  if [ -z "$fw_want" ] || [ "$fw_want" != "$fw_have" ] \
+     || [ "$(docker inspect -f '{{.Image}}' "$FILES_WORKER_NAME" 2>/dev/null || true)" \
+          != "$(docker image inspect -f '{{.Id}}' "${IMAGE}:latest" 2>/dev/null || true)" ]; then
+    save_logs "$FILES_WORKER_NAME"
+  fi
+fi
 if ! compose --profile "$NEW" up -d --remove-orphans "${INFRA[@]}"; then
   echo "::error::the release is live, but applying the rest of the compose file failed"
   exit 1

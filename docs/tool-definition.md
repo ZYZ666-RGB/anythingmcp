@@ -49,8 +49,50 @@ holding an example (`host`, `example.com`, `your-api-key`, `<...>`,
 `PASTE_KEY_HERE`) and a credential pasted more than once (the same string
 repeated). See `packages/backend/src/adapters/env-var-checks.ts`.
 
+`envVarMeta.<VAR>.options` gives a variable a fixed list of choices, for an
+API with one host per country or region. The setup form shows a select with
+the labels instead of a text field, a model setting the connector up from a
+chat is given the list and asks the user to pick, and every path that writes
+the variable refuses a value that is not one of the listed `value`s (an
+optional variable may stay empty). List 2 to 20 choices with unique values;
+write each `value` exactly as it is stored (a whole `https://` URL when the
+variable starts `connector.baseUrl`), make it match `pattern` when there is
+one, and never combine `options` with `"secret": true`:
+
+```json
+"envVarMeta": {
+  "ACME_MARKET_URL": {
+    "label": "Country",
+    "kind": "address",
+    "help": "The country of your seller account.",
+    "options": [
+      { "value": "https://fr.market.example.com", "label": "France" },
+      { "value": "https://es.market.example.com", "label": "Spain" }
+    ]
+  }
+}
+```
+
+`envVarMeta.<VAR>.lookedUp: true` marks a required variable the setup check
+finds by itself when the form leaves it empty. The form then accepts it empty
+and labels it "found for you if left empty"; the check tries the value it
+found and hands it back to the page, which fills it in and saves it. Only
+`ODOO_DB` of `odoo` and `odoo-jsonrpc` has a lookup (the one database the
+address lists, or the Odoo Online subdomain; several databases are listed for
+the user to pick), and the validator refuses the flag anywhere else.
+
 `verifyHints` maps a status (`"401"`) or failure kind (`"auth_failed"`,
-`"unreachable"`) to what the setup check tells the user. A tool call that
+`"unreachable"`) to what the setup check tells the user. For a provider that
+answers every refusal with the same status and says which one in the body, a
+hint can be filed under that error code instead, and is tried first: Shopify's
+token request answers 400 with `{"error":"app_not_installed"}` or
+`{"error":"shop_not_permitted"}`, so the Shopify adapter has a hint under each
+of those names next to its `"400"`. The code is read from `"error"`, `"code"`,
+`"error_code"` or `"errorCode"` in the answer (letters and underscores, 3 to 40
+characters); the names of the failure kinds are never read as codes. A hint
+under a code is also given at a failed tool call that carries the code. A
+failed check records the code as `code` on the `setup_verify_failed` product
+event. A tool call that
 the API answers 401 uses the adapter's `"401"` (or `"auth_failed"`) hint too
 when no built-in rule matches, followed by a link to the connector's page,
 so a connector saved without a passing check hears the same advice. Hints are
@@ -125,6 +167,26 @@ JSON-Schema `parameters` when it accepts input. Parameter properties should
 include descriptions for the model. `"enabled": false` installs a tool switched
 off, for writes a workspace should turn on deliberately.
 
+`endpointMapping.envDefaults` fills a parameter the caller left out from a
+connector variable, for a value that is the same on nearly every call of one
+workspace and that a model cannot know (the chat a bot writes to):
+
+```json
+"endpointMapping": {
+  "method": "POST",
+  "path": "/sendMessage",
+  "envDefaults": { "chat_id": "TELEGRAM_DEFAULT_CHAT_ID" },
+  "bodyMapping": { "chat_id": "$chat_id", "text": "$text" }
+}
+```
+
+The parameter must be one the tool declares and does not list in `required`;
+say in its description what leaving it out does. The variable must be a
+non-secret one the adapter declares (usually in `optionalEnvVars`): its value
+is sent as a plain argument. A value the caller gives always wins, and a
+variable that is not set leaves the call as it was. The default is applied
+before the schema's own `default`s, on a tool call and on "Run test" alike.
+
 See [connector configuration](#connector)
 and [authentication](#authentication) for the nested connector fields.
 
@@ -177,6 +239,45 @@ rule. Connectors installed from the catalog follow the adapter's rules even if
 they were installed before the rules existed; a connector's own
 `config.errorWhen` overrides them, and `[]` switches the check off.
 
+### Large integers (64-bit ids)
+
+JSON numbers are doubles in JavaScript: an integer above 9007199254740991
+(2^53 - 1) is rounded when the answer is parsed, so a 64-bit id such as
+SHEIN's goodsId `5230236437987443003` comes back as `5230236437987443000`, and
+a JSON number in a tool call is rounded by the MCP client before it reaches
+the server. Two opt-ins, both off unless set
+(`packages/backend/src/connectors/engines/json-integers.util.ts`):
+
+- `connector.config.largeIntegers: "string"` (REST connectors): every
+  integer literal of a JSON answer outside ±(2^53 - 1) becomes a string with
+  its exact digits and sign. Everything else parses exactly as before:
+  safe integers, decimals and exponents stay numbers, numbers inside strings
+  are untouched, and a body that is not valid JSON is still handed back as
+  text. It applies wherever the engine reads the answer: the tool result, the
+  `errorWhen` rules, error bodies and the install check. A catalog connector
+  follows its adapter's setting, like `errorWhen`.
+- `endpointMapping.bodyIntegers` (a tool with a JSON body): body paths whose
+  values go out as JSON number literals written with exactly the digits the
+  tool received as text. `"orderGoodsId"` is a field, `"goodsIdList[]"` every
+  element of a list, `"infoList[].goodsId"` a field of every element. Declare
+  such parameters as strings (`"type": "string", "pattern": "^(0|[1-9][0-9]{0,19})$"`)
+  so no client turns them into numbers. A value that is not a whole number
+  is refused before anything is sent.
+
+```json
+"connector": { "type": "REST", "config": { "largeIntegers": "string" } },
+"endpointMapping": {
+  "method": "POST",
+  "path": "/open-api/order/import-batch-multiple-express",
+  "bodyMapping": { "orderNo": "$order_no", "infoList": "$items" },
+  "bodyIntegers": ["infoList[].goodsId"]
+}
+```
+
+`scripts/validate-adapters.mjs` checks both (rule `large-integers`):
+`"string"` on a REST connector, and paths that start at a field the
+bodyMapping writes, on a tool that is not a GET.
+
 ### Authentication
 
 Use `NONE`, `API_KEY`, `BEARER_TOKEN`, `BASIC`, `BASIC_AUTH`, `OAUTH2`,
@@ -200,6 +301,16 @@ eBay is the case: its `redirect_uri` is the app's RuName, and the RuName's
 Use a variable (`"providerRedirectUri": "{{EBAY_RUNAME}}"`); until it has a
 value, the sign-in asks for it instead of starting. `authConfig.pkce: false`
 leaves out the PKCE challenge and verifier for providers that do not use them.
+
+The token answer is read as RFC 6749 has it, with `access_token`,
+`refresh_token` and `expires_in` at the top level. A provider that wraps them
+(Joom answers `{ "code": 0, "message": "", "data": { "access_token": … } }`)
+names the wrapping object in `authConfig.tokenResponsePath`, a dotted path of
+keys such as `"data"`. The code exchange, the refreshes and the
+`client_credentials` and `password` grants then read the token fields from
+that object, and fail with the provider's own `code` and `message` when it is
+missing. Without the field nothing changes. See
+[REST connectors](connectors/rest.md#token-answers-inside-a-wrapper-tokenresponsepath).
 
 A `User-Agent` set for the API calls, in `authConfig.extraHeaders` or in the
 connector's `headers` (`extraHeaders` wins, as it does on the API calls), is
@@ -240,6 +351,46 @@ The body is signed exactly as it will be sent — signing a different rendering
 of the same object is the usual way an HMAC integration fails with an error
 that blames the key.
 
+#### Signed JWT per request (opt-in)
+
+Some APIs want a short-lived JWT signed with a shared secret on every request
+instead of a digest (Ghost's Admin API). A `jwt` block in `signature` switches
+to that: a fresh token is signed for each call and each retry, so the
+connector stores only the key, never a token that expires.
+
+```json
+"authType": "HMAC",
+"authConfig": {
+  "signature": {
+    "jwt": {
+      "key": "{{GHOST_ADMIN_API_KEY}}",
+      "keyFormat": "id:secret",
+      "secretEncoding": "hex",
+      "algorithm": "HS256",
+      "ttlSeconds": 300,
+      "claims": { "aud": "/admin/" }
+    },
+    "headerName": "Authorization",
+    "headerTemplate": "Ghost ${jwt}"
+  }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `jwt.key` + `jwt.keyFormat` | One `<id>:<secret>` value: the id becomes the `kid` header, the secret signs. `id:secret` is the only format. |
+| `jwt.keyId`, `jwt.secret` | The same two parts as separate values, instead of `key`. `keyId` is optional. |
+| `jwt.secretEncoding` | How the secret turns into key bytes: `utf8` (default), `hex` or `base64`. |
+| `jwt.algorithm` | `HS256` (default), `HS384` or `HS512`. |
+| `jwt.ttlSeconds` | Token lifetime, default 300, at most 3600. |
+| `jwt.claims` | Claims added to the payload (`aud`, `iss`, …). `iat` and `exp` are always set by the engine. |
+| `headerName` | Default `Authorization`. |
+| `headerTemplate` | `${jwt}` is the token. Default `Bearer ${jwt}`. |
+
+`extraHeaders` are sent as with a digest signature. Errors name the field that
+is wrong (no colon in the key, a secret that is not hex, an unset variable) and
+never include the key.
+
 #### Query signing (opt-in)
 
 Some platforms put the digest and the timestamp in the query instead of a
@@ -251,9 +402,10 @@ computed exactly as described above.
 | `placement` | `header` (default) or `query`: the digest goes into the query parameter `paramName`. |
 | `paramName` | Name of that query parameter, default `sign`. |
 | `timestampParam` | Sends the timestamp as this query parameter. |
-| `timestampFormat` | `s` (default, Unix seconds) or `ms` (milliseconds), for `${timestamp}`, `timestampParam` and `timestampHeader` alike. |
+| `timestampFormat` | `s` (default, Unix seconds), `ms` (milliseconds) or `iso` (ISO 8601 in UTC, `2026-11-06T07:00:00+00:00`), for `${timestamp}`, `timestampParam` and `timestampHeader` alike. |
 | `queryParams` | Static query parameters added to every call (an app key, a fixed `sign_method`), signed like the others. |
 | `encoding` | Also `hex-upper`: hex in capitals. |
+| `excludeMultipartBody` | `true`: `${body}` is empty when the body is `multipart/form-data` (file uploads), for vendors that sign uploads without their body. |
 
 On this path the template may also use:
 
@@ -268,6 +420,11 @@ On this path the template may also use:
   object contributes the same pairs the query serializer sends for it
   (`ids=1&ids=2`, `page[size]=20`). The signature parameter itself and empty
   values are left out.
+- `${sortedQuery}`: the query parameters as sent (no body), sorted by name and
+  written as `name=value` pairs joined with `&`, names and values
+  percent-encoded per RFC 3986 (only `A-Z a-z 0-9 - . _ ~` unescaped). The
+  signature parameter is left out; empty values are kept, because they are
+  sent. This is the Rocket SellerCenter signature (Falabella Seller Center).
 
 Variables are replaced in one pass, so a value that contains `${body}` is
 signed as that literal text. Shopee (`intl/shopee.json`) signs
@@ -293,6 +450,385 @@ parameter is one of them); calls on their `/rest` gateway put the API path in
 front: `${apiPath}${sortedParams}`. JSON-valued parameters go in a form body
 with the `__json` marker, which `${sortedParams}` signs as its JSON text.
 
+Falabella Seller Center (`intl/falabella-seller-center.json`) signs the
+sorted query with the user's API key and sends it as `Signature`, with an ISO
+8601 `Timestamp`:
+
+```json
+"signature": {
+  "algorithm": "sha256",
+  "encoding": "hex",
+  "secret": "{{FALABELLA_API_KEY}}",
+  "placement": "query",
+  "paramName": "Signature",
+  "timestampParam": "Timestamp",
+  "timestampFormat": "iso",
+  "queryParams": { "UserID": "{{FALABELLA_USER_ID}}", "Version": "1.0", "Format": "JSON" },
+  "template": "${sortedQuery}"
+}
+```
+
+TikTok Shop (`intl/tiktok-shop.json`) wraps the path, the sorted query and the
+body in the app secret: `{{SECRET}}${pathname}${sortedParams}${body}{{SECRET}}`,
+with `queryParams: { "app_key": ... }` and `excludeMultipartBody: true`. Pass
+array values as comma-separated strings on this kind of adapter: TikTok signs
+one value per query key.
+
+#### Plain digest and body placement (opt-in)
+
+Some platforms take every call as a JSON body that carries its own signature,
+and compute it as a plain hash rather than an HMAC (Temu's Partner API). These
+fields describe that; a signature without any of them is computed exactly as
+described above.
+
+| Field | Meaning |
+|-------|---------|
+| `mode` | `hmac` (default) or `digest`: a plain hash of the rendered template, with no key. The secret is then written into `template`, where the vendor puts it; `secret` is not used. |
+| `algorithm` | Also `md5`, accepted in `digest` mode only. |
+| `placement` | Also `body`: the digest is written into the JSON body as the field `paramName` (default `sign`). The tool must be a `POST`, `PUT`, `PATCH` or `DELETE` that sends a JSON object (a `bodyMapping` or `bodyTemplate`, or no body of its own). |
+| `bodyParams` | Static fields written into the JSON body of every call (an app key, an access token, a fixed `data_type`), signed like the tool's own fields. They win over a tool's field of the same name. Text, numbers or `true`/`false`. |
+| `timestampParam` | With `placement: "body"` the timestamp is written into the body: as a JSON number for the `s` and `ms` formats, as text for `iso`. |
+
+With `placement: "body"`, `${sortedParams}` is built from the JSON body
+instead of the query:
+
+- every top-level field of the body as sent (the tool's fields, `bodyParams`
+  and the timestamp), sorted by name in ASCII order and concatenated as name +
+  value with no separators; the query is not part of it;
+- a string contributes its text as it is;
+- every other value contributes its JSON text, exactly as the body carries it:
+  a number in its shortest form (`0`, `19.9`), `true`, `false`, `null`, and an
+  array or object as compact JSON without spaces, with its keys in the order
+  they are sent (`[{"skuId":1,"quantity":2}]`);
+- the signature field itself is left out; an empty string is sent, so its name
+  is signed.
+
+Temu (`intl/temu.json`) signs `app_secret + sorted fields + app_secret` with
+MD5 in capitals:
+
+```json
+"signature": {
+  "mode": "digest",
+  "algorithm": "md5",
+  "encoding": "hex-upper",
+  "placement": "body",
+  "paramName": "sign",
+  "timestampParam": "timestamp",
+  "bodyParams": {
+    "app_key": "{{TEMU_APP_KEY}}",
+    "access_token": "{{TEMU_ACCESS_TOKEN}}",
+    "data_type": "JSON"
+  },
+  "template": "{{TEMU_APP_SECRET}}${sortedParams}{{TEMU_APP_SECRET}}"
+}
+```
+
+Each tool then only names its operation and its own fields:
+`"bodyMapping": { "type": "bg.order.detail.v2.get", "parentOrderSn": "$parent_order_sn" }`.
+A tool cannot replace `app_key`, the timestamp or the signature, and the
+secret never leaves the server. A digest can also go in a header or the query
+(`mode: "digest"` with the default placement or `placement: "query"`).
+
+One limit of the string above: a top-level text value is signed as it is. A
+vendor that signs such a value as JSON text instead (with `"` and `\` escaped)
+agrees with this for every value without those characters, which covers ids,
+codes and dates; send free text in a nested object, where it is JSON text on
+both sides.
+
+#### Nonce and header template (opt-in)
+
+Some platforms mix a random string into the key and send it along with the
+digest (SHEIN Open Platform: the key is secret + 5 random characters, and the
+header is those characters followed by the Base64 of the hex digest).
+
+| Field | Meaning |
+|-------|---------|
+| `nonceLength` | 1 to 64. A random string of that many characters (`A-Z a-z 0-9`) is drawn for every signature and is available as `${nonce}` in `template`, in `secret` and in `headerTemplate`. |
+| `secret` | May contain `${nonce}`: `"{{KEY}}${nonce}"` is an HMAC key of the secret followed by the nonce. |
+| `headerTemplate` | The header value around the digest: `${signature}` is the digest, `${nonce}` the random string. Default: the digest alone. It must contain `${signature}`. (A signed-JWT signature has its own `headerTemplate`, see above.) |
+| `encoding` | Also `hex-base64`: the Base64 of the lower-case hex text of the digest. |
+
+```json
+"signature": {
+  "algorithm": "sha256",
+  "encoding": "hex-base64",
+  "secret": "{{SECRET_KEY}}${nonce}",
+  "nonceLength": 5,
+  "template": "{{OPEN_KEY_ID}}&${timestamp}&${pathname}",
+  "timestampFormat": "ms",
+  "headerName": "x-lt-signature",
+  "headerTemplate": "${nonce}${signature}",
+  "timestampHeader": "x-lt-timestamp",
+  "extraHeaders": { "x-lt-openKeyId": "{{OPEN_KEY_ID}}" }
+}
+```
+
+`scripts/validate-adapters.mjs` refuses a signature whose `mode`, `placement`,
+`encoding` or `algorithm` is not one of the values above, `md5` outside
+`digest` mode, `bodyParams` without `placement: "body"`, and `${nonce}`
+without `nonceLength` (rule `hmac-signature`).
+
+#### Form placement and expiry time (opt-in)
+
+Some platforms take every call as an `application/x-www-form-urlencoded` POST
+whose fields carry the signature, and sign an expiry time rather than the
+signing time (Apaczka.pl API v2: the fields `app_id`, `request` (the call's
+JSON as text), `expires` and `signature`, an HMAC over
+`app_id:route:request:expires`). These fields describe that; a signature
+without any of them is computed exactly as described above.
+
+| Field | Meaning |
+|-------|---------|
+| `placement` | Also `form`: the digest is written into the form body as the field `paramName` (default `sign`). The tool must be a `POST`, `PUT`, `PATCH` or `DELETE` with `bodyEncoding: "form-urlencoded"` and a `bodyMapping`, or no body of its own. |
+| `bodyParams` | With `placement: "form"`: static form fields of every call (an app id), signed like the tool's own fields. They replace a tool's field of the same name. Text, numbers or `true`/`false`. |
+| `timestampParam` | With `placement: "form"` the timestamp is written into the form as this field. |
+| `timestampOffsetSeconds` | A whole number of seconds, -86400 to 86400, added to the current time for `${timestamp}`, `timestampParam` and `timestampHeader`: an expiry time instead of the signing time. Works with every placement. |
+
+The template may also use:
+
+- `${form.NAME}`: the value of a form field as sent (decoded, before
+  percent-encoding), empty when absent. Only with `placement: "form"`; on any
+  other placement the text stays as written. It covers the tool's fields,
+  `bodyParams` and the timestamp; the signature field is not there yet.
+- `${apiPathNoSlash}`: `${apiPath}` without its leading slash
+  (`order_send/` for `https://www.apaczka.pl/api/v2/order_send/` under the
+  `baseUrl` `https://www.apaczka.pl/api/v2`). Path parameters are part of
+  it (`waybill/123456/`), and a trailing slash in the tool's `path` is kept.
+
+The JSON text of the call goes into its field with the [`__json`
+marker](#json-encoded-fields-__json), and `${form.request}` signs exactly that
+text. Apaczka (`pl/apaczka.json`):
+
+```json
+"signature": {
+  "algorithm": "sha256",
+  "encoding": "hex",
+  "secret": "{{APACZKA_APP_SECRET}}",
+  "placement": "form",
+  "paramName": "signature",
+  "bodyParams": { "app_id": "{{APACZKA_APP_ID}}" },
+  "timestampParam": "expires",
+  "timestampOffsetSeconds": 600,
+  "template": "${form.app_id}:${apiPathNoSlash}:${form.request}:${timestamp}"
+}
+```
+
+Each tool then sends its payload as one field:
+`"path": "/orders/", "bodyEncoding": "form-urlencoded", "bodyMapping": { "request": { "__json": { "page": "$page", "limit": "$limit" } } }`.
+Choose an offset that leaves room for clock drift and the engine's own
+retries, which resend the fields as signed: Apaczka accepts at most 15 minutes
+ahead, so the adapter uses 10. The validator
+also refuses `${form.NAME}` without `placement: "form"`, an offset that is not
+a whole number in range, and, on a connector with `placement: "form"`, a tool
+that is a `GET` or sends anything but a form-urlencoded `bodyMapping` (rule
+`hmac-signature`).
+
+#### Shop authorization (token providers)
+
+Some marketplaces authorize a shop with their own flow instead of OAuth 2, set
+with `authConfig.tokenProvider` on an `HMAC` connector. The provider stores the
+shop's tokens encrypted on the connector, renews them before they expire, adds
+them to every call, and marks the connector as needing a new authorization when
+the marketplace refuses the refresh token. The connector page shows
+**Authorize with Provider** until the shop is authorized.
+
+| `tokenProvider` | Flow | What it adds to each call |
+|-----------------|------|---------------------------|
+| `shopee` | Signed `auth_partner` link; callback `<SERVER_URL>/api/shopee/callback/<state>` | `access_token` and `shop_id` query parameters, signed |
+| `tiktok-shop` | `services.tiktokshop.com/open/authorize?service_id=...` (US: `services.us.tiktokshop.com`); callback `<SERVER_URL>/api/tiktok-shop/callback`, set as the app's Redirect URL | the access token in the `x-tts-access-token` header (not signed) and `shop_cipher` in the query (signed), except on `/authorization/`, `/seller/` and upload paths |
+| `iop` | The Alibaba IOP gateways (Lazada, Miravia, AliExpress seller): `authConfig.iop.authorizeUrl` with `response_type=code`, `client_id`, `redirect_uri` and `state`; callback `<SERVER_URL>/api/iop-auth/callback`, set as the app's callback URL | `access_token` query parameter, signed |
+| `shein` | SHEIN's store authorization: `authConfig.shein.authorizeUrl` (`https://openapi-sem.sheincorp.com/#/empower`) with `appid`, `redirectUrl` (the callback in Base64) and `state`; callback `<SERVER_URL>/api/shein-auth/callback` | the shop's `openKeyId` and `secretKey`, filled into `${openKeyId}` and `${secretKey}` of the signature block (nothing to renew) |
+
+The TikTok Shop provider reads the app key from `authConfig.appKey` (or the
+`app_key` query parameter), the secret from `signature.secret` and the Service
+ID from `authConfig.serviceId`. The optional connector variables
+`TIKTOK_SHOP_MARKET` (`US`) and `TIKTOK_SHOP_SHOP_ID` (shop id, code or name,
+when one authorization covers several shops) are read when the authorization
+starts and completes.
+
+When the server sets `TIKTOK_SHOP_PLATFORM_APP_KEY`,
+`TIKTOK_SHOP_PLATFORM_APP_SECRET` and `TIKTOK_SHOP_PLATFORM_SERVICE_ID` (a
+public TikTok Shop App Store app), a connector whose app key resolves empty
+uses that app instead: the provider fills `appKey`, `serviceId`,
+`signature.secret`, the signed `app_key` and the template
+`<secret>${pathname}${sortedParams}${body}<secret>` in memory for each call,
+authorization and renewal, and never writes them to the connector. That is why
+the adapter's `TIKTOK_SHOP_APP_KEY`, `TIKTOK_SHOP_APP_SECRET` and
+`TIKTOK_SHOP_SERVICE_ID` are optional variables: saved empty, they ask for the
+server's app. On a server without one, the setup check still reports them as
+missing. A callback that carries a code but no state (an install from the
+App Store, `?app_key=...&code=...&shop_region=...`) is kept as a single-use
+install record for 30 minutes when its `app_key` is the server's; the
+dashboard completes it with `POST /api/tiktok-shop/install` once the seller is
+signed in, reusing the workspace's newest TikTok Shop connector that uses the
+server's app and has no shop authorized yet, or installing a new one.
+
+The `iop` provider (`iop-token.service.ts`, `iop-auth.controller.ts`) takes
+the gateway from the adapter, not from code per vendor:
+
+```json
+"authType": "HMAC",
+"authConfig": {
+  "tokenProvider": "iop",
+  "iop": {
+    "appKey": "{{LAZADA_APP_KEY}}",
+    "authorizeUrl": "https://auth.lazada.com/oauth/authorize",
+    "tokenBaseUrl": "https://auth.lazada.com/rest",
+    "tokenPath": "/auth/token/create",
+    "refreshPath": "/auth/token/refresh",
+    "authorizeParams": { "force_auth": "true" }
+  },
+  "signature": {
+    "algorithm": "sha256",
+    "encoding": "hex-upper",
+    "secret": "{{LAZADA_APP_SECRET}}",
+    "placement": "query",
+    "paramName": "sign",
+    "timestampParam": "timestamp",
+    "timestampFormat": "ms",
+    "queryParams": { "app_key": "{{LAZADA_APP_KEY}}", "sign_method": "sha256" },
+    "template": "${apiPath}${sortedParams}"
+  }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `iop.appKey` | The app key, sent as `client_id` and signed as `app_key`. Default: `signature.queryParams.app_key`. |
+| `iop.authorizeUrl` | https URL of the seller authorize page, without a query. |
+| `iop.tokenBaseUrl` | https URL the token paths are appended to. |
+| `iop.tokenPath` / `iop.refreshPath` | The token-create and token-refresh operations. |
+| `iop.authorizeParams` | Optional static query parameters of the authorize URL. They cannot set `response_type`, `client_id`, `redirect_uri` or `state`. |
+| `iop.tokenResponsePath` | Optional dotted path of the object that holds the token fields, for a gateway that wraps them. Unset, they are read at the top level, where Lazada, Miravia and AliExpress put them. |
+
+The callback exchanges `code` at `tokenBaseUrl + tokenPath`; before a call,
+an access token with less than 30 minutes (or half its lifetime) left is
+renewed at `tokenBaseUrl + refreshPath` with `refresh_token`. Both token calls
+reuse the connector's `signature` block (secret, algorithm, `paramName`,
+`timestampParam`, `queryParams`) and are always signed as IOP system calls,
+the operation's path in front of the sorted parameters, even when the
+business calls sign `${sortedParams}` alone (AliExpress `/sync`). As in the
+gateways' SDKs, `app_key`, `sign_method`, `timestamp` and `sign` go in the
+query and `code` or `refresh_token` in a form body. Lifetimes come from the
+answer: `expires_in` and `refresh_expires_in` in seconds (AliExpress's
+absolute `expire_time` and `refresh_token_valid_time` are read only when
+those are missing); a token without a lifetime is used until it is refused.
+The stored fields are `accessToken`, `refreshToken`, `expiresAt`,
+`expiresIn`, `refreshExpiresAt`, `refreshExpiresIn`, `authorizedAt` and
+`lastRefreshedAt`, encrypted with the rest of the authConfig.
+
+A call refused with 401 (an `errorWhen` rule with `status: 401`, such as
+`IllegalAccessToken`, or HTTP 401) is renewed once and resent once, unless
+the gateway's code names the signature, the app key, the timestamp or a
+permission, which a new token cannot fix. A refresh token the gateway
+refuses (`IllegalRefreshToken`, `AUTH_TYPE_UNSUPPORTED`), or one past its own
+`refresh_expires_in` (or issued with `refresh_expires_in` 0), marks the
+connector as needing a new authorization, with one email to the owner,
+without asking the gateway again. No access-token variable is needed, and
+`signature.queryParams` must not set `access_token`. The setup page fills
+`{{redirectUri}}` in such an adapter's setup guide with
+`<SERVER_URL>/api/iop-auth/callback` (on AnythingMCP Cloud:
+`https://cloud.anythingmcp.com/api/iop-auth/callback`), and its last step
+sends the seller to the authorize page. `scripts/validate-adapters.mjs`
+checks the block (rule `iop-token-provider`): `HMAC` only, https URLs, paths,
+and the IOP signature (`placement: "query"`, `encoding: "hex-upper"`,
+`timestampFormat: "ms"`, a template with `${sortedParams}`).
+
+The `shein` provider (`shein-token.service.ts`, `shein-auth.controller.ts`)
+follows SHEIN's "Store Authorization Application Manual". The seller opens the
+authorize page, signs in with the shop's main account and approves the app;
+SHEIN sends the browser back to the callback with `appid`, `tempToken` (valid
+for a few minutes) and `state`. The tempToken is exchanged at
+`tokenBaseUrl + tokenPath` (`POST /open-api/auth/get-by-token`, JSON body
+`{ "tempToken": … }`), signed with the app's id and secret (header
+`x-lt-appid` instead of `x-lt-openKeyId`). The answer's `secretKey` is
+decrypted with the app secret (AES-128-CBC, `shein-secret.util.ts`) and
+stored with `openKeyId`, `supplierId`, `supplierBusinessMode` and
+`authorizedAt`, encrypted with the rest of the authConfig.
+
+```json
+"authType": "HMAC",
+"authConfig": {
+  "tokenProvider": "shein",
+  "shein": {
+    "appId": "{{SHEIN_APP_ID}}",
+    "appSecret": "{{SHEIN_APP_SECRET}}",
+    "authorizeUrl": "https://openapi-sem.sheincorp.com/#/empower",
+    "tokenBaseUrl": "{{SHEIN_API_HOST}}",
+    "tokenPath": "/open-api/auth/get-by-token"
+  },
+  "signature": {
+    "algorithm": "sha256",
+    "encoding": "hex-base64",
+    "secret": "${secretKey}${nonce}",
+    "nonceLength": 5,
+    "template": "${openKeyId}&${timestamp}&${pathname}",
+    "timestampFormat": "ms",
+    "headerName": "x-lt-signature",
+    "headerTemplate": "${nonce}${signature}",
+    "timestampHeader": "x-lt-timestamp",
+    "extraHeaders": { "x-lt-openKeyId": "${openKeyId}" }
+  }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `shein.appId` / `shein.appSecret` | The app's App ID and App Secret (SHEIN Open Platform, Application Management). They sign get-by-token and decrypt the shop's secretKey; seller calls never use them. |
+| `shein.authorizeUrl` | https URL of the authorize page, hash route included. The engine appends `?appid=…&redirectUrl=…&state=…` after it. |
+| `shein.tokenBaseUrl` | The API host of the app's type, an https URL or one variable: `https://openapi.sheincorp.com` (self-operated, semi-managed) or `https://openapi.sheincorp.cn` (fully managed, SHEIN-operated, other). |
+| `shein.tokenPath` | `/open-api/auth/get-by-token`. |
+
+Before each call the provider fills the stored keys into `${openKeyId}` and
+`${secretKey}` of `signature.secret`, `signature.template` and the values of
+`signature.extraHeaders`, in memory; the stored authConfig keeps the
+placeholders. A shop key does not expire on a schedule SHEIN documents and has
+no refresh. A call answered with `openapi00004` ("The user [...] has expired")
+marks the connector as needing a new authorization, with one email to the
+owner; `openapi00001` (signature refused, also what a key that changed
+elsewhere gives) only adds a hint to authorize again. The setup page fills
+`{{redirectUri}}` with `<SERVER_URL>/api/shein-auth/callback`.
+`scripts/validate-adapters.mjs` checks the block (rule
+`shein-token-provider`): `HMAC` only, the app settings, and SHEIN's signature
+with the two placeholders, which no other connector may use.
+
+#### Meta sign-in (Instagram connectors)
+
+Meta's logins issue no refresh token, so the two Instagram adapters stay
+`BEARER_TOKEN` connectors with `authConfig.tokenRenewal` and get their token
+from a sign-in instead of a paste. The connector page and the setup page show
+**Authorize with Provider**. The callback is `<SERVER_URL>/api/meta/callback`
+for every flavour (`meta-auth.controller.ts`, `meta-login.util.ts`):
+
+- `instagram` with an app that has a Unified Login configuration id
+  (`META_CONFIG_ID`, or the server's `META_PLATFORM_CONFIG_ID`): the dialog
+  takes `config_id` instead of `scope`, the user signs in with Instagram or
+  Facebook and shares a business portfolio's Instagram accounts. The code
+  gives a Business Integration System User token that does not expire; it is
+  stored as is and never renewed. `/me/assigned_instagram_accounts` lists the
+  accounts. Meta apps created since autumn 2026 only offer this login.
+- `instagram` with an older app (no configuration id): classic Facebook Login
+  with a `scope` list; the code is exchanged for a long-lived user token
+  (`fb_exchange_token`) and the account comes from the user's Pages.
+- `instagram-login`: Instagram Login (`ig_exchange_token`), for apps that
+  still have it; always the connector's own app.
+
+The completion writes the token to `INSTAGRAM_ACCESS_TOKEN` and the account
+id to `INSTAGRAM_ACCOUNT_ID` (several accounts: the user picks one), rebuilds
+the stored bearer token as the variable editor does and hands the expiry to
+the bearer token renewal. Pasting a token keeps working.
+
+The app comes from the connector (`META_APP_ID` / `META_APP_SECRET` /
+`META_CONFIG_ID`, or `INSTAGRAM_APP_ID` / `INSTAGRAM_APP_SECRET`), else, for
+`instagram` only, from the server (`META_PLATFORM_APP_ID` / `_SECRET` /
+`META_PLATFORM_CONFIG_ID`), the same on Cloud and self-hosted. A user token
+issued through the server's classic Facebook Login app is renewed with that
+app; a pasted token never is. Deleting a connector deletes its tool-call log
+rows with it (they cascade with its tools), so no Instagram data outlives the
+connector. The flavour is chosen by the connector's catalog adapter
+(`meta-login.util.ts`), so a new Meta adapter that should sign in this way is
+added there.
+
 ### MCP adapters (a vendor's own MCP server)
 
 When a vendor already runs an official MCP server, the adapter bridges it
@@ -311,6 +847,18 @@ leaves out (the server's own hints win). `omitParameters` (an array of
 top-level parameter names) drops those parameters from the schema the server
 lists, at install and on every **Discover tools**, for vendor fields such as
 attribution that a workspace has no use for.
+When the server needs the same argument on every call instead (an agent
+profile URL, a fixed channel), set `connector.config.mcpFixedArguments` to an
+object: it is merged into the arguments of every tool call, its values win
+over the caller's, `{{VAR}}` is resolved in them, and its paths are dropped
+from the listed schemas (nested ones too, so
+`{ "meta": { "ucp-agent": { "profile": "…" } } }` removes `meta` where it holds
+nothing else). Write the snapshot's `parameters` without those paths: the
+snapshot is installed as it is when the server cannot be reached. The
+validator accepts the setting on `MCP` connectors only, as an object. See
+[MCP Bridge](connectors/mcp-bridge.md#fixed-arguments-mcpfixedarguments).
+A public server that needs no credentials uses `authType: "NONE"` with no
+`authConfig` and an empty `requiredEnvVars` (see `intl/decathlon-shop.json`).
 Each tool's `endpointMapping` is `{ "method": "<remote tool name>", "path": "/mcp" }`
 (`"/"` for a server at the root of its host, together with
 `connector.config.mcpPath: "/"`).
@@ -325,8 +873,12 @@ adapter that signs in at the provider uses `authType: "OAUTH2"` with no
 `authConfig`; `connector.config.mcpOAuth` says how (dynamic registration,
 a client of the user's own from `{{VAR}}`s, scope, RFC 8707 resource). Both
 are described in [MCP Bridge](connectors/mcp-bridge.md#connector-settings-connectorconfig).
-`prerequisites` (an array of short sentences) lists what the user needs at
+`prerequisites` (a sentence or two, Markdown) says what the user needs at
 the vendor first; the setup page shows it above the form.
+`requiresIpAllowlist: true` marks an API that refuses every call from an
+address not registered with the provider (eMAG, Shopee, the Korean law API):
+the setup page then shows the server's outbound IP addresses (`EGRESS_IPS`)
+as a step to complete, not as a side note.
 
 ### DATABASE adapters
 
@@ -347,6 +899,14 @@ of the REST rules simply do not apply to it:
   bound parameters, never string-interpolated.
 - Adapters install **read-only**; the engine rejects anything but a read until
   the user flips the switch in the connector's settings.
+- A table name cannot be a bound parameter. When part of it depends on the
+  installation (OpenCart's table prefix), list the variable in
+  `connector.config.sqlIdentifierVars` and write it as `{{VAR}}` inside the
+  identifier: `` FROM `{{OPENCART_DB_PREFIX}}order` ``. Its value must then be
+  at most 20 letters, digits or underscores (empty is allowed), or the call
+  is refused before anything reaches the database; no other `{{VAR}}` may
+  appear in the SQL of that connector. Values still go through `${name}`.
+  Without the list nothing is checked, so never put `{{VAR}}` in SQL without it.
 - Declare a `probe` (a listing tool with no required parameters). A DATABASE
   adapter has no HTTP healthcheck, so without one the install reports nothing.
 
@@ -469,6 +1029,33 @@ Supported types: `string`, `integer`, `number`, `boolean`, `array`, `object`
 
 > **Tip:** Parameters matching environment variable names are automatically stripped from the tool schema, so the AI never sees them.
 
+### `pattern` on a string parameter
+
+A catalog adapter may give a string parameter (or the string items of an
+array parameter) a `pattern`. A value that does not match is refused before
+the request is sent, and the answer quotes the parameter's `description`, so
+write there what to pass instead:
+
+```json
+"includes": {
+  "type": "string",
+  "description": "Comma-separated, any of: Images, Shop, User. For stock and prices call the inventory tool.",
+  "pattern": "^(Images|Shop|User)(,(Images|Shop|User))*$"
+}
+```
+
+- Make the pattern no stricter than the API: check it against values that
+  work (case, non-ASCII characters, optional parts) before adding it.
+- Keep it simple. `catalog-patterns.spec.ts` runs every catalog pattern on
+  texts built to slow a regular expression down, and fails when one needs
+  more than a moment. Backreferences are not allowed.
+- Values longer than 2,000 characters are not checked.
+- Only catalog tools are checked, and only while the installed tool still
+  carries the catalog's pattern: a workspace that edits or removes the
+  pattern on its own copy turns the check off for that tool. Patterns of
+  hand-built tools and of tools imported from an OpenAPI file stay
+  documentation.
+
 ---
 
 ## 2. Endpoint Mapping
@@ -551,6 +1138,14 @@ instead of a text field containing the URL. Declare the parameter with `"type": 
 "format": "uri"` so the model knows to pass a link. `__file` in a `form-urlencoded` body is a
 configuration error — that encoding cannot carry a file at all.
 
+The same parameter also accepts an uploaded file's reference, `amcp-file:<id>`. An AI client
+that created the file in its own code sandbox calls the built-in `file_upload_link` tool, sends
+the file to the one-time URL it returns with `curl`, and passes the reference instead of a URL.
+The engine then reads the file from AnythingMCP's own storage, only for a tool of the workspace
+that uploaded it. Nothing to declare in the tool: every `__file` parameter gets this, and the
+MCP endpoint adds a sentence about it to the parameter's description. See
+[File uploads from AI clients](connectors/file-uploads.md).
+
 ### JSON-encoded fields (`__json`)
 
 Some APIs take a method's arguments as one field holding JSON text, e.g. a form body
@@ -602,6 +1197,39 @@ break the document:
   or the tool sets its own `Content-Type`.
 
 Without `bodyEncoding: "xml"`, `__raw` values are inserted as they are, as
+before.
+
+**Optional and repeated blocks.** An API that validates requests against a
+schema refuses an element that is present but empty (`<paging></paging>` where
+a number is expected), so an XML `bodyTemplate` can leave parts out and repeat
+parts per item of a list:
+
+| Block | Meaning |
+|-------|---------|
+| `${?name}…${/name}` | Kept when the parameter `name` has a value. |
+| `${?a\|b}…${/a\|b}` | Kept when `a` or `b` has a value. |
+| `${*items}…${/items}` | Repeated for every item of the list `items` (a single value counts as a list of one). Inside, `${.}` is the item, and the fields of an object item are placeholders of their own (`${sku}`), on top of the call's parameters. |
+
+"Has a value" means not missing, not `null`, not `""` and not an empty list;
+`0` and `false` are values. Blocks nest, also under the same name, so a wrapper
+element goes with its list:
+
+```json
+{
+  "method": "POST",
+  "path": "/orders_query",
+  "bodyEncoding": "xml",
+  "bodyTemplate": "<orders_query${?results_count} results_count=\"${results_count}\"${/results_count}>${?page}<paging>${page}</paging>${/page}${?states}<states>${*states}<state>${.}</state>${/states}</states>${/states}${?date_min|date_max}<date type=\"${date_type}\">${?date_min}<min>${date_min}</min>${/date_min}${?date_max}<max>${date_max}</max>${/date_max}</date>${/date_min|date_max}</orders_query>"
+}
+```
+
+With `{"page": 1, "states": ["Created", "ToShip"]}` this sends
+`<orders_query><paging>1</paging><states><state>Created</state><state>ToShip</state></states></orders_query>`.
+Every substituted value is XML-escaped, as elsewhere in an XML body. A block
+that is opened and never closed, or that names no parameter, stops the call
+before anything is sent; `scripts/validate-adapters.mjs` reports it (rule
+`xml-template-blocks`). Blocks exist only in a `bodyTemplate` with
+`bodyEncoding: "xml"`, and a template without them is rendered exactly as
 before.
 
 ### Response headers and pagination (`exposeHeaders`)
@@ -669,6 +1297,51 @@ out of the result. A tool can set its own values on the endpoint mapping:
   method; a POST, PATCH or DELETE is never retried after a timeout anyway.
 - REST connectors only. Tools without these keys behave exactly as before, on
   Cloud and self-hosted alike.
+
+### Download links in the response (`download`)
+
+Some APIs answer with a short-lived link to the data instead of the data
+(Amazon SP-API report documents: `{ "url": "https://…amazonaws.com/…",
+"compressionAlgorithm": "GZIP" }`). An AI client cannot open that link. With a
+`download` block the tool makes its API call as usual, then fetches the link on
+the server and returns the parsed content:
+
+```json
+"endpointMapping": {
+  "method": "GET",
+  "path": "/reports/2021-06-30/documents/{reportDocumentId}",
+  "download": {
+    "urlField": "url",
+    "compressionField": "compressionAlgorithm",
+    "format": "auto",
+    "allowedHosts": ["amazonaws.com"],
+    "offset": "$offset",
+    "limit": "$limit",
+    "columns": "$columns",
+    "filterColumn": "$filterColumn",
+    "filterValue": "$filterValue"
+  }
+}
+```
+
+- `urlField` (required): dot path of the link in the API response.
+- `allowedHosts` (required): hosts the link may point to; a domain also matches
+  its subdomains. Only `https` links are fetched.
+- `compressionField`: dot path of a marker whose value `GZIP` means gunzip. Gzip
+  is also recognised by its first bytes.
+- `format`: `auto` (default) picks JSON, tab- or comma-separated text from the
+  content; or `tsv`, `csv`, `json`, `text`.
+- `offset`, `limit`, `columns`, `filterColumn`, `filterValue`: references to tool
+  parameters. Delimited files come back as one page of rows keyed by the header
+  (`limit` default 50, at most 500), filtered by one column (several values
+  comma-separated, case-insensitive) and cut to the listed columns, with
+  `columns`, `totalRows`, `matchedRows` and `nextOffset`. JSON comes back whole
+  under `data`; other text as the first 20 000 characters.
+- The link is fetched without the connector's credentials, with the same SSRF
+  checks as every outbound call (each redirect included), at most 25 MB
+  compressed and 32 MB decompressed.
+- REST connectors only, on Cloud and self-hosted alike. Tools without the block
+  behave exactly as before.
 
 ### By Connector Type
 
@@ -1170,6 +1843,16 @@ The engine handles salt fetch → bcrypt → login → token cache → proactive
   }
 }
 ```
+
+A login that takes HTTP Basic credentials (Wazuh's `POST /security/user/authenticate`) sets `"loginBasicAuth": true`: the engine sends `Authorization: Basic base64(username:password)` on the login request only (the API calls keep using `headerTemplate`), the password is never offered to the body templates (`${password}` renders empty), and no body is sent without a `loginBody`. An `Authorization` in `loginHeaders` is refused rather than overridden, as are `signedJwt`, bcrypt `passwordHashing` and a username containing `:`; `scripts/validate-adapters.mjs` reports the same mistakes (rule `login-basic-auth`).
+
+When the login answer is not documented, `tokenJsonPath` may be a list of paths tried in order (the first non-empty string wins), e.g. `["AuthenticationResult.IdToken", "idToken", "token", "."]`. An empty or absent `tokenJsonPath` (or `"."`) takes the whole response body, for a login that answers with a plain-text token.
+
+`username` and `password` are needed only when the login uses them (`${username}` / `${password}` in `loginBody`, `loginBodyTemplate` or `loginHeaders`, no login body at all, or `loginBasicAuth`). A key-only token exchange puts the key in `loginHeaders` (`{"X-Api-Key": "{{API_KEY}}"}`) with `"loginBody": {}`. Connector-level headers are not sent with the login request, and a failed login is reported as `LOGIN_TOKEN: login request failed (HTTP <status>): <excerpt>`.
+
+An XML API (Fnac Darty's marketplace) logs in with an XML document and carries the token in the body of every request instead of a header. Four opt-in fields cover it: `"loginBodyFormat": "xml"` (a string `loginBody` is XML, its values are XML-escaped), `"loginResponseFormat": "xml"` (the XML login answer is parsed, so `tokenJsonPath` reads `auth_response.token`), `"tokenPlacement": "body"` (no token header; the token is `${loginToken}` in a tool's `bodyTemplate`) and `"refreshOnBody401": true` (log in again when a `config.errorWhen` rule with `status: 401` matches the response body). `scripts/validate-adapters.mjs` checks the combinations (rule `login-token-xml`).
+
+A login that answers the token in a response header instead of the body (Ceneo's `GetToken` answers it in a header called `access_token`) sets `"tokenSource": "header"` and `"tokenHeaderName": "access_token"`. The name is matched without regard to case, `tokenJsonPath` is not needed, and the lifetime comes from `tokenTTLSeconds`. `scripts/validate-adapters.mjs` checks the pair (rule `login-token-source`).
 
 See [`docs/connectors/login-token-auth.md`](connectors/login-token-auth.md) for the full field-by-field reference, salt-source types (`fetch` vs `static`), expiry formats (`iso8601` / `unix` / `ttl_seconds`), and re-login policies.
 

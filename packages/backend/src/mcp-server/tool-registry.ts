@@ -72,8 +72,18 @@ export class ToolRegistry {
   private readonly logger = new Logger(ToolRegistry.name);
   // Keyed by tool.id (globally unique) to prevent cross-org name collisions
   private readonly toolsById = new Map<string, RegisteredTool>();
-  // Secondary index by name for backward-compatible lookups (within a filtered set)
-  private readonly toolsByName = new Map<string, RegisteredTool[]>();
+  // Secondary index by name for backward-compatible lookups (within a filtered
+  // set). A Map per name, like the other indexes, so dropping one tool from a
+  // name shared by thousands of installs of a catalog adapter costs O(1).
+  private readonly toolsByName = new Map<string, Map<string, RegisteredTool>>();
+  // Per-organization and per-connector indexes, so a request reads its own
+  // tools instead of copying and filtering the whole registry (134k tools on
+  // Cloud in Nov 2026, once per /mcp request). Each keeps the registry's
+  // insertion order; `order` lets a multi-connector read restore it.
+  private readonly toolsByOrg = new Map<string, Map<string, RegisteredTool>>();
+  private readonly toolsByConnector = new Map<string, Map<string, RegisteredTool>>();
+  private readonly order = new Map<string, number>();
+  private nextOrder = 0;
 
   constructor() {
     // The registry is the largest long-lived structure in the process (it
@@ -85,31 +95,51 @@ export class ToolRegistry {
    * Register a tool in the runtime registry.
    */
   registerTool(tool: RegisteredTool): void {
+    const previous = this.toolsById.get(tool.id);
+    if (previous) {
+      if (previous.organizationId !== tool.organizationId) {
+        this.removeFromIndex(this.toolsByOrg, previous.organizationId, tool.id);
+      }
+      if (previous.connectorId !== tool.connectorId) {
+        this.removeFromIndex(this.toolsByConnector, previous.connectorId, tool.id);
+      }
+    } else {
+      this.order.set(tool.id, this.nextOrder++);
+    }
     this.toolsById.set(tool.id, tool);
-    // Append to name index (multiple tools can share a name across orgs)
-    const existing = this.toolsByName.get(tool.name) || [];
-    existing.push(tool);
-    this.toolsByName.set(tool.name, existing);
+    this.addToIndex(this.toolsByOrg, tool.organizationId, tool);
+    this.addToIndex(this.toolsByConnector, tool.connectorId, tool);
+    // Name index (multiple tools can share a name across orgs). A tool
+    // registered again under the same id replaces its old entry in place, so
+    // the name keeps one entry per tool and its first-registered order.
+    if (previous && previous.name !== tool.name) {
+      this.removeFromIndex(this.toolsByName, previous.name, tool.id);
+    }
+    this.addToIndex(this.toolsByName, tool.name, tool);
     this.logger.debug(`Registered MCP tool: ${tool.name} (${tool.id})`);
   }
 
   /**
    * Unregister all tools belonging to a connector.
+   *
+   * Reads only that connector's tools through the per-connector index. It
+   * used to walk the whole registry and then rebuild the name index from
+   * scratch: two passes over every tool of every organization (316k on Cloud
+   * in Nov 2026) for each reload, and a dashboard tool toggle reloads its
+   * connector. A burst of toggles, or a registry catch-up after a busy day,
+   * then held the event loop long enough to slow every /mcp request.
    */
   unregisterConnectorTools(connectorId: string): void {
-    for (const [id, tool] of this.toolsById.entries()) {
-      if (tool.connectorId === connectorId) {
-        this.toolsById.delete(id);
-        this.logger.debug(`Unregistered MCP tool: ${tool.name} (${id})`);
-      }
+    const tools = this.toolsByConnector.get(connectorId);
+    if (!tools) return;
+    for (const [id, tool] of tools) {
+      this.toolsById.delete(id);
+      this.order.delete(id);
+      this.removeFromIndex(this.toolsByOrg, tool.organizationId, id);
+      this.removeFromIndex(this.toolsByName, tool.name, id);
+      this.logger.debug(`Unregistered MCP tool: ${tool.name} (${id})`);
     }
-    // Rebuild name index
-    this.toolsByName.clear();
-    for (const tool of this.toolsById.values()) {
-      const existing = this.toolsByName.get(tool.name) || [];
-      existing.push(tool);
-      this.toolsByName.set(tool.name, existing);
-    }
+    this.toolsByConnector.delete(connectorId);
   }
 
   /**
@@ -118,9 +148,11 @@ export class ToolRegistry {
    */
   getTool(name: string, connectorIds?: string[]): RegisteredTool | undefined {
     const candidates = this.toolsByName.get(name);
-    if (!candidates || candidates.length === 0) return undefined;
-    if (!connectorIds) return candidates[0];
-    return candidates.find((t) => connectorIds.includes(t.connectorId));
+    if (!candidates) return undefined;
+    for (const t of candidates.values()) {
+      if (!connectorIds || connectorIds.includes(t.connectorId)) return t;
+    }
+    return undefined;
   }
 
   /**
@@ -135,8 +167,11 @@ export class ToolRegistry {
     organizationId: string,
   ): RegisteredTool | undefined {
     const candidates = this.toolsByName.get(name);
-    if (!candidates || candidates.length === 0) return undefined;
-    return candidates.find((t) => t.organizationId === organizationId);
+    if (!candidates) return undefined;
+    for (const t of candidates.values()) {
+      if (t.organizationId === organizationId) return t;
+    }
+    return undefined;
   }
 
   /**
@@ -144,6 +179,47 @@ export class ToolRegistry {
    */
   getAllTools(): RegisteredTool[] {
     return Array.from(this.toolsById.values());
+  }
+
+  /** The tools of one organization, in registration order. */
+  getToolsForOrganization(organizationId: string): RegisteredTool[] {
+    const tools = this.toolsByOrg.get(organizationId);
+    return tools ? Array.from(tools.values()) : [];
+  }
+
+  /**
+   * The tools of the given connectors, in registration order: the same list
+   * as `getAllTools().filter((t) => ids.includes(t.connectorId))`, without
+   * reading the rest of the registry.
+   */
+  getToolsForConnectors(connectorIds: Iterable<string>): RegisteredTool[] {
+    const out: RegisteredTool[] = [];
+    for (const id of new Set(connectorIds)) {
+      const tools = this.toolsByConnector.get(id);
+      if (tools) out.push(...tools.values());
+    }
+    return out.sort((a, b) => (this.order.get(a.id) ?? 0) - (this.order.get(b.id) ?? 0));
+  }
+
+  private addToIndex(
+    index: Map<string, Map<string, RegisteredTool>>,
+    key: string,
+    tool: RegisteredTool,
+  ): void {
+    let bucket = index.get(key);
+    if (!bucket) index.set(key, (bucket = new Map()));
+    bucket.set(tool.id, tool);
+  }
+
+  private removeFromIndex(
+    index: Map<string, Map<string, RegisteredTool>>,
+    key: string,
+    id: string,
+  ): void {
+    const bucket = index.get(key);
+    if (!bucket) return;
+    bucket.delete(id);
+    if (bucket.size === 0) index.delete(key);
   }
 
   /**
@@ -162,7 +238,7 @@ export class ToolRegistry {
    * exposed in the upstream MCP library's (single-tenant) registry.
    */
   countByName(name: string): number {
-    return this.toolsByName.get(name)?.length ?? 0;
+    return this.toolsByName.get(name)?.size ?? 0;
   }
 
   /**
@@ -172,8 +248,8 @@ export class ToolRegistry {
    */
   countByConnector(): Map<string, number> {
     const counts = new Map<string, number>();
-    for (const tool of this.toolsById.values()) {
-      counts.set(tool.connectorId, (counts.get(tool.connectorId) ?? 0) + 1);
+    for (const [connectorId, tools] of this.toolsByConnector) {
+      counts.set(connectorId, tools.size);
     }
     return counts;
   }

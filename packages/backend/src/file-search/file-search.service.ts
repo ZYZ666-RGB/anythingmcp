@@ -31,6 +31,7 @@ import { buildFileSearchBuiltinTools } from './file-search-builtins';
 import { clampInterval, nextPlan, SYNC_INTERVALS } from './file-search-quotas';
 import { applySelection, checkQuota, estimate, selectionOf, type CompactListing, type Selection } from './file-search-selection';
 import { CLOUD_PROTOCOLS, FILE_SEARCH_PROTOCOLS, isPausedState, type FileSearchConfig } from './file-search.types';
+import { ownedConnectorWhere, type VisibilityScope } from '../settings/member-visibility.service';
 
 /**
  * The setup wizard and the Files tab (#1385). Orchestration only: tests,
@@ -43,6 +44,9 @@ interface Actor {
   organizationId: string;
   role: string;
 }
+
+/** The 404 message for an unknown File Search connector, and for one a restricted member cannot see. */
+export const FILE_SEARCH_CONNECTOR_NOT_FOUND = 'File Search connector not found.';
 
 const TEST_WINDOW_MS = 10 * 60_000;
 const TEST_MAX = 10;
@@ -175,8 +179,28 @@ export class FileSearchService {
 
   private async loadConnector(actor: Actor, id: string) {
     const c = await this.prisma.connector.findFirst({ where: { id, organizationId: actor.organizationId, type: 'FILE_SEARCH' as any } });
-    if (!c) throw new NotFoundException('File Search connector not found.');
+    if (!c) throw new NotFoundException(FILE_SEARCH_CONNECTOR_NOT_FOUND);
     return c;
+  }
+
+  /**
+   * Member visibility: in a restricted workspace a member who is not an admin
+   * reaches the File Search routes of a connector only when they own it.
+   * Every other connector answers exactly the 404 of an unknown id, including
+   * one shared with them through their roles: the overview, tree, problems,
+   * runs, scans and access rules describe the source (its address, every
+   * folder and file name, the role rules) beyond what their AI client may
+   * read through the tools, which apply the folder rules. Called by the
+   * controller for restricted scopes only; the workspace filter stays, the
+   * owner filter is added with AND.
+   */
+  async assertVisible(actor: Actor, id: string, scope: VisibilityScope): Promise<void> {
+    if (!scope.restricted) return;
+    const c = await this.prisma.connector.findFirst({
+      where: { AND: [{ id, organizationId: actor.organizationId, type: 'FILE_SEARCH' as any }, ownedConnectorWhere(scope)] },
+      select: { id: true },
+    });
+    if (!c) throw new NotFoundException(FILE_SEARCH_CONNECTOR_NOT_FOUND);
   }
 
   /** Saves a tested connector as a draft: no tools, no schedule, not on any server. */

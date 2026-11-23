@@ -9,8 +9,8 @@ import {
   UnauthorizedException,
   UseGuards,
 } from '@nestjs/common';
-import { AuthGuard } from '@nestjs/passport';
-import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { JwtOrManagementKeyGuard } from '../auth/jwt-or-management-key.guard';
+import { ApiBearerAuth, ApiExcludeEndpoint, ApiOperation, ApiSecurity } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import type { Request } from 'express';
 import { ConnectorSetupService } from './connector-setup.service';
@@ -23,8 +23,10 @@ const SIGN_IN_AGAIN = 'Sign in to open this link.';
  * Opening a setup link (/s/<token> in the dashboard). A link only opens for
  * the user it was made for, so one forwarded or leaked from a chat opens
  * nothing for anyone else.
+ *
+ * Both routes serve the dashboard's /s/<token> page, not API clients, so they
+ * are kept out of the OpenAPI document (and the controller carries no tag).
  */
-@ApiTags('Connector setup')
 @Controller('api/setup-links')
 export class SetupLinksController {
   private readonly logger = new Logger(SetupLinksController.name);
@@ -36,8 +38,10 @@ export class SetupLinksController {
 
   @Post('resolve')
   @HttpCode(200)
+  @ApiExcludeEndpoint()
   @ApiBearerAuth()
-  @UseGuards(AuthGuard('jwt'))
+  @ApiSecurity('api-key')
+  @UseGuards(JwtOrManagementKeyGuard)
   @Throttle({ default: { limit: 20, ttl: 60_000 } })
   @ApiOperation({ summary: 'Open a connector setup link with the dashboard session' })
   async resolve(
@@ -45,7 +49,7 @@ export class SetupLinksController {
     @Body() body: { token?: string; from?: string },
   ): Promise<{ redirect: string; session?: RecentSignInSession }> {
     // `from` only picks the setup page's way back, from a fixed list.
-    const out = await this.setup.resolveLink(String(body?.token ?? ''), req.user.sub, body?.from);
+    const out = await this.setup.resolveLink(String(body?.token ?? ''), req.user.sub, body?.from, { signedIn: true });
     if ('error' in out) throw new GoneException(out.error);
     // The session is on another workspace than the connector: switch, as the
     // workspace menu would, or the setup page could not save anything.
@@ -65,6 +69,7 @@ export class SetupLinksController {
    */
   @Post('open')
   @HttpCode(200)
+  @ApiExcludeEndpoint()
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({ summary: 'Open a connector setup link right after signing in to connect an AI client' })
   async open(

@@ -3,7 +3,9 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import { useAuth } from '@/lib/auth-context';
-import { connectors, tools, withSecretsNotice, withImportNotice, isMachineGrant, type ToolTestResult, type CatalogDiff, type OAuthGrant } from '@/lib/api';
+import { connectors, tools, withSecretsNotice, withImportNotice, isMachineGrant, planLimitOf, type ToolTestResult, type CatalogDiff, type OAuthGrant } from '@/lib/api';
+import { atPlanCap, pausedByPlanSets, usePlanUsage } from '@/lib/use-plan-fit';
+import { PausedByPlanBadge, PlanSwapDialog, type SwapAxis } from '@/components/plan-swap-dialog';
 import { findDemoByTool } from '@/lib/demo-connectors';
 import { ToolEditor } from '@/components/tool-editor';
 import { McpAssignModal } from '@/components/mcp-assign-modal';
@@ -13,17 +15,23 @@ import { AppShell } from '@/components/app-shell';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { Button, buttonVariants } from '@/components/ui/button';
+import { NetworkNote } from '@/components/connector-setup/network-note';
 import { Card } from '@/components/ui/card';
 import { Badge, StatusPill } from '@/components/ui/badge';
-import { SetupStatusBanner, SetupStatusPill } from '@/components/setup-status';
-import { AuthStatusBanner, AuthStatusPill } from '@/components/auth-status';
+import { SetupStatusBanner, SetupStatusPill, finishSetupHref } from '@/components/setup-status';
+import { AuthStatusBanner, AuthStatusPill, isCredentialsRefused } from '@/components/auth-status';
+import { MetaSignInBanner, type MetaSignInStatus } from '@/components/meta-sign-in-banner';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useLocale, useTranslations } from 'next-intl';
 import { cn } from '@/lib/utils';
+import { missingLoginCredential, tokenPathFromInput, tokenPathToInput } from '@/lib/login-token-form';
 import { useAuthTypeLabel } from '@/lib/use-auth-type-label';
+import { canManageConnector } from '@/lib/can-manage-connector';
+import { useConnectorOwners } from '@/lib/use-connector-owners';
 import { ToolAnnotationsEditor } from '@/components/tool-annotations-editor';
 import { UserCredentialsCard } from '@/components/user-credentials-card';
+import { WebhookCard } from '@/components/webhook-card';
 import { FilesPanel } from '@/components/file-search/files-panel';
 import Link from 'next/link';
 import {
@@ -51,12 +59,86 @@ const IMPORT_SOURCES: { id: string; placeholder?: string }[] = [
   { id: 'odata' },
 ];
 
+/**
+ * The backend's answers when "Authorize with Provider" cannot start because
+ * the app's client id/secret are not saved (connector-authorization.ts):
+ * shown in plain words instead.
+ */
+function isMissingClientKeysError(error: string): boolean {
+  return /No clientId configured|environment variables first/i.test(error);
+}
+
+/** Stands for "no client id stored at all" in the list of missing keys. */
+const CLIENT_ID_UNSET = '__client_id__';
+
+/**
+ * The variables of a REST/GraphQL OAuth client that are still empty: the
+ * `{{VAR}}` names in the stored client id that the connector reports as
+ * missing, or the client id itself when none is stored. Empty while the
+ * OAuth settings are loading, and for MCP connectors (they register a
+ * client on their own).
+ */
+function missingOAuthClientKeys(
+  connector: { type?: string; missingVariables?: string[] },
+  clientIdRaw: string | null,
+): string[] {
+  if (connector.type === 'MCP' || clientIdRaw === null) return [];
+  if (clientIdRaw.trim() === '') return [CLIENT_ID_UNSET];
+  const missing = new Set(connector.missingVariables ?? []);
+  const used = [...clientIdRaw.matchAll(/\{\{\s*([^}]+?)\s*\}\}/g)].map((m) => m[1]);
+  if (!used.some((name) => missing.has(name))) return [];
+  // The secret is not returned to the page; any other missing variable named
+  // like a client credential belongs to the same app.
+  return [...missing].filter((name) => used.includes(name) || /CLIENT|SECRET|KEY/i.test(name)).sort();
+}
+
 /** OData settings live under config.odata on ODATA connectors and OData-enabled REST connectors. */
 function hasOData(connector: any): boolean {
   return connector?.type === 'ODATA' || (connector?.type === 'REST' && !!connector?.config?.odata);
 }
 
 const EDIT_DEFAULT_LOGIN_BODY = '{\n  "username": "${username}",\n  "password": "${password}"\n}';
+
+/**
+ * The Login → Token settings as the form was filled (from the server, or the
+ * defaults): saving sends only what differs, merged server-side, so settings
+ * this form does not show survive. Secrets are never part of it.
+ */
+interface LoginTokenFormSnapshot {
+  loginUrl: string;
+  method: string;
+  body: string;
+  /** The stored body is a string (form, XML): an edit is sent as text. */
+  bodyIsString: boolean;
+  /** A body with a literal secret is stored but not shown. */
+  bodyHidden: boolean;
+  hasTemplate: boolean;
+  tokenPath: string;
+  ttl: string;
+  refreshOn401: boolean;
+  headers: string;
+  maskedHeaders: string[];
+  hasUsername: boolean;
+  hasPassword: boolean;
+  tokenSource: 'body' | 'cookie' | 'header';
+}
+
+const EMPTY_LOGIN_TOKEN_SNAPSHOT: LoginTokenFormSnapshot = {
+  loginUrl: '',
+  method: 'POST',
+  body: EDIT_DEFAULT_LOGIN_BODY,
+  bodyIsString: false,
+  bodyHidden: false,
+  hasTemplate: false,
+  tokenPath: 'token',
+  ttl: '',
+  refreshOn401: true,
+  headers: '{}',
+  maskedHeaders: [],
+  hasUsername: false,
+  hasPassword: false,
+  tokenSource: 'body',
+};
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -174,7 +256,7 @@ function slimHarForUpload(rawText: string, baseUrl?: string): { json: string; by
 }
 
 export default function ConnectorDetailPage() {
-  const { token, user, deploymentMode } = useAuth();
+  const { token, user, deploymentMode, deploymentModeLoaded } = useAuth();
   const t = useTranslations('connectorDetail');
   const te = useTranslations('emailSettings');
   const tt = useTranslations('connectorTools');
@@ -185,6 +267,23 @@ export default function ConnectorDetailPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const id = params.id as string;
+  // Cloud: whether the last automatic downgrade paused this connector, and the
+  // swap dialog when activating it would go past the plan.
+  const { usage: planUsage, reload: reloadPlanUsage } = usePlanUsage();
+  // Admins of a workspace with several members see who owns each connector.
+  // Cloud: the plan usage this page loads anyway says how many members there
+  // are, so a single-member workspace asks for no members list. Self-hosted
+  // has no such number for the workspace: the hook makes that one request.
+  const memberCount = !deploymentModeLoaded
+    ? null
+    : deploymentMode === 'cloud'
+      ? (planUsage ? planUsage.users.current : null)
+      : undefined;
+  const ownerOf = useConnectorOwners(memberCount);
+  const pausedByPlan = pausedByPlanSets(planUsage).connectors.has(id);
+  const tSwap = useTranslations('planSwap');
+  const tAuthStatus = useTranslations('authStatus');
+  const [swap, setSwap] = useState<{ axis: SwapAxis; max: number | null; activate?: () => Promise<void> } | null>(null);
 
   const [connector, setConnector] = useState<any>(null);
   const [toolList, setToolList] = useState<any[]>([]);
@@ -192,11 +291,27 @@ export default function ConnectorDetailPage() {
   // Whether CONNECTOR_PROXY_URL is configured on this instance — drives
   // visibility of the per-tool "Use proxy" checkbox.
   const [proxyAvailable, setProxyAvailable] = useState(false);
+  // The addresses this instance calls APIs from (EGRESS_IPS), for servers
+  // that only accept approved IPs. Empty when the operator did not set them.
+  const [egressIps, setEgressIps] = useState<string[]>([]);
   // Tool whose MCP hints (annotations) panel is expanded, if any.
   const [hintsToolId, setHintsToolId] = useState<string | null>(null);
 
   // OAuth + MCP discovery
   const [authorizing, setAuthorizing] = useState(false);
+  // What "Authorize with Provider" answered when it could not start, shown
+  // next to the button: the page-level message sits far above it and was
+  // missed (a customer clicked five times and saw nothing).
+  const [oauthError, setOauthError] = useState('');
+  // `?signin=1`, the link of the "your app was approved" email: the sign-in
+  // starts by itself for a connector that waits for it. 'manual' when it
+  // could not start: the button is then focused, with a line above it.
+  const [signInLink, setSignInLink] = useState<'' | 'starting' | 'manual'>('');
+  const signInLinkHandled = useRef(false);
+  const oauthCardRef = useRef<HTMLDivElement>(null);
+  const signInButtonFocused = useRef(false);
+  // The stored client id as written ("{{ETSY_CLIENT_ID}}"); null until loaded.
+  const [oauthClientIdRaw, setOauthClientIdRaw] = useState<string | null>(null);
   const [discovering, setDiscovering] = useState(false);
   const [editing, setEditing] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<
@@ -251,6 +366,9 @@ export default function ConnectorDetailPage() {
   const [editLtTokenPath, setEditLtTokenPath] = useState('token');
   const [editLtTtl, setEditLtTtl] = useState('');
   const [editLtRefreshOn401, setEditLtRefreshOn401] = useState(true);
+  // Headers sent with the login request only (authConfig.loginHeaders).
+  const [editLtHeaderRows, setEditLtHeaderRows] = useState<HeaderRow[]>([]);
+  const [ltSnapshot, setLtSnapshot] = useState<LoginTokenFormSnapshot>(EMPTY_LOGIN_TOKEN_SNAPSHOT);
   const [editHeaderRows, setEditHeaderRows] = useState<HeaderRow[]>([]);
   const [editDbReadOnly, setEditDbReadOnly] = useState(true);
   const [editDbDeniedTables, setEditDbDeniedTables] = useState('');
@@ -263,6 +381,16 @@ export default function ConnectorDetailPage() {
   const [importEntitySets, setImportEntitySets] = useState('');
   const [editInstructions, setEditInstructions] = useState('');
   const [msg, setMsg] = useState('');
+  // Result of an import or auto-import, shown in the Tools card next to the
+  // buttons that started it: the page-level message sits far above and went
+  // unnoticed, so a failed import looked like nothing had happened.
+  const [toolsMsg, setToolsMsg] = useState('');
+  // The outcome of a Meta sign-in of an Instagram connector (?meta=…), with its next step.
+  const [metaSignIn, setMetaSignIn] = useState<{
+    status: MetaSignInStatus;
+    message: string | null;
+    reason?: string | null;
+  } | null>(null);
   const [testResult, setTestResult] = useState<{
     ok: boolean;
     message: string;
@@ -329,18 +457,28 @@ export default function ConnectorDetailPage() {
       // Cheap, instance-wide flag — drives the per-tool proxy checkbox.
       connectors
         .proxyAvailability(token)
-        .then((r) => setProxyAvailable(!!r.available))
+        .then((r) => {
+          setProxyAvailable(!!r.available);
+          setEgressIps(Array.isArray(r.egressIps) ? r.egressIps : []);
+        })
         .catch(() => setProxyAvailable(false));
       const c = await connectors.get(id, token);
       setConnector(c);
       // Only catalog-installed connectors have anything to compare against;
-      // the endpoint answers catalogManaged:false for the rest.
-      connectors
-        .catalogDiff(id, token)
-        .then((d) => setCatalogDiff(d.catalogManaged && !d.isUpToDate ? d : null))
-        .catch(() => setCatalogDiff(null));
+      // the endpoint answers catalogManaged:false for the rest. Owner or admin
+      // only (the route answers 403 to anyone else), so nobody else asks.
+      if (canManageConnector(user, c)) {
+        connectors
+          .catalogDiff(id, token)
+          .then((d) => setCatalogDiff(d.catalogManaged && !d.isUpToDate ? d : null))
+          .catch(() => setCatalogDiff(null));
+      } else {
+        setCatalogDiff(null);
+      }
       setEditName(c.name);
-      setEditBaseUrl(c.baseUrl);
+      // The reduced view (memberView) has no address or settings; the edit
+      // form these feed is not shown for it.
+      setEditBaseUrl(c.baseUrl || '');
       setEditHealthcheckPath(c.healthcheckPath || '');
       setEditActive(c.isActive);
       setEditAuthType(c.authType || 'NONE');
@@ -368,12 +506,46 @@ export default function ConnectorDetailPage() {
             setEditOauthGrant(r.grant || 'authorization_code');
             setLoadedOauthGrant(r.grant || 'authorization_code');
             setOauthHasPasswordCreds(r.hasUsername && r.hasPassword);
+            setOauthClientIdRaw(typeof r.clientId === 'string' ? r.clientId : '');
           })
           .catch(() => setEditTokenAuthMethod('client_secret_post'));
       }
-      // authConfig is encrypted server-side, so LOGIN_TOKEN fields start empty;
-      // headers are stored in the clear and can be pre-filled for editing.
+      // authConfig is encrypted server-side: the Login → Token settings come
+      // from their own endpoint, without username, password or secret header
+      // values. Headers are stored in the clear and can be pre-filled.
       setEditLtPassword('');
+      setEditLtUsername('');
+      if (c.authType === 'LOGIN_TOKEN') {
+        connectors
+          .getLoginTokenConfig(id, token)
+          .then((r) => {
+            const bodyIsString = typeof r.loginBody === 'string';
+            applyLoginTokenSnapshot({
+              loginUrl: r.loginUrl,
+              method: r.loginMethod || 'POST',
+              body:
+                r.loginBody === undefined
+                  ? ''
+                  : bodyIsString
+                    ? (r.loginBody as string)
+                    : JSON.stringify(r.loginBody, null, 2),
+              bodyIsString,
+              bodyHidden: r.loginBodyHidden,
+              hasTemplate: r.hasLoginBodyTemplate,
+              tokenPath: tokenPathToInput(r.tokenJsonPath),
+              ttl: typeof r.tokenTTLSeconds === 'number' ? String(r.tokenTTLSeconds) : '',
+              refreshOn401: r.refreshOn401,
+              headers: JSON.stringify(r.loginHeaders ?? {}),
+              maskedHeaders: r.maskedLoginHeaders ?? [],
+              hasUsername: r.hasUsername,
+              hasPassword: r.hasPassword,
+              tokenSource: r.tokenSource,
+            });
+          })
+          .catch(() => applyLoginTokenSnapshot(EMPTY_LOGIN_TOKEN_SNAPSHOT));
+      } else {
+        applyLoginTokenSnapshot(EMPTY_LOGIN_TOKEN_SNAPSHOT);
+      }
       setEditHeaderRows(objectToHeaderRows(c.headers as Record<string, string> | null));
       setEditDbReadOnly((c.config as any)?.readOnly !== false);
       {
@@ -434,9 +606,84 @@ export default function ConnectorDetailPage() {
       setMsg(t('msg.oauthError', { message }));
       window.history.replaceState({}, '', `/connectors/${id}`);
     }
+    const metaStatus = searchParams.get('meta');
+    if (metaStatus === 'connected' || metaStatus === 'choose' || metaStatus === 'no_account' || metaStatus === 'error') {
+      setMetaSignIn({ status: metaStatus, message: searchParams.get('message'), reason: searchParams.get('reason') });
+      window.history.replaceState({}, '', `/connectors/${id}`);
+    }
 
     fetchConnector();
   }, [token, id]);
+
+  /** Fill the Login → Token fields from a snapshot and remember it. */
+  const applyLoginTokenSnapshot = (snap: LoginTokenFormSnapshot) => {
+    setLtSnapshot(snap);
+    setEditLtLoginUrl(snap.loginUrl);
+    setEditLtMethod(snap.method);
+    setEditLtLoginBody(snap.body);
+    setEditLtTokenPath(snap.tokenPath);
+    setEditLtTtl(snap.ttl);
+    setEditLtRefreshOn401(snap.refreshOn401);
+    setEditLtHeaderRows(objectToHeaderRows(JSON.parse(snap.headers) as Record<string, string>));
+  };
+
+  /** The typed login body: undefined when empty, else parsed JSON (or text for a stored text body). */
+  const parseLtLoginBody = (): unknown => {
+    const raw = editLtLoginBody.trim();
+    if (!raw) return undefined;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      if (ltSnapshot.bodyIsString) return editLtLoginBody;
+      throw new Error(t('msg.loginJson'));
+    }
+  };
+
+  /** Refuse a login that uses a credential nobody gave (typed now or stored). */
+  const assertLtCredentials = (opts: { hasBody: boolean; bodyText: string; headers: Record<string, string>; stored: boolean }) => {
+    const missing = missingLoginCredential({
+      texts: [opts.bodyText, ...Object.values(opts.headers)],
+      hasBody: opts.hasBody,
+      hasUsername: !!editLtUsername || (opts.stored && ltSnapshot.hasUsername),
+      hasPassword: !!editLtPassword || (opts.stored && ltSnapshot.hasPassword),
+    });
+    if (missing === 'username') throw new Error(t('loginToken.usernameRequired', { user: '${username}' }));
+    if (missing === 'password') throw new Error(t('loginToken.passwordRequired', { pass: '${password}' }));
+  };
+
+  /**
+   * The changes to a connector that already uses Login → Token, for the
+   * merging PATCH: only what differs from the loaded settings, plus a typed
+   * username or password (empty keeps the stored one).
+   */
+  const buildLoginTokenPatch = () => {
+    const snap = ltSnapshot;
+    const patch: Parameters<typeof connectors.updateLoginTokenConfig>[1] = {};
+    if (editLtLoginUrl.trim() !== snap.loginUrl) {
+      if (!editLtLoginUrl.trim()) throw new Error(t('loginToken.urlRequired'));
+      patch.loginUrl = editLtLoginUrl.trim();
+    }
+    if (editLtMethod !== snap.method) patch.loginMethod = editLtMethod;
+    const bodyChanged = editLtLoginBody !== snap.body;
+    if (bodyChanged && !(snap.bodyHidden && !editLtLoginBody.trim())) {
+      const body = parseLtLoginBody();
+      patch.loginBody = body === undefined ? null : body;
+    }
+    if (editLtUsername) patch.username = editLtUsername;
+    if (editLtPassword) patch.password = editLtPassword;
+    if (editLtTokenPath.trim() !== snap.tokenPath.trim()) patch.tokenJsonPath = tokenPathFromInput(editLtTokenPath);
+    if (editLtTtl.trim() !== snap.ttl) patch.tokenTTLSeconds = editLtTtl.trim() ? Number(editLtTtl) : null;
+    if (editLtRefreshOn401 !== snap.refreshOn401) patch.refreshOn401 = editLtRefreshOn401;
+    const headers = headerRowsToObject(editLtHeaderRows);
+    if (JSON.stringify(headers) !== snap.headers) patch.loginHeaders = headers;
+    // A hidden stored body cannot be checked here; the login reports it.
+    const bodyKnown = !(snap.bodyHidden && !editLtLoginBody.trim());
+    if (bodyKnown) {
+      const hasBody = !!editLtLoginBody.trim() || (snap.hasTemplate && !bodyChanged);
+      assertLtCredentials({ hasBody, bodyText: editLtLoginBody, headers, stored: true });
+    }
+    return patch;
+  };
 
   const buildAuthConfig = () => {
     // Only send authConfig if the user filled in credential fields;
@@ -483,25 +730,25 @@ export default function ConnectorDetailPage() {
         };
       }
       case 'LOGIN_TOKEN': {
-        // Re-entering the password is required to (re)write the whole config;
-        // leaving it empty keeps the existing encrypted credentials untouched.
-        if (!editLtPassword) return undefined;
-        let loginBody: unknown;
-        const raw = editLtLoginBody.trim();
-        if (raw) {
-          try {
-            loginBody = JSON.parse(raw);
-          } catch {
-            throw new Error(t('msg.loginJson'));
-          }
-        }
+        // A connector that already logs in this way is patched field by
+        // field instead (see handleSave): a full write would drop the
+        // settings this form does not show (login headers set through the
+        // API, header name, extra headers, token source …).
+        if (connector.authType === 'LOGIN_TOKEN') return undefined;
+        if (!editLtLoginUrl.trim()) throw new Error(t('loginToken.urlRequired'));
+        const loginBody = parseLtLoginBody();
+        const loginHeaders = headerRowsToObject(editLtHeaderRows);
+        assertLtCredentials({ hasBody: loginBody !== undefined, bodyText: editLtLoginBody, headers: loginHeaders, stored: false });
+        const tokenJsonPath = tokenPathFromInput(editLtTokenPath);
         return {
-          loginUrl: editLtLoginUrl,
+          loginUrl: editLtLoginUrl.trim(),
           loginMethod: editLtMethod || 'POST',
           ...(loginBody !== undefined ? { loginBody } : {}),
-          username: editLtUsername,
-          password: editLtPassword,
-          tokenJsonPath: editLtTokenPath || 'token',
+          ...(Object.keys(loginHeaders).length > 0 ? { loginHeaders } : {}),
+          ...(editLtUsername ? { username: editLtUsername } : {}),
+          ...(editLtPassword ? { password: editLtPassword } : {}),
+          // Left out when empty: the whole response body is the token.
+          ...(tokenJsonPath !== '' ? { tokenJsonPath } : {}),
           ...(editLtTtl.trim() ? { tokenTTLSeconds: Number(editLtTtl) } : {}),
           refreshOn401: editLtRefreshOn401,
         };
@@ -511,8 +758,39 @@ export default function ConnectorDetailPage() {
     }
   };
 
-  const handleSave = async () => {
+  /** The plan-limit axis of this connector: File Search folders have their own. */
+  const swapAxis = (): SwapAxis => (connector?.type === 'FILE_SEARCH' ? 'fileSearchConnectors' : 'connectors');
+
+  /** Activate from the header (a connector the plan paused); the swap at the cap. */
+  const handleActivateNow = async () => {
+    if (!token || !connector) return;
+    if (swapAxis() === 'connectors' && atPlanCap(planUsage, 'connectors')) {
+      setSwap({ axis: 'connectors', max: planUsage?.connectors.max ?? null });
+      return;
+    }
+    try {
+      await connectors.update(id, { isActive: true }, token);
+      fetchConnector();
+      reloadPlanUsage();
+    } catch (err: any) {
+      const limit = planLimitOf(err);
+      if (limit && limit.axis !== 'users') setSwap({ axis: limit.axis, max: limit.max || null });
+      else setMsg(t('msg.error', { message: err.message }));
+    }
+  };
+
+  /**
+   * Save the form. Turning the connector on at the plan's cap opens the swap
+   * dialog first; its "Pause and activate" then saves again (`rethrow`, so a
+   * failure puts the paused one back).
+   */
+  const handleSave = async (opts?: { rethrow?: boolean }) => {
     if (!token) return;
+    const activating = editActive && !connector.isActive;
+    if (!opts?.rethrow && activating && swapAxis() === 'connectors' && atPlanCap(planUsage, 'connectors')) {
+      setSwap({ axis: 'connectors', max: planUsage?.connectors.max ?? null, activate: () => handleSave({ rethrow: true }) });
+      return;
+    }
     try {
       if (
         editAuthType === 'OAUTH2' &&
@@ -544,6 +822,14 @@ export default function ConnectorDetailPage() {
         if (editOauth1TokenSecret.trim()) oauth1Patch.tokenSecret = editOauth1TokenSecret.trim();
         if (Object.keys(oauth1Patch).length > 0) {
           await connectors.updateOAuth1Config(id, oauth1Patch, token);
+        }
+      }
+      // Login → Token on a connector that already uses it: merged server-side,
+      // before the main update so a refused value saves nothing.
+      if (editAuthType === 'LOGIN_TOKEN' && connector.authType === 'LOGIN_TOKEN') {
+        const loginPatch = buildLoginTokenPatch();
+        if (Object.keys(loginPatch).length > 0) {
+          await connectors.updateLoginTokenConfig(id, loginPatch, token);
         }
       }
       if (connector.type === 'EMAIL') {
@@ -620,7 +906,14 @@ export default function ConnectorDetailPage() {
       setMsg(withSecretsNotice(t('msg.updated'), saved));
       setEditing(false);
       fetchConnector();
+      if (activating) reloadPlanUsage();
     } catch (err: any) {
+      if (opts?.rethrow) throw err;
+      const limit = planLimitOf(err);
+      if (limit && limit.axis !== 'users') {
+        setSwap({ axis: limit.axis, max: limit.max || null, activate: () => handleSave({ rethrow: true }) });
+        return;
+      }
       setMsg(t('msg.error', { message: err.message }));
     }
   };
@@ -672,14 +965,14 @@ export default function ConnectorDetailPage() {
 
   const handleImportSpec = async () => {
     if (!token) return;
-    setMsg(t('msg.importingSpec'));
+    setToolsMsg(t('msg.importingSpec'));
     try {
       const result = await connectors.importSpec(id, token);
-      setMsg(withImportNotice(result.message, result));
+      setToolsMsg(withImportNotice(result.message, result));
       fetchConnector();
       promptMcpAssignIfNeeded();
     } catch (err: any) {
-      setMsg(t('msg.importFailed', { message: err.message }));
+      setToolsMsg(t('msg.importFailed', { message: err.message }));
     }
   };
 
@@ -715,6 +1008,7 @@ export default function ConnectorDetailPage() {
   const handleImportTools = async () => {
     if (!token) return;
     setImporting(true);
+    setToolsMsg('');
     try {
       const data: { source: string; content?: string; url?: string; service?: string; entitySets?: string[] } = {
         source: importSource,
@@ -726,6 +1020,10 @@ export default function ConnectorDetailPage() {
         if (sets.length) data.entitySets = sets;
       } else if (importSource === 'curl' || importSource === 'json' || importSource === 'har') {
         data.content = importContent;
+      } else if ((importSource === 'openapi' || importSource === 'postman') && importContent.trim()) {
+        // A pasted spec wins over the URL: users paste it when the URL does not
+        // load (a site that blocks downloads), often with the URL still filled in.
+        data.content = importContent;
       } else if (importUrl) {
         data.url = importUrl;
       } else if (importContent) {
@@ -733,9 +1031,9 @@ export default function ConnectorDetailPage() {
       }
       const result = await connectors.importTools(id, data, token) as any;
       if (result.error) {
-        setMsg(result.error);
+        setToolsMsg(result.error);
       } else {
-        setMsg(withImportNotice(result.message, result));
+        setToolsMsg(withImportNotice(result.message, result));
         setShowImport(false);
         setImportContent('');
         setImportUrl('');
@@ -745,7 +1043,7 @@ export default function ConnectorDetailPage() {
         promptMcpAssignIfNeeded();
       }
     } catch (err: any) {
-      setMsg(t('msg.importFailed', { message: err.message }));
+      setToolsMsg(t('msg.importFailed', { message: err.message }));
     } finally {
       setImporting(false);
     }
@@ -911,6 +1209,25 @@ export default function ConnectorDetailPage() {
     }
   };
 
+  /**
+   * Where a hand-built connector keeps its credentials: its variables when it
+   * has any, else the details form. Opened and brought into view from the
+   * "credentials refused" notice, with the first field focused.
+   */
+  const openCredentials = () => {
+    const inVariables = envVarEntries.length > 0;
+    if (inVariables) setShowEnvVars(true);
+    else setEditing(true);
+    const targetId = inVariables ? 'connector-variables' : 'connector-details';
+    requestAnimationFrame(() => {
+      const target = document.getElementById(targetId);
+      if (!target) return;
+      const calm = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      target.scrollIntoView({ behavior: calm ? 'auto' : 'smooth', block: 'start' });
+      target.querySelector<HTMLInputElement>('input')?.focus({ preventScroll: true });
+    });
+  };
+
   const handleSaveEnvVars = async () => {
     if (!token) return;
     setSavingEnvVars(true);
@@ -938,11 +1255,87 @@ export default function ConnectorDetailPage() {
     }
   };
 
-  const handleOAuthAuthorize = async () => {
+  /** Starts the provider's sign-in. True when the browser is leaving for it. */
+  const handleOAuthAuthorize = async (): Promise<boolean> => {
+    if (!token) return false;
+    setAuthorizing(true);
+    setOauthError('');
+    try {
+      const result = await connectors.oauthAuthorize(id, token);
+      if (result.authorizationUrl) {
+        window.location.href = result.authorizationUrl;
+        return true;
+      } else if (result.error) {
+        setOauthError(isMissingClientKeysError(result.error) ? t('oauthCard.keysMissing') : result.error);
+      }
+    } catch (err: any) {
+      setOauthError(t('msg.authorizationFailed', { message: err.message }));
+    } finally {
+      setAuthorizing(false);
+    }
+    return false;
+  };
+
+  // `?signin=1` (the "your app was approved" email, and the AI client's
+  // answers): start what the sign-in button starts, with no search for it.
+  //
+  // The parameter is a flag and carries no address: the page asks the server
+  // for the provider's URL of THIS connector, exactly as the button does, so
+  // the link cannot send anyone elsewhere. It acts once, only for a signed-in
+  // user (the page does not load otherwise, and /login brings the same link
+  // back), only on the connector in the path, and only while that connector
+  // waits for its authorization: one already signed in is left alone, so the
+  // link can never replace a working sign-in. The provider's own consent page
+  // still asks before anything is granted.
+  useEffect(() => {
+    if (signInLinkHandled.current || searchParams.get('signin') !== '1') return;
+    if (!token || !connector || connector.id !== id) return;
+    const oauth2 = connector.authType === 'OAUTH2' && connector.type !== 'MCP';
+    // Its OAuth settings (grant, client keys) are still loading.
+    if (oauth2 && oauthClientIdRaw === null) return;
+    signInLinkHandled.current = true;
+    // Dropped before leaving, so "back" from the provider does not start it again.
+    window.history.replaceState({}, '', `/connectors/${id}`);
+    const waitsForSignIn =
+      oauth2 &&
+      connector.setupStatus === 'needs_authorization' &&
+      connector.credentialScope !== 'USER' &&
+      !isMachineGrant(loadedOauthGrant) &&
+      missingOAuthClientKeys(connector, oauthClientIdRaw).length === 0;
+    if (!waitsForSignIn) return;
+    setSignInLink('starting');
+    void handleOAuthAuthorize().then((leaving) => {
+      // Could not start: bring the button into view instead (effect below).
+      if (!leaving) setSignInLink('manual');
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connector, oauthClientIdRaw, token, searchParams]);
+
+  // The button is disabled while the sign-in starts and a disabled button
+  // takes no focus: wait for the render that enables it again.
+  useEffect(() => {
+    if (signInLink !== 'manual' || authorizing || signInButtonFocused.current) return;
+    signInButtonFocused.current = true;
+    oauthCardRef.current?.scrollIntoView({ block: 'center' });
+    oauthCardRef.current?.querySelector('button')?.focus();
+  }, [signInLink, authorizing]);
+
+  // "Back" from the provider can restore this page exactly as it was left:
+  // the "opening the sign-in" line would then stand there with nothing going on.
+  useEffect(() => {
+    const onShow = (event: PageTransitionEvent) => {
+      if (event.persisted) setSignInLink('');
+    };
+    window.addEventListener('pageshow', onShow);
+    return () => window.removeEventListener('pageshow', onShow);
+  }, []);
+
+  // Shopee shops are authorized through Shopee's own signed link, not OAuth2.
+  const handleShopeeAuthorize = async () => {
     if (!token) return;
     setAuthorizing(true);
     try {
-      const result = await connectors.oauthAuthorize(id, token);
+      const result = await connectors.shopeeAuthorize(id, token);
       if (result.authorizationUrl) {
         window.location.href = result.authorizationUrl;
       } else if (result.error) {
@@ -955,12 +1348,66 @@ export default function ConnectorDetailPage() {
     }
   };
 
-  // Shopee shops are authorized through Shopee's own signed link, not OAuth2.
-  const handleShopeeAuthorize = async () => {
+  // TikTok shops are authorized through TikTok Shop's own seller authorization link.
+  const handleTikTokShopAuthorize = async () => {
     if (!token) return;
     setAuthorizing(true);
     try {
-      const result = await connectors.shopeeAuthorize(id, token);
+      const result = await connectors.tiktokShopAuthorize(id, token);
+      if (result.authorizationUrl) {
+        window.location.href = result.authorizationUrl;
+      } else if (result.error) {
+        setMsg(result.error);
+      }
+    } catch (err: any) {
+      setMsg(t('msg.authorizationFailed', { message: err.message }));
+    } finally {
+      setAuthorizing(false);
+    }
+  };
+
+  // Sellers at an IOP gateway (Lazada, Miravia, AliExpress seller) authorize through the gateway's own page.
+  const handleIopAuthorize = async () => {
+    if (!token) return;
+    setAuthorizing(true);
+    try {
+      const result = await connectors.iopAuthorize(id, token);
+      if (result.authorizationUrl) {
+        window.location.href = result.authorizationUrl;
+      } else if (result.error) {
+        setMsg(result.error);
+      }
+    } catch (err: any) {
+      setMsg(t('msg.authorizationFailed', { message: err.message }));
+    } finally {
+      setAuthorizing(false);
+    }
+  };
+
+  // SHEIN shops authorize through SHEIN's own store authorization page.
+  const handleSheinAuthorize = async () => {
+    if (!token) return;
+    setAuthorizing(true);
+    try {
+      const result = await connectors.sheinAuthorize(id, token);
+      if (result.authorizationUrl) {
+        window.location.href = result.authorizationUrl;
+      } else if (result.error) {
+        setMsg(result.error);
+      }
+    } catch (err: any) {
+      setMsg(t('msg.authorizationFailed', { message: err.message }));
+    } finally {
+      setAuthorizing(false);
+    }
+  };
+
+  // Instagram connectors sign in with Facebook or Instagram through Meta's own flow.
+  const handleMetaAuthorize = async () => {
+    if (!token) return;
+    setAuthorizing(true);
+    try {
+      const result = await connectors.metaAuthorize(id, token);
       if (result.authorizationUrl) {
         window.location.href = result.authorizationUrl;
       } else if (result.error) {
@@ -1007,6 +1454,15 @@ export default function ConnectorDetailPage() {
 
   if (!connector) return null;
 
+  // The server's reduced view of a connector the caller may use but does not
+  // own, in a workspace with restricted member visibility: its name, status
+  // and tools, none of its settings.
+  const memberView = connector.memberView === true;
+  const canManage = canManageConnector(user, connector);
+
+  const oauthKeysMissing =
+    connector.authType === 'OAUTH2' ? missingOAuthClientKeys(connector, oauthClientIdRaw) : [];
+
   const monoMethodTone = (method?: string): string => {
     switch ((method || '').toUpperCase()) {
       case 'GET':
@@ -1039,18 +1495,23 @@ export default function ConnectorDetailPage() {
       title={connector.name}
       maxWidth={880}
       actions={
+        // Test, Edit and Delete for the owner or an admin; Export for anyone
+        // who reads the full connector. Nothing in the reduced view.
+        (canManage || !memberView) && (
         <div className="flex gap-2 flex-wrap">
+          {canManage && (
           <Button variant="secondary" size="md" onClick={handleTest}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m5 12 5 5L20 7" /></svg>
             {t('actions.test')}
           </Button>
+          )}
           {/* File Search is edited on its Files panel (source, selection, description). */}
-          {connector?.type !== 'FILE_SEARCH' && (
+          {canManage && connector?.type !== 'FILE_SEARCH' && (
           <Button variant="secondary" size="md" onClick={() => setEditing(!editing)}>
             {editing ? t('actions.cancel') : t('actions.edit')}
           </Button>
           )}
-          {connector?.type !== 'FILE_SEARCH' && (
+          {!memberView && connector?.type !== 'FILE_SEARCH' && (
           <DropdownMenu.Root>
             <DropdownMenu.Trigger asChild>
               <Button variant="secondary" size="md" title={t('actions.exportTitle')}>
@@ -1077,12 +1538,32 @@ export default function ConnectorDetailPage() {
             </DropdownMenu.Portal>
           </DropdownMenu.Root>
           )}
+          {canManage && (
           <Button variant="outlineDanger" size="md" onClick={handleDelete}>
             {t('actions.delete')}
           </Button>
+          )}
         </div>
+        )
       }
     >
+      {swap && (
+        <PlanSwapDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setSwap(null);
+          }}
+          axis={swap.axis}
+          target={{ id, name: connector.name }}
+          max={swap.max}
+          activate={swap.activate}
+          onDone={() => {
+            fetchConnector();
+            reloadPlanUsage();
+          }}
+        />
+      )}
+
       <Dialog.Root open={!!deleteTarget} onOpenChange={(open) => { if (!open && !deleting) setDeleteTarget(null); }}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 z-50 bg-black/50" />
@@ -1119,24 +1600,84 @@ export default function ConnectorDetailPage() {
             <div className="flex items-center gap-2.5 flex-wrap">
               <span className="text-lg font-semibold tracking-[-0.02em]">{connector.name}</span>
               <Badge tone="info">{connector.type}</Badge>
-              <StatusPill
-                tone={connector.isActive ? 'success' : 'neutral'}
-                dot={connector.isActive ? 'var(--ok)' : 'var(--text-3)'}
-              >
-                {connector.isActive ? t('active') : t('inactive')}
-              </StatusPill>
+              {!connector.isActive && pausedByPlan ? (
+                <>
+                  <PausedByPlanBadge />
+                  {canManage && (
+                    <Button size="sm" variant="secondary" onClick={handleActivateNow}>
+                      {tSwap('activate')}
+                    </Button>
+                  )}
+                </>
+              ) : (
+                <StatusPill
+                  tone={connector.isActive ? 'success' : 'neutral'}
+                  dot={connector.isActive ? 'var(--ok)' : 'var(--text-3)'}
+                >
+                  {connector.isActive ? t('active') : t('inactive')}
+                </StatusPill>
+              )}
               <SetupStatusPill status={connector.setupStatus} />
               <AuthStatusPill connector={connector} />
             </div>
-            <div className="mt-0.5 break-all font-mono text-[12.5px] text-[var(--text-3)]">
-              {connector.baseUrl}
-            </div>
+            {connector.baseUrl && (
+              <div className="mt-0.5 break-all font-mono text-[12.5px] text-[var(--text-3)]">
+                {connector.baseUrl}
+              </div>
+            )}
+            {ownerOf(connector.userId) !== undefined && (
+              <div className="mt-0.5 text-[12.5px] text-[var(--text-3)]" data-testid="connector-owner">
+                {ownerOf(connector.userId) === null
+                  ? t('ownerGone')
+                  : t('owner', { name: ownerOf(connector.userId) as string })}
+              </div>
+            )}
           </div>
         </div>
 
-        <SetupStatusBanner connector={connector} />
-        <AuthStatusBanner connector={connector} />
+        <SetupStatusBanner connector={connector} canManage={canManage} />
+        <AuthStatusBanner
+          connector={connector}
+          action={
+            canManage && isCredentialsRefused(connector) ? (
+              connector.config?.adapterSlug ? (
+                // A catalog connector: its setup page asks for the credentials
+                // again, with the provider's own help, and checks them.
+                <Link href={finishSetupHref(connector)} className={cn(buttonVariants({ size: 'sm' }))}>
+                  {tAuthStatus('banner.updateCredentials')}
+                </Link>
+              ) : (
+                <Button size="sm" onClick={openCredentials}>
+                  {tAuthStatus('banner.updateCredentials')}
+                </Button>
+              )
+            ) : undefined
+          }
+        />
 
+        {metaSignIn && (
+          <MetaSignInBanner
+            connectorId={id}
+            status={metaSignIn.status}
+            message={metaSignIn.message}
+            reason={metaSignIn.reason}
+            token={token}
+            authorizing={authorizing}
+            onAuthorize={handleMetaAuthorize}
+            onTest={handleTest}
+            onSaved={() => {
+              setMetaSignIn({ status: 'connected', message: null });
+              fetchConnector();
+            }}
+            onDismiss={() => setMetaSignIn(null)}
+          />
+        )}
+
+        {signInLink === 'starting' && (
+          <div role="status" className="rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] p-3 text-sm text-[var(--text-2)]">
+            {t('oauthCard.signInStarting', { name: connector.name })}
+          </div>
+        )}
         {msg && (
           <div className="rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] p-3 text-sm text-[var(--text-2)]">
             {msg}
@@ -1185,7 +1726,7 @@ export default function ConnectorDetailPage() {
             listed apart from the rest and ticked separately: correcting a
             wrong hostname and overwriting a deliberate one look identical
             from here, and getting it wrong takes every tool down at once. */}
-        {catalogDiff && (
+        {catalogDiff && canManage && (
           <Card className="p-[22px]">
             <div className="flex items-start justify-between gap-4 mb-3">
               <div>
@@ -1274,10 +1815,10 @@ export default function ConnectorDetailPage() {
         )}
 
         {/* File Search: sync state, selection, description (#1385). */}
-        {connector.type === 'FILE_SEARCH' && !(connector.config as { fileShare?: boolean } | null)?.fileShare && (
+        {!memberView && connector.type === 'FILE_SEARCH' && !(connector.config as { fileShare?: boolean } | null)?.fileShare && (
           <FilesPanel connectorId={connector.id} />
         )}
-        {connector.type === 'FILE_SEARCH' && (connector.config as { fileShare?: boolean } | null)?.fileShare && (
+        {!memberView && connector.type === 'FILE_SEARCH' && (connector.config as { fileShare?: boolean } | null)?.fileShare && (
           <Card className="p-[22px]">
             <h3 className="text-sm font-semibold">{tfs('shareConnector.title')}</h3>
             <p className="mt-1 text-[13px] text-[var(--text-2)]">{tfs('shareConnector.text')}</p>
@@ -1287,9 +1828,17 @@ export default function ConnectorDetailPage() {
           </Card>
         )}
 
+        {/* The reduced view: say why the page shows so little. */}
+        {memberView && (
+          <Card className="p-[22px]" data-testid="member-view-note">
+            <h3 className="text-sm font-semibold">{t('memberView.title')}</h3>
+            <p className="mt-1 text-[13px] text-[var(--text-2)]">{t('memberView.body')}</p>
+          </Card>
+        )}
+
         {/* Connector Details */}
-        {connector.type !== 'FILE_SEARCH' && (
-        <Card className="p-[22px]">
+        {!memberView && connector.type !== 'FILE_SEARCH' && (
+        <Card id="connector-details" className="scroll-mt-6 p-[22px]">
           <h3 className="text-sm font-semibold mb-4">{t('details.title')}</h3>
           {editing ? (
             <div className="space-y-4 max-w-md">
@@ -1685,16 +2234,26 @@ export default function ConnectorDetailPage() {
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                     <div>
                       <label className="block text-sm font-medium mb-1">{t('loginToken.username')}</label>
-                      <input type="text" autoComplete="off" data-1p-ignore data-lpignore="true" data-bwignore="true" data-form-type="other" value={editLtUsername} onChange={(e) => setEditLtUsername(e.target.value)} placeholder={t('loginToken.usernamePlaceholder')} className="w-full border border-[var(--border)] rounded-[9px] px-3 py-2 text-sm font-mono bg-[var(--surface)] focus:outline-none focus:border-[var(--border-strong)]" />
+                      <input type="text" autoComplete="off" data-1p-ignore data-lpignore="true" data-bwignore="true" data-form-type="other" value={editLtUsername} onChange={(e) => setEditLtUsername(e.target.value)} placeholder={connector.authType === 'LOGIN_TOKEN' && ltSnapshot.hasUsername ? t('details.keepCurrent') : t('loginToken.usernamePlaceholder')} className="w-full border border-[var(--border)] rounded-[9px] px-3 py-2 text-sm font-mono bg-[var(--surface)] focus:outline-none focus:border-[var(--border-strong)]" />
                     </div>
                     <div>
                       <label className="block text-sm font-medium mb-1">{t('loginToken.password')}</label>
-                      <input type="password" autoComplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore="true" data-form-type="other" value={editLtPassword} onChange={(e) => setEditLtPassword(e.target.value)} placeholder={t('details.keepCurrent')} className="w-full border border-[var(--border)] rounded-[9px] px-3 py-2 text-sm font-mono bg-[var(--surface)] focus:outline-none focus:border-[var(--border-strong)]" />
+                      <input type="password" autoComplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore="true" data-form-type="other" value={editLtPassword} onChange={(e) => setEditLtPassword(e.target.value)} placeholder={connector.authType === 'LOGIN_TOKEN' && ltSnapshot.hasPassword ? t('details.keepCurrent') : t('loginToken.passwordPlaceholder')} className="w-full border border-[var(--border)] rounded-[9px] px-3 py-2 text-sm font-mono bg-[var(--surface)] focus:outline-none focus:border-[var(--border-strong)]" />
                     </div>
+                    <p className="text-xs text-[var(--text-3)] sm:col-span-2 -mt-2">
+                      {t.rich('loginToken.credentialsHint', {
+                        user: '${username}',
+                        pass: '${password}',
+                        code: (chunks) => <code>{chunks}</code>,
+                      })}
+                    </p>
                   </div>
                   <div>
                     <label className="block text-sm font-medium mb-1">{t('loginToken.body')}</label>
                     <textarea value={editLtLoginBody} onChange={(e) => setEditLtLoginBody(e.target.value)} rows={4} className="w-full border border-[var(--border)] rounded-[9px] px-3 py-2 text-sm font-mono bg-[var(--surface)] resize-y focus:outline-none focus:border-[var(--border-strong)]" />
+                    {connector.authType === 'LOGIN_TOKEN' && ltSnapshot.bodyHidden && (
+                      <p className="text-xs text-[var(--t-warn-fg)] mt-1">{t('loginToken.bodyHidden')}</p>
+                    )}
                     <p className="text-xs text-[var(--text-3)] mt-1">
                       {t.rich('loginToken.bodyHint', {
                         user: '${username}',
@@ -1716,13 +2275,25 @@ export default function ConnectorDetailPage() {
                     </div>
                     <div>
                       <label className="block text-sm font-medium mb-1">{t('loginToken.tokenPath')}</label>
-                      <input type="text" value={editLtTokenPath} onChange={(e) => setEditLtTokenPath(e.target.value)} placeholder="token" className="w-full border border-[var(--border)] rounded-[9px] px-3 py-2 text-sm font-mono bg-[var(--surface)] focus:outline-none focus:border-[var(--border-strong)]" />
+                      <input type="text" value={editLtTokenPath} onChange={(e) => setEditLtTokenPath(e.target.value)} placeholder={t('loginToken.tokenPathPlaceholder')} className="w-full border border-[var(--border)] rounded-[9px] px-3 py-2 text-sm font-mono bg-[var(--surface)] focus:outline-none focus:border-[var(--border-strong)]" />
                     </div>
                     <div>
                       <label className="block text-sm font-medium mb-1">{t('loginToken.ttl')}</label>
                       <input type="number" value={editLtTtl} onChange={(e) => setEditLtTtl(e.target.value)} placeholder="900" className="w-full border border-[var(--border)] rounded-[9px] px-3 py-2 text-sm font-mono bg-[var(--surface)] focus:outline-none focus:border-[var(--border-strong)]" />
                     </div>
+                    <p className="text-xs text-[var(--text-3)] sm:col-span-3 -mt-2">
+                      {connector.authType === 'LOGIN_TOKEN' && ltSnapshot.tokenSource !== 'body'
+                        ? t('loginToken.tokenFromSource', { source: ltSnapshot.tokenSource })
+                        : t('loginToken.tokenPathHint')}
+                    </p>
                   </div>
+                  <HeadersEditor
+                    rows={editLtHeaderRows}
+                    onChange={setEditLtHeaderRows}
+                    label={t('loginToken.loginHeaders')}
+                    hint={t('loginToken.loginHeadersHint', { variable: '{{API_KEY}}', pass: '${password}' })}
+                    maskedKeys={connector.authType === 'LOGIN_TOKEN' ? ltSnapshot.maskedHeaders : []}
+                  />
                   <label className="flex items-center gap-2 text-sm text-[var(--text-2)]">
                     <input type="checkbox" checked={editLtRefreshOn401} onChange={(e) => setEditLtRefreshOn401(e.target.checked)} />
                     {t('loginToken.refreshOn401')}
@@ -1752,7 +2323,7 @@ export default function ConnectorDetailPage() {
                   {t('details.instructionsHint')}
                 </p>
               </div>
-              <Button variant="primary" size="lg" onClick={handleSave}>
+              <Button variant="primary" size="lg" onClick={() => handleSave()}>
                 {t('details.save')}
               </Button>
             </div>
@@ -1828,20 +2399,22 @@ export default function ConnectorDetailPage() {
         )}
 
         {/* Who signs in: one shared authorization, or each user (Enterprise) */}
-        {connector.authType === 'OAUTH2' && (connector.type === 'MCP' || !isMachineGrant(loadedOauthGrant)) && (
+        {/* The reduced view names no auth type: per-user sign-in exists only
+            on connectors users authorize in the browser, so the scope decides. */}
+        {(memberView
+          ? connector.credentialScope === 'USER'
+          : connector.authType === 'OAUTH2' && (connector.type === 'MCP' || !isMachineGrant(loadedOauthGrant))) && (
           <UserCredentialsCard
             connectorId={connector.id}
             credentialScope={connector.credentialScope === 'USER' ? 'USER' : 'SHARED'}
-            canManage={
-              user?.role === 'ADMIN' || (user?.role !== 'VIEWER' && user?.id === connector.userId)
-            }
+            canManage={canManage}
             isMcp={connector.type === 'MCP'}
             onScopeChanged={fetchConnector}
           />
         )}
 
         {/* OAuth2 Authorization (shared sign-in; per-user sign-in lives in the card above) */}
-        {connector.authType === 'OAUTH2' && (connector.type === 'MCP' || !isMachineGrant(loadedOauthGrant)) && (
+        {canManage && connector.authType === 'OAUTH2' && (connector.type === 'MCP' || !isMachineGrant(loadedOauthGrant)) && (
           <Card className="p-[22px]">
             <h3 className="text-sm font-semibold mb-2">{t('oauthCard.title')}</h3>
             <p className="text-sm text-[var(--text-3)] mb-4">
@@ -1851,9 +2424,19 @@ export default function ConnectorDetailPage() {
                 ? t('oauthCard.mcp')
                 : t('oauthCard.provider')}
             </p>
-            <div className="flex gap-3 flex-wrap">
+            {signInLink === 'manual' && (
+              <p role="status" className="mb-3 text-sm font-medium text-[var(--text)]">
+                {t('oauthCard.signInManual')}
+              </p>
+            )}
+            <div ref={oauthCardRef} className="flex gap-3 flex-wrap">
               {connector.credentialScope !== 'USER' && (
-                <Button variant="primary" size="lg" onClick={handleOAuthAuthorize} disabled={authorizing}>
+                <Button
+                  variant="primary"
+                  size="lg"
+                  onClick={() => void handleOAuthAuthorize()}
+                  disabled={authorizing || oauthKeysMissing.length > 0}
+                >
                   {authorizing
                     ? t('oauthCard.redirecting')
                     : connector.type === 'MCP'
@@ -1867,11 +2450,31 @@ export default function ConnectorDetailPage() {
                 </Button>
               )}
             </div>
+            {connector.credentialScope !== 'USER' && oauthKeysMissing.length > 0 && (
+              <div role="status" className="mt-3 text-sm text-[var(--t-warn-fg)]">
+                <p>{t('oauthCard.keysMissing')}</p>
+                <p className="mt-0.5 text-xs">
+                  {t('oauthCard.keysStillEmpty', {
+                    names: oauthKeysMissing.map((n) => (n === CLIENT_ID_UNSET ? t('oauthCard.clientId') : n)).join(', '),
+                  })}
+                </p>
+                {connector.config?.adapterSlug && (
+                  <Link href={finishSetupHref(connector)} className="mt-1 inline-block text-xs underline">
+                    {t('oauthCard.enterKeys')}
+                  </Link>
+                )}
+              </div>
+            )}
+            {oauthError && oauthKeysMissing.length === 0 && (
+              <p role="alert" className="mt-3 text-sm text-[var(--t-warn-fg)]">
+                {oauthError}
+              </p>
+            )}
           </Card>
         )}
 
         {/* Shopee shop authorization (HMAC-signed, Shopee's own flow) */}
-        {connector.authType === 'HMAC' && (connector.config as any)?.adapterSlug === 'shopee' && (
+        {canManage && connector.authType === 'HMAC' && (connector.config as any)?.adapterSlug === 'shopee' && (
           <Card className="p-[22px]">
             <h3 className="text-sm font-semibold mb-2">{t('shopee.title')}</h3>
             <p className="text-sm text-[var(--text-3)] mb-4">
@@ -1883,9 +2486,81 @@ export default function ConnectorDetailPage() {
           </Card>
         )}
 
+        {/* TikTok Shop seller authorization (HMAC-signed, TikTok Shop's own flow) */}
+        {canManage && connector.authType === 'HMAC' && (connector.config as any)?.adapterSlug === 'tiktok-shop' && (
+          <Card className="p-[22px]">
+            <h3 className="text-sm font-semibold mb-2">{t('tiktokShop.title')}</h3>
+            <p className="text-sm text-[var(--text-3)] mb-4">
+              {t('tiktokShop.body')}
+            </p>
+            <Button variant="primary" size="lg" onClick={handleTikTokShopAuthorize} disabled={authorizing}>
+              {authorizing ? t('oauthCard.redirecting') : t('oauthCard.authorizeProvider')}
+            </Button>
+          </Card>
+        )}
+
+        {/* Seller authorization at an IOP gateway (HMAC-signed: Lazada, Miravia, AliExpress seller) */}
+        {canManage && connector.authType === 'HMAC' && connector.tokenProvider === 'iop' && (
+          <Card className="p-[22px]">
+            <h3 className="text-sm font-semibold mb-2">{t('iopSeller.title')}</h3>
+            <p className="text-sm text-[var(--text-3)] mb-4">
+              {t('iopSeller.body')}
+            </p>
+            <Button variant="primary" size="lg" onClick={handleIopAuthorize} disabled={authorizing}>
+              {authorizing ? t('oauthCard.redirecting') : t('oauthCard.authorizeProvider')}
+            </Button>
+          </Card>
+        )}
+
+        {/* SHEIN store authorization (HMAC-signed with the shop's openKeyId and secretKey) */}
+        {canManage && connector.authType === 'HMAC' && connector.tokenProvider === 'shein' && (
+          <Card className="p-[22px]">
+            <h3 className="text-sm font-semibold mb-2">{t('sheinShop.title')}</h3>
+            <p className="text-sm text-[var(--text-3)] mb-4">
+              {t('sheinShop.body')}
+            </p>
+            <Button variant="primary" size="lg" onClick={handleSheinAuthorize} disabled={authorizing}>
+              {authorizing ? t('oauthCard.redirecting') : t('oauthCard.authorizeProvider')}
+            </Button>
+          </Card>
+        )}
+
+        {/* Instagram sign-in (Meta's Facebook Login or Instagram Login) */}
+        {canManage &&
+          connector.authType === 'BEARER_TOKEN' &&
+          ['instagram', 'instagram-login'].includes((connector.config as any)?.adapterSlug) && (
+            <Card className="p-[22px]">
+              <h3 className="text-sm font-semibold mb-2">
+                {(connector.config as any)?.adapterSlug === 'instagram' ? t('meta.titleFacebook') : t('meta.titleInstagram')}
+              </h3>
+              <p className="text-sm text-[var(--text-3)] mb-4">
+                {(connector.config as any)?.adapterSlug === 'instagram' ? t('meta.bodyFacebook') : t('meta.bodyInstagram')}
+              </p>
+              <Button variant="primary" size="lg" onClick={handleMetaAuthorize} disabled={authorizing}>
+                {authorizing
+                  ? t('oauthCard.redirecting')
+                  : (connector.config as any)?.adapterSlug === 'instagram'
+                    ? t('meta.authorizeFacebook')
+                    : t('meta.authorizeInstagram')}
+              </Button>
+            </Card>
+          )}
+
+        {/* Inbound webhook ingestion (#1393): only where it applies — a Stripe
+            connector, or any connector someone already turned it on for via the API. */}
+        {/* Its URL and deliveries are read by the owner or an admin only. */}
+        {canManage && ((connector.config as any)?.adapterSlug === 'stripe' || connector.webhookEnabled) && (
+          <WebhookCard
+            connectorId={connector.id}
+            webhookEnabled={!!connector.webhookEnabled}
+            canManage={canManage}
+            onChanged={fetchConnector}
+          />
+        )}
+
         {/* Environment Variables */}
-        {connector.type !== 'FILE_SEARCH' && (
-        <Card className="p-[22px]">
+        {canManage && connector.type !== 'FILE_SEARCH' && (
+        <Card id="connector-variables" className="scroll-mt-6 p-[22px]">
           <div className="flex items-center justify-between mb-4">
             <div>
               <h3 className="text-sm font-semibold">{t('env.title')}</h3>
@@ -1963,12 +2638,23 @@ export default function ConnectorDetailPage() {
         </Card>
         )}
 
+        {/* For whoever sets the connector up, not for the reduced view. */}
+        {!memberView && (
+          <NetworkNote
+            ips={egressIps}
+            name={connector.name}
+            mentionProxy={proxyAvailable && connector.type !== 'FILE_SEARCH'}
+            className="bg-[var(--surface)]"
+          />
+        )}
+
         {/* Tools Section */}
         <Card className="p-[22px]">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
             <h3 className="text-sm font-semibold">
               {tt('title', { count: toolList.length })}
             </h3>
+            {canManage && (
             <div className="flex gap-2 flex-wrap">
               {/* An email connector's tools are its built-ins: nothing to import. */}
               {connector.type !== 'EMAIL' && connector.type !== 'FILE_SEARCH' && (
@@ -1998,7 +2684,17 @@ export default function ConnectorDetailPage() {
               </Button>
               )}
             </div>
+            )}
           </div>
+
+          {toolsMsg && (
+            <div role="status" className="rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] p-3 mb-4 text-sm text-[var(--text-2)]">
+              {toolsMsg}
+              <button onClick={() => setToolsMsg('')} className="ml-2 underline">
+                {t('dismiss')}
+              </button>
+            </div>
+          )}
 
           {/* Import Panel */}
           {showImport && (
@@ -2125,7 +2821,7 @@ export default function ConnectorDetailPage() {
 
           {toolList.length === 0 ? (
             <p className="text-sm text-[var(--text-3)] py-4 text-center">
-              {tt('empty')}
+              {canManage ? tt('empty') : tt('emptyReadOnly')}
             </p>
           ) : (
             <div className="space-y-3">
@@ -2214,6 +2910,9 @@ export default function ConnectorDetailPage() {
                             )}
                           </div>
                         </div>
+                        {/* Test, edit, hints, enable, proxy and delete all answer 403
+                            to anyone but the owner or an admin. */}
+                        {canManage && (
                         <div className="flex gap-2 flex-wrap sm:flex-nowrap sm:ml-4 flex-shrink-0">
                           <button
                             onClick={() => {
@@ -2292,6 +2991,7 @@ export default function ConnectorDetailPage() {
                           </button>
                           )}
                         </div>
+                        )}
                       </div>
 
                       {/* MCP annotations (hints) */}
@@ -2432,6 +3132,7 @@ export default function ConnectorDetailPage() {
         </Card>
 
         {/* Danger zone */}
+        {canManage && (
         <div
           className="flex flex-wrap items-center justify-between gap-3 rounded-[14px] border p-[18px]"
           style={{ borderColor: 'var(--t-danger-bg)', background: 'color-mix(in srgb, var(--danger) 5%, transparent)' }}
@@ -2449,6 +3150,7 @@ export default function ConnectorDetailPage() {
             {t('danger.delete')}
           </button>
         </div>
+        )}
       </div>
 
       {/* MCP Server Assignment Modal — shown after tools are added and connector is unassigned */}

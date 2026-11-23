@@ -32,6 +32,13 @@ import { AdsActivationService } from './ads-activation.service';
 import { FirstSuccessService } from './first-success.service';
 import { AlertsService } from '../alerts/alerts.service';
 import { ANALYTICS_DEFAULT_DAYS, ANALYTICS_MAX_DAYS } from './analytics-query.dto';
+import {
+  TOOL_PERFORMANCE_DEFAULT_HOURS,
+  TOOL_PERFORMANCE_DEFAULT_LIMIT,
+  ToolPerformanceQueryDto,
+} from './tool-performance-query.dto';
+import { ToolPerformanceRow, toolPerformanceQuery } from './tool-performance.query';
+import { memberCallError } from './member-call-error';
 
 @Injectable()
 export class AuditService implements OnModuleDestroy {
@@ -86,7 +93,22 @@ export class AuditService implements OnModuleDestroy {
     durationMs?: number;
     error?: string;
     clientInfo?: string;
+    /**
+     * The call used an operator's support key (roles/support-keys.ts). It is
+     * not the workspace's activity: no row in its logs, no failure alert, no
+     * first-success or activation event. One internal log line instead,
+     * without inputs or outputs.
+     */
+    supportKeyId?: string;
   }): Promise<void> {
+    if (data.supportKeyId) {
+      this.logger.log(
+        `Support call: key ${data.supportKeyId}, org ${data.organizationId ?? 'none'}, ` +
+          `user ${data.userId ?? 'none'}, tool ${data.toolId}, ${data.status}, ${data.durationMs ?? 0}ms`,
+      );
+      return;
+    }
+
     // Every failing call, not just the ones that end up as a fresh row: the
     // repeat-dedup check just below collapses an identical, fast-repeating
     // failure into a counter on the first row instead of writing it again,
@@ -343,12 +365,34 @@ export class AuditService implements OnModuleDestroy {
       connectorId?: string;
       mcpServerId?: string;
       organizationId?: string;
+      /**
+       * Restricted member visibility: only calls made by this user, and only
+       * the MCP servers this user owns are named (`mcpServer` and
+       * `mcpServerId` are null on a call made through another member's
+       * server; filtering by such a server matches nothing). Absent on the
+       * open path; when present (even empty) it is always applied, so a bad
+       * value matches nothing instead of everything.
+       */
+      onlyUserId?: string;
+      /**
+       * With `onlyUserId`: whether owning a connector shows the member the
+       * full error text of their calls on it (an EDITOR, who reads their own
+       * connectors in full). On every other connector the member gets the
+       * reduced view, and the error text is replaced (member-call-error.ts):
+       * it can name the address that view withholds.
+       */
+      ownerSeesErrors?: boolean;
     },
   ) {
+    const restricted = filters?.onlyUserId !== undefined;
     const where: any = { ...this.orgScope(filters?.organizationId) };
+    if (restricted) where.userId = filters!.onlyUserId;
     if (filters?.toolId) where.toolId = filters.toolId;
     if (filters?.status) where.status = filters.status;
-    if (filters?.mcpServerId) where.mcpServerId = filters.mcpServerId;
+    if (filters?.mcpServerId) {
+      where.mcpServerId = filters.mcpServerId;
+      if (restricted) where.mcpServer = { userId: filters!.onlyUserId };
+    }
     if (filters?.search) {
       where.tool = { ...where.tool, name: { contains: filters.search, mode: 'insensitive' } };
     }
@@ -356,7 +400,7 @@ export class AuditService implements OnModuleDestroy {
       where.tool = { ...where.tool, connectorId: filters.connectorId };
     }
 
-    return this.prisma.toolInvocation.findMany({
+    const rows = await this.prisma.toolInvocation.findMany({
       where,
       take: limit,
       skip: offset,
@@ -366,24 +410,54 @@ export class AuditService implements OnModuleDestroy {
           select: {
             name: true,
             connectorId: true,
-            connector: { select: { name: true, type: true } },
+            // The owner only to decide below whose error text is shown in full.
+            connector: { select: { name: true, type: true, ...(restricted ? { userId: true } : {}) } },
           },
         },
         user: {
           select: { id: true, email: true, name: true },
         },
         mcpServer: {
-          select: { id: true, name: true, slug: true },
+          // The owner only to decide below whether the server may be named.
+          select: { id: true, name: true, slug: true, ...(restricted ? { userId: true } : {}) },
         },
       },
     });
+    if (!restricted) return rows;
+    return rows.map((row: any) => {
+      const out = { ...row };
+      const ownServer = !!row.mcpServer && row.mcpServer.userId === filters!.onlyUserId;
+      if (ownServer) {
+        const { userId: _owner, ...server } = row.mcpServer;
+        out.mcpServer = server;
+      } else {
+        out.mcpServerId = null;
+        out.mcpServer = null;
+      }
+      const connector = row.tool?.connector;
+      if (connector) {
+        const { userId: connectorOwner, ...shown } = connector;
+        out.tool = { ...row.tool, connector: shown };
+        const full = filters!.ownerSeesErrors === true && connectorOwner === filters!.onlyUserId;
+        if (!full && typeof row.error === 'string') out.error = memberCallError(row.error);
+      } else if (typeof row.error === 'string') {
+        // No connector to own: nothing says the member may read the text.
+        out.error = memberCallError(row.error);
+      }
+      return out;
+    });
   }
 
-  async getStats(organizationId?: string) {
+  /**
+   * `onlyUserId` (restricted member visibility) narrows every counter to the
+   * calls of that user, on top of the organisation scope.
+   */
+  async getStats(organizationId?: string, onlyUserId?: string) {
     const now = new Date();
     const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
     const last7d = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     const scope = this.orgScope(organizationId);
+    if (onlyUserId !== undefined) scope.userId = onlyUserId;
 
     const [total24h, errors24h, total7d, totalAll] = await Promise.all([
       this.countCalls({ createdAt: { gte: last24h }, ...scope }),
@@ -412,8 +486,10 @@ export class AuditService implements OnModuleDestroy {
    * Semantics are unchanged: a row counts `repeat_count` calls (repeats of
    * the same failure), while durations are averaged per stored row for days
    * and the whole window and per call for tools, as before.
+   *
+   * `onlyUserId` (restricted member visibility) narrows it to that user's calls.
    */
-  async getAnalytics(organizationId: string, days = ANALYTICS_DEFAULT_DAYS) {
+  async getAnalytics(organizationId: string, days = ANALYTICS_DEFAULT_DAYS, onlyUserId?: string) {
     const safeDays = Math.min(
       Math.max(Math.floor(days) || ANALYTICS_DEFAULT_DAYS, 1),
       ANALYTICS_MAX_DAYS,
@@ -422,7 +498,7 @@ export class AuditService implements OnModuleDestroy {
     const since = new Date(now.getTime() - safeDays * 24 * 60 * 60 * 1000);
 
     const groups = organizationId
-      ? await this.prisma.$queryRaw<AnalyticsGroupRow[]>(analyticsQuery(organizationId, since))
+      ? await this.prisma.$queryRaw<AnalyticsGroupRow[]>(analyticsQuery(organizationId, since, onlyUserId))
       : [];
 
     const dailyMap = new Map<string, AnalyticsGroupRow>();
@@ -487,6 +563,65 @@ export class AuditService implements OnModuleDestroy {
     };
   }
 
+  /** `onlyUserId` (restricted member visibility) narrows it to that user's calls. */
+  async getToolPerformance(
+    organizationId: string,
+    options: ToolPerformanceQueryDto = {},
+    onlyUserId?: string,
+    /** With `onlyUserId`: see `ownerSeesErrors` of getRecentInvocations. */
+    ownerSeesErrors = false,
+  ) {
+    if (!organizationId) return { items: [], hasMore: false };
+
+    const hours = options.hours ?? TOOL_PERFORMANCE_DEFAULT_HOURS;
+    const limit = options.limit ?? TOOL_PERFORMANCE_DEFAULT_LIMIT;
+    const until = new Date();
+    const since = new Date(until.getTime() - hours * 60 * 60 * 1000);
+    const rows = await this.prisma.$queryRaw<ToolPerformanceRow[]>(
+      toolPerformanceQuery(organizationId, since, until, options, limit, onlyUserId),
+    );
+
+    // Restricted member visibility: the latest error of a tool is shown in
+    // full only on a connector the member owns and may manage. On the others
+    // they read the reduced view, and the text can name its address.
+    const restricted = onlyUserId !== undefined;
+    let fullErrorConnectorIds = new Set<string>();
+    if (restricted && ownerSeesErrors && rows.length > 0) {
+      const owned = await this.prisma.connector.findMany({
+        where: { id: { in: [...new Set(rows.map((r) => r.connector_id))] }, organizationId, userId: onlyUserId },
+        select: { id: true },
+      });
+      fullErrorConnectorIds = new Set(owned.map((c) => c.id));
+    }
+    const lastErrorOf = (row: ToolPerformanceRow) =>
+      restricted && !fullErrorConnectorIds.has(row.connector_id) ? memberCallError(row.last_error) : row.last_error;
+
+    return {
+      items: rows.slice(0, limit).map((row) => {
+        const calls = Number(row.calls);
+        const errors = Number(row.errors);
+        return {
+          toolId: row.tool_id,
+          toolName: row.tool_name,
+          connectorId: row.connector_id,
+          connectorName: row.connector_name,
+          mcpServerId: row.mcp_server_id,
+          mcpServerName: row.mcp_server_name,
+          calls,
+          errors,
+          errorRate: calls > 0 ? Math.round((errors / calls) * 10000) / 100 : 0,
+          latencySampleCount: Number(row.latency_sample_count),
+          p50Ms: row.latency?.[0] ?? null,
+          p95Ms: row.latency?.[1] ?? null,
+          p99Ms: row.latency?.[2] ?? null,
+          lastError: lastErrorOf(row),
+          lastErrorAt: row.last_error_at?.toISOString() ?? null,
+        };
+      }),
+      hasMore: rows.length > limit,
+    };
+  }
+
   /**
    * Usage & cost breakdowns over the last `days`, grouped by connector, MCP
    * server and user — plus proxy-call metering and a volume-based cost estimate.
@@ -495,11 +630,18 @@ export class AuditService implements OnModuleDestroy {
    * scales far better than loading every row. Cost has no LLM-token component:
    * estimate = calls × COST_PER_CALL_MICROS + proxyCalls × COST_PER_PROXY_CALL_MICROS
    * (both env-configurable, default 0 → shows 0 until an operator sets rates).
+   *
+   * `onlyUserId` (restricted member visibility) narrows every list and total
+   * to that user's calls, so `byUser` holds at most the caller's own row, and
+   * `byServer` names only the servers that user owns: calls through any other
+   * server are counted in one row with `id: null` together with the calls
+   * made without a server.
    */
-  async getBreakdowns(organizationId: string, days = 30) {
+  async getBreakdowns(organizationId: string, days = 30, onlyUserId?: string) {
     const safeDays = Math.min(Math.max(days || 30, 1), 365);
     const since = new Date(Date.now() - safeDays * 24 * 60 * 60 * 1000);
-    const where = { organizationId, createdAt: { gte: since } };
+    const where: Prisma.ToolInvocationWhereInput = { organizationId, createdAt: { gte: since } };
+    if (onlyUserId !== undefined) where.userId = onlyUserId;
     const errWhere = { ...where, status: 'ERROR' as InvocationStatus };
 
     const [
@@ -528,7 +670,7 @@ export class AuditService implements OnModuleDestroy {
         ? this.prisma.connector.findMany({ where: { id: { in: connIds } }, select: { id: true, name: true } })
         : [],
       srvIds.length
-        ? this.prisma.mcpServerConfig.findMany({ where: { id: { in: srvIds } }, select: { id: true, name: true } })
+        ? this.prisma.mcpServerConfig.findMany({ where: { id: { in: srvIds } }, select: { id: true, name: true, userId: true } })
         : [],
       userIds.length
         ? this.prisma.user.findMany({ where: { id: { in: userIds } }, select: { id: true, email: true, name: true } })
@@ -536,6 +678,30 @@ export class AuditService implements OnModuleDestroy {
     ]);
     const connName = new Map(conns.map((c) => [c.id, c.name]));
     const srvName = new Map(srvs.map((s) => [s.id, s.name]));
+    // Restricted member visibility: a server the caller does not own is not
+    // named; its calls join the row of calls without a server.
+    const ownServers = new Set(
+      (srvs as Array<{ id: string; userId?: string }>).filter((s) => s.userId === onlyUserId).map((s) => s.id),
+    );
+    const serverRows = <T extends { mcpServerId: string | null; _count: { _all: number }; _sum?: { repeatCount: number | null } }>(
+      rows: T[],
+    ) => {
+      if (onlyUserId === undefined) return rows;
+      const calls = (r: T) => r._sum?.repeatCount ?? r._count._all;
+      const out: Array<{ mcpServerId: string | null; _count: { _all: number }; _sum: { repeatCount: number | null } }> = [];
+      let other = 0;
+      let hasOther = false;
+      for (const r of rows) {
+        if (r.mcpServerId && ownServers.has(r.mcpServerId)) {
+          out.push({ mcpServerId: r.mcpServerId, _count: { _all: calls(r) }, _sum: { repeatCount: calls(r) } });
+        } else {
+          other += calls(r);
+          hasOther = true;
+        }
+      }
+      if (hasOther) out.push({ mcpServerId: null, _count: { _all: other }, _sum: { repeatCount: other } });
+      return out;
+    };
     const userName = new Map(users.map((u) => [u.id, u.name || u.email]));
 
     const merge = (
@@ -574,8 +740,12 @@ export class AuditService implements OnModuleDestroy {
       byConnector: merge(byConnector, byConnectorErr, 'connectorId', (id) =>
         id ? (connName.get(id) ?? 'Unknown connector') : 'No connector',
       ),
-      byServer: merge(byServer, byServerErr, 'mcpServerId', (id) =>
-        id ? (srvName.get(id) ?? 'Unknown server') : 'Direct / no server',
+      byServer: merge(serverRows(byServer), serverRows(byServerErr), 'mcpServerId', (id) =>
+        id
+          ? (srvName.get(id) ?? 'Unknown server')
+          : onlyUserId !== undefined
+            ? 'Other server or none'
+            : 'Direct / no server',
       ),
       byUser: merge(byUser, byUserErr, 'userId', (id) =>
         id ? (userName.get(id) ?? 'Unknown user') : 'Anonymous',
@@ -607,8 +777,13 @@ export interface AnalyticsGroupRow {
  * a UTC `timestamp without time zone`, so to_char gives the same UTC date as
  * `toISOString().slice(0, 10)` whatever the session time zone is, and the
  * bound is converted to UTC explicitly for the same reason.
+ *
+ * `onlyUserId` (restricted member visibility) adds `AND ti.user_id = $n` as a
+ * bound value; without it the query is the workspace-wide one.
  */
-export function analyticsQuery(organizationId: string, since: Date): Prisma.Sql {
+export function analyticsQuery(organizationId: string, since: Date, onlyUserId?: string): Prisma.Sql {
+  const userFilter =
+    onlyUserId !== undefined ? Prisma.sql`AND ti.user_id = ${onlyUserId}` : Prisma.empty;
   return Prisma.sql`
     WITH scoped AS (
       SELECT
@@ -623,6 +798,7 @@ export function analyticsQuery(organizationId: string, since: Date): Prisma.Sql 
       JOIN connectors c ON c.id = t.connector_id
       WHERE c.organization_id = ${organizationId}
         AND ti.created_at >= (${since.toISOString()}::timestamptz AT TIME ZONE 'UTC')
+        ${userFilter}
     )
     SELECT
       GROUPING(day) AS by_tool,

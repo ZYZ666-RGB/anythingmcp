@@ -12,6 +12,14 @@ import type { AdapterDefinition } from './catalog';
  */
 export type EnvVarKind = 'address' | 'credential' | 'setting';
 
+/** One choice of a variable that takes one of a fixed list of values. */
+export interface EnvVarOption {
+  /** What is stored and sent. */
+  value: string;
+  /** What the user picks. */
+  label: string;
+}
+
 export interface EnvVarMeta {
   label?: string;
   kind?: EnvVarKind;
@@ -28,6 +36,17 @@ export interface EnvVarMeta {
   link?: string;
   /** Rarely needed: shown collapsed (e.g. a refresh token the authorization fills in). */
   advanced?: boolean;
+  /**
+   * A fixed list of choices (one API host per country): the form shows a
+   * select, and every path that writes the variable refuses another value.
+   */
+  options?: EnvVarOption[];
+  /**
+   * Required, but the setup check finds it when the form leaves it empty
+   * (an Odoo database name, from the address): the form does not insist.
+   * Only for a variable the backend knows how to look up.
+   */
+  lookedUp?: boolean;
 }
 
 export interface EnvVarDescriptor extends Required<Pick<EnvVarMeta, 'label' | 'kind' | 'secret'>> {
@@ -39,6 +58,30 @@ export interface EnvVarDescriptor extends Required<Pick<EnvVarMeta, 'label' | 'k
   patternMessage?: string;
   link?: string;
   advanced?: boolean;
+  options?: EnvVarOption[];
+  lookedUp?: boolean;
+}
+
+/**
+ * The choices of a variable that takes one of a fixed list, or undefined when
+ * it takes any value. Entries that are not a `{ value, label }` pair of
+ * non-empty strings are left out (the validator refuses them in the catalog).
+ */
+export function envVarOptions(meta: { options?: unknown } | null | undefined): EnvVarOption[] | undefined {
+  const raw = meta?.options;
+  if (!Array.isArray(raw)) return undefined;
+  const out: EnvVarOption[] = [];
+  for (const o of raw as Array<Partial<EnvVarOption> | null | undefined>) {
+    if (!o || typeof o.value !== 'string' || !o.value || typeof o.label !== 'string' || !o.label.trim()) continue;
+    if (out.some((x) => x.value === o.value)) continue;
+    out.push({ value: o.value, label: o.label });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/** `France (https://fr.example.com), Spain (https://es.example.com)`: the choices in a sentence. */
+export function describeEnvVarOptions(options: EnvVarOption[]): string {
+  return options.map((o) => (o.label === o.value ? o.value : `${o.label} (${o.value})`)).join(', ');
 }
 
 /**
@@ -75,7 +118,12 @@ export function needsBrowserAuthorization(adapter: Pick<AdapterDefinition, 'conn
 
 export function setupKind(adapter: Pick<AdapterDefinition, 'connector' | 'requiredEnvVars'>): SetupKind {
   if (needsBrowserAuthorization(adapter)) return 'oauth_browser';
-  return adapter.requiredEnvVars.length === 0 ? 'none' : 'credentials';
+  // A marketplace shop (HMAC with a token provider: Shopee, TikTok Shop) is
+  // authorized on the setup page even when nothing has to be typed (TikTok
+  // Shop on a server with its own app), so it never "works right away".
+  const auth = (adapter.connector.authConfig ?? {}) as Record<string, unknown>;
+  const shopAuthorization = adapter.connector.authType === 'HMAC' && typeof auth.tokenProvider === 'string';
+  return adapter.requiredEnvVars.length === 0 && !shopAuthorization ? 'none' : 'credentials';
 }
 
 /** Names an authorization fills in: `{{VAR}}` used as the OAuth refresh/access token. */
@@ -118,7 +166,14 @@ export function describeAdapterEnvVars(
       ...(browser && tokens.has(name) ? { advanced: true } : {}),
     };
     const own = adapter.envVarMeta?.[name] ?? {};
-    return { ...derived, ...own, name, required } as EnvVarDescriptor;
+    const described = { ...derived, ...own, name, required } as EnvVarDescriptor;
+    if (described.options !== undefined) {
+      // Only well-formed choices reach the form, the chat and the checks.
+      const options = envVarOptions(own);
+      if (options) described.options = options;
+      else delete described.options;
+    }
+    return described;
   });
 }
 

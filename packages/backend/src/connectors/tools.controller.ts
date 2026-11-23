@@ -12,9 +12,10 @@ import {
   ForbiddenException,
   BadRequestException,
   ConflictException,
+  NotFoundException,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiBearerAuth, ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { AuthGuard } from '@nestjs/passport';
+import { ApiTags, ApiOperation, ApiBearerAuth, ApiProperty, ApiPropertyOptional, ApiSecurity } from '@nestjs/swagger';
+import { JwtOrManagementKeyGuard } from '../auth/jwt-or-management-key.guard';
 import {
   IsString,
   IsOptional,
@@ -24,9 +25,16 @@ import {
   ValidateNested,
   MaxLength,
 } from 'class-validator';
-import { MAX_TOOL_NAME_LENGTH } from './parsers/tool-name.util';
-import { Type } from 'class-transformer';
+import { MAX_TOOL_NAME_LENGTH, trimToolName } from './parsers/tool-name.util';
+import { Transform, Type } from 'class-transformer';
 import { PrismaService } from '../common/prisma.service';
+import {
+  MemberVisibilityService,
+  canSeeConnector,
+  toolWhere,
+  type VisibilityScope,
+} from '../settings/member-visibility.service';
+import { seesMemberView, toMemberTool } from './connector-member-view.util';
 import { McpServerService } from '../mcp-server/mcp-server.service';
 import { DynamicMcpTools } from '../mcp-server/dynamic-mcp-tools';
 import { ConnectorsService } from './connectors.service';
@@ -93,11 +101,12 @@ const RESPONSE_MAPPING_EXAMPLE = {
   },
 };
 
-class CreateToolDto {
+export class CreateToolDto {
   @ApiProperty({
     description: 'Tool name exposed via MCP (unique per connector).',
     example: 'list_invoices',
   })
+  @Transform(({ value }) => trimToolName(value))
   @IsString()
   @MaxLength(MAX_TOOL_NAME_LENGTH)
   name: string;
@@ -143,8 +152,9 @@ class CreateToolDto {
   responseMapping?: Record<string, unknown>;
 }
 
-class UpdateToolDto {
+export class UpdateToolDto {
   @ApiPropertyOptional({ description: 'Tool name.' })
+  @Transform(({ value }) => trimToolName(value))
   @IsOptional()
   @IsString()
   @MaxLength(MAX_TOOL_NAME_LENGTH)
@@ -191,7 +201,7 @@ class UpdateToolDto {
   isEnabled?: boolean;
 }
 
-class BulkCreateToolsDto {
+export class BulkCreateToolsDto {
   @ApiProperty({
     description: 'Tools to create in a single call. Duplicates (same name) on the connector are skipped.',
     type: [CreateToolDto],
@@ -302,9 +312,23 @@ class PreviewMappingDto {
   sample?: unknown;
 }
 
+const UNRESTRICTED_SCOPE: VisibilityScope = Object.freeze({ restricted: false as const });
+
+/**
+ * Member visibility (settings/member-visibility.service.ts) on the tools of a
+ * connector: in a workspace set to `restricted`, a member who is not an admin
+ * gets 404 (the body an unknown connector id gets) on every GET route of a
+ * connector they cannot see. Of a connector they do not own, the list holds
+ * only the tools their roles allow, each reduced to its name, description and
+ * whether it is enabled (connector-member-view.util.ts): no parameters, no
+ * endpoint mapping. A tool outside their roles answers the same 404 on the
+ * routes that take a tool id. Writes keep their owner-or-admin rule. Admins
+ * and open workspaces take today's code path.
+ */
 @ApiTags('Tools')
 @ApiBearerAuth()
-@UseGuards(AuthGuard('jwt'))
+@ApiSecurity('api-key')
+@UseGuards(JwtOrManagementKeyGuard)
 @Controller('api/connectors/:connectorId/tools')
 export class ToolsController {
   constructor(
@@ -314,7 +338,45 @@ export class ToolsController {
     private readonly edition: EditionService,
     private readonly licenseGuard: LicenseGuardService,
     private readonly toolExecutor: DynamicMcpTools,
+    // Not @Optional: Nest refuses to boot without it. It is missing only in
+    // unit specs that build the controller by hand and predate the setting.
+    private readonly visibility?: MemberVisibilityService,
   ) {}
+
+  /** The caller's member visibility; unrestricted for admins and open workspaces. */
+  private scopeFor(req: any): Promise<VisibilityScope> {
+    return this.visibility ? this.visibility.scopeFor(req.user) : Promise.resolve(UNRESTRICTED_SCOPE);
+  }
+
+  /** A connector the scope may not see: exactly the 404 ConnectorsService.findById gives an unknown id. */
+  private assertVisible(scope: VisibilityScope, connector: { userId: string; tools?: Array<{ id: string }> }, connectorId: string) {
+    if (!canSeeConnector(scope, { userId: connector.userId, tools: connector.tools ?? [] })) {
+      throw new NotFoundException(`Connector ${connectorId} not found`);
+    }
+  }
+
+  /**
+   * For a restricted member: another workspace's connector stays the 403 it is
+   * today, a hidden one is a 404. Nothing at all for admins and open workspaces.
+   */
+  private async hideUnlessVisible(connectorId: string, req: any, toolId?: string): Promise<void> {
+    const scope = await this.scopeFor(req);
+    if (!scope.restricted) return;
+    const connector = await this.assertConnectorOrgMatch(connectorId, req);
+    this.assertVisible(scope, connector as any, connectorId);
+    // With a tool id: a tool outside the member's roles is as hidden as a
+    // connector with none of them, even on a connector they can see. Checked
+    // against the allowed ids alone, so the answer does not say whether the
+    // tool exists.
+    if (
+      toolId !== undefined &&
+      seesMemberView(scope, connector) &&
+      scope.allowedToolIds !== null &&
+      !scope.allowedToolIds.includes(toolId)
+    ) {
+      throw new NotFoundException(`Connector ${connectorId} not found`);
+    }
+  }
 
   /**
    * Validate and authorize a code tool at save time (shape + authority gates).
@@ -470,13 +532,29 @@ export class ToolsController {
   }
 
   @Get()
-  @ApiOperation({ summary: 'List tools for a connector' })
+  @ApiOperation({
+    summary: 'List tools for a connector',
+    description:
+      'In a workspace with restricted member visibility, a member who is not an admin gets 404 for a connector they ' +
+      'cannot see. Of a connector they own they get every tool in full. Of one they do not own they get only the ' +
+      'tools their roles allow, each with `id`, `name`, `description` and `isEnabled` only: no parameters, endpoint ' +
+      'mapping, response mapping, output schema or annotations.',
+  })
   async list(@Req() req: any, @Param('connectorId') connectorId: string) {
-    await this.assertConnectorOrgMatch(connectorId, req);
-    return this.prisma.mcpTool.findMany({
-      where: { connectorId },
+    const connector = await this.assertConnectorOrgMatch(connectorId, req);
+    const scope = await this.scopeFor(req);
+    if (!scope.restricted) {
+      return this.prisma.mcpTool.findMany({
+        where: { connectorId },
+        orderBy: { createdAt: 'desc' },
+      });
+    }
+    this.assertVisible(scope, connector as any, connectorId);
+    const tools = await this.prisma.mcpTool.findMany({
+      where: { AND: [{ connectorId }, toolWhere(scope, connector)] },
       orderBy: { createdAt: 'desc' },
     });
+    return seesMemberView(scope, connector) ? tools.map((tool) => toMemberTool(tool)) : tools;
   }
 
   /**
@@ -712,13 +790,16 @@ export class ToolsController {
       'Returns `derived` (inferred from the connector: HTTP verb, ' +
       'query/mutation, readOnly flag, SQL text), `override` (the stored ' +
       'explicit value, if any) and `effective` (what MCP clients actually ' +
-      'see). Also lists the supported keys.',
+      'see). Also lists the supported keys. Connector owner or admin; in a workspace with restricted member ' +
+      'visibility, a member who is not an admin gets 404 for a connector they cannot see, and for a tool outside ' +
+      'their roles on a connector they do not own.',
   })
   async getAnnotations(
     @Req() req: any,
     @Param('toolId') toolId: string,
     @Param('connectorId') connectorId: string,
   ) {
+    await this.hideUnlessVisible(connectorId, req, toolId);
     const connector = await this.assertCanWriteConnector(connectorId, req);
     const tool = await this.prisma.mcpTool.findFirst({
       where: { id: toolId, connectorId },
@@ -801,13 +882,16 @@ export class ToolsController {
     summary: 'Get the response mapping configured for a tool',
     description:
       'Returns the stored `transform` (or null), whether it is active, and ' +
-      'whether a recent real response is available to preview it against.',
+      'whether a recent real response is available to preview it against. Connector owner or admin; in a workspace ' +
+      'with restricted member visibility, a member who is not an admin gets 404 for a connector they cannot see, and ' +
+      'for a tool outside their roles on a connector they do not own.',
   })
   async getResponseMapping(
     @Req() req: any,
     @Param('toolId') toolId: string,
     @Param('connectorId') connectorId: string,
   ) {
+    await this.hideUnlessVisible(connectorId, req, toolId);
     await this.assertCanWriteConnector(connectorId, req);
     const tool = await this.prisma.mcpTool.findFirst({
       where: { id: toolId, connectorId },
@@ -1128,7 +1212,10 @@ export class ToolsController {
           statusText: err.response.statusText,
           responseBody: err.response.data,
           kind,
-          hint,
+          // The engine's own hint when it knows more than the status says (a
+          // failed Login → Token login, a token header that replaced a
+          // connector header).
+          hint: engineHintOf(err) ?? hint,
           ...withNote,
         };
       }
@@ -1183,4 +1270,10 @@ export class ToolsController {
     await this.mcpServer.reloadConnectorTools(connectorId);
     return { message: 'Tool deleted' };
   }
+}
+
+/** The hint an engine attached to an error (`error.hint`), if any. */
+function engineHintOf(err: unknown): string | undefined {
+  const hint = (err as { hint?: unknown } | null)?.hint;
+  return typeof hint === 'string' && hint ? hint : undefined;
 }

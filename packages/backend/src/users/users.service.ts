@@ -6,6 +6,7 @@ import { UserLifecycleService, LifecycleContext } from './user-lifecycle.service
 import { SecurityEventService, SecurityEvents } from '../audit/security-event.service';
 import { LicenseReleaseService } from '../license/license-release.service';
 import { findUserByEmail, findUsersByEmail, normalizeEmail } from '../common/email.util';
+import { CASCADE_DELETE_TRANSACTION } from '../common/cascade-delete-transaction';
 
 @Injectable()
 export class UsersService {
@@ -71,6 +72,15 @@ export class UsersService {
             name: true,
             mcpRoleId: true,
             mcpRole: { select: { id: true, name: true } },
+            // Every MCP role the member holds here: grants of this workspace
+            // plus grants with no workspace, which apply everywhere. Access
+            // is their union, so the deprecated single `mcpRole` alone hid
+            // roles granted by a single sign-on group.
+            roleAssignments: {
+              where: { OR: [{ organizationId }, { organizationId: null }] },
+              select: { roleId: true, source: true, organizationId: true, role: { select: { name: true } } },
+              orderBy: { createdAt: 'asc' },
+            },
             createdAt: true,
             updatedAt: true,
           },
@@ -86,6 +96,12 @@ export class UsersService {
       organizationId,
       mcpRoleId: m.user.mcpRoleId,
       mcpRole: m.user.mcpRole,
+      mcpRoles: m.user.roleAssignments.map((a) => ({
+        roleId: a.roleId,
+        roleName: a.role.name,
+        source: a.source,
+        global: a.organizationId === null,
+      })),
       createdAt: m.user.createdAt,
       updatedAt: m.user.updatedAt,
       joinedAt: m.joinedAt,
@@ -289,7 +305,7 @@ export class UsersService {
       ),
       this.prisma.oAuthAuthorizationCode.deleteMany({ where: { userId } }),
       this.prisma.user.delete({ where: { id: userId } }),
-    ]);
+    ], CASCADE_DELETE_TRANSACTION);
 
     // The deleted workspaces' licences are left without one; end them on the
     // licence site, which stops the trial emails.

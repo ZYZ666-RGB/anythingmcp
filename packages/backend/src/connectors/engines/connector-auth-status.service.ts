@@ -4,6 +4,7 @@ import { PrismaService } from '../../common/prisma.service';
 import { connectorPageUrl } from '../../common/url.util';
 import { EmailService } from '../../settings/email.service';
 import { parseCredentialKey } from '../../common/credential-key.util';
+import { CREDENTIAL_REFUSED_CODE } from './credential-refusal-tracker';
 
 /**
  * Credential health of a connector, kept on the connector row
@@ -148,8 +149,11 @@ export class ConnectorAuthStatusService implements OnModuleInit, OnModuleDestroy
    * each at most. The first time a connector needs a new sign-in, its
    * workspace owner is emailed.
    */
-  async mark(connectorId: string, issue: AuthIssue): Promise<void> {
+  async mark(connectorId: string, issue: AuthIssue, opts: { notify?: boolean } = {}): Promise<void> {
     if (parseCredentialKey(connectorId).userId) return this.markUser(connectorId, issue);
+    // notify: false records the status for the dashboard and the assistant
+    // only: the incident counts as told, so no email goes out for it.
+    const notify = opts.notify !== false;
     try {
       const current = await this.prisma.connector.findUnique({
         where: { id: connectorId },
@@ -172,7 +176,7 @@ export class ConnectorAuthStatusService implements OnModuleInit, OnModuleDestroy
             authStatusCode: issue.code,
             authStatusMessage: issue.message,
             authStatusRef: issue.ref ?? null,
-            ...(newIncident ? { authStatusAt: new Date(), authNotifiedAt: null } : {}),
+            ...(newIncident ? { authStatusAt: new Date(), authNotifiedAt: notify ? null : new Date() } : {}),
           },
         });
         this.logger.log(
@@ -180,7 +184,7 @@ export class ConnectorAuthStatusService implements OnModuleInit, OnModuleDestroy
         );
       }
       // Not awaited: the caller may hold the refresh lock, and SMTP can be slow.
-      if (issue.status === 'needs_reauth') {
+      if (issue.status === 'needs_reauth' && notify) {
         void this.notifyOnce(connectorId).catch((err) =>
           this.logger.warn(`Could not email about connector ${connectorId}: ${err?.message ?? err}`),
         );
@@ -282,7 +286,7 @@ export class ConnectorAuthStatusService implements OnModuleInit, OnModuleDestroy
 
     const connector = await this.prisma.connector.findUnique({
       where: { id: connectorId },
-      select: { name: true, organizationId: true, authStatusMessage: true },
+      select: { name: true, organizationId: true, authStatusMessage: true, authStatusCode: true },
     });
     if (!connector) return;
     const owner = await this.prisma.organizationMember.findFirst({
@@ -298,6 +302,8 @@ export class ConnectorAuthStatusService implements OnModuleInit, OnModuleDestroy
         connectorName: connector.name,
         message: connector.authStatusMessage ?? '',
         connectorPath: `/connectors/${encodeURIComponent(connectorId)}`,
+        // A saved key the API keeps refusing reads differently from a sign-in to renew.
+        kind: connector.authStatusCode === CREDENTIAL_REFUSED_CODE ? 'credentials' : 'sign_in',
       },
       connector.organizationId,
     );

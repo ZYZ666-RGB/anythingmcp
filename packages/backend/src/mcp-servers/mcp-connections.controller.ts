@@ -8,8 +8,8 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
-import { AuthGuard } from '@nestjs/passport';
-import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { JwtOrManagementKeyGuard } from '../auth/jwt-or-management-key.guard';
+import { ApiBearerAuth, ApiBody, ApiOperation, ApiTags, ApiSecurity } from '@nestjs/swagger';
 import { McpConnectionGrantService } from './mcp-connection-grant.service';
 import { PrismaService } from '../common/prisma.service';
 import {
@@ -37,10 +37,11 @@ interface UpdateConnectionDto {
  * Changes take effect on the connection's very next request: the grant is
  * re-read, and re-validated, per request.
  */
-@ApiTags('mcp-connections')
+@ApiTags('MCP Connections')
 @Controller('api/mcp-connections')
-@UseGuards(AuthGuard('jwt'))
+@UseGuards(JwtOrManagementKeyGuard)
 @ApiBearerAuth()
+@ApiSecurity('api-key')
 export class McpConnectionsController {
   constructor(
     private readonly grants: McpConnectionGrantService,
@@ -49,7 +50,12 @@ export class McpConnectionsController {
   ) {}
 
   @Get()
-  @ApiOperation({ summary: 'AI clients connected to the shared /mcp endpoint' })
+  @ApiOperation({
+    summary: 'AI clients connected to the shared /mcp endpoint',
+    description:
+      'Your own connections only. In a workspace with restricted member visibility where you are not an admin, a ' +
+      'granted server you do not own is left out of `servers`.',
+  })
   async list(@Req() req: any) {
     const userId = req.user.sub;
     const grants = await this.grants.listForUser(userId);
@@ -78,7 +84,9 @@ export class McpConnectionsController {
     ]);
 
     const clientName = new Map(clients.map((c) => [c.clientId, c.clientName]));
-    const serverById = new Map(servers.map((s) => [s.id, s]));
+    // Named only when member visibility lets this user see the server.
+    const shown = new Set((await this.grants.keepVisible(userId, servers)).map((s) => s.id));
+    const serverById = new Map(servers.filter((s) => shown.has(s.id)).map((s) => [s.id, s]));
     const orgName = new Map(organizations.map((o) => [o.id, o.name]));
 
     return grants.map((g) => ({
@@ -102,13 +110,44 @@ export class McpConnectionsController {
   @Get('targets')
   @ApiOperation({
     summary: 'Workspaces and MCP servers this user can grant access to',
+    description:
+      'In a workspace with restricted member visibility where you are not an admin, only the servers you own are ' +
+      'listed, each counting only the connectors you can see; every workspace follows its own setting and your role ' +
+      'there. The whole-workspace choice stays available.',
   })
   async targets(@Req() req: any) {
     return this.grants.listSelectableTargets(req.user.sub);
   }
 
   @Put(':clientId')
-  @ApiOperation({ summary: 'Change what a connected client may reach' })
+  @ApiOperation({
+    summary: 'Change what a connected client may reach',
+    description:
+      'Replaces the grant of one connected AI client (`clientId` from GET /api/mcp-connections): either a whole ' +
+      'workspace (`organizationId`) or a list of MCP servers (`serverIds`), as listed by GET /api/mcp-connections/targets. ' +
+      'When both are given, `organizationId` wins. The change applies from the client\'s next request.\n\n' +
+      'Answers `{ "ok": true }`, or `{ "ok": false, "reason": … }`: `not-a-member` (you are not in that workspace), ' +
+      '`nothing-granted` (you can reach none of the servers; unreachable ids are dropped) or `empty-selection` (neither field given). ' +
+      'In a workspace with restricted member visibility where you are not an admin, a server you do not own is dropped like an unknown id.\n\n' +
+      '```bash\namcp api PUT /api/mcp-connections/$CLIENT_ID --data \'{"serverIds":["cmo9x1k2a0001abcdpq7rs8tu"]}\' --yes\n```',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        organizationId: { type: 'string', description: 'Grant every MCP server of this workspace.' },
+        serverIds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Grant only these MCP servers; ignored when `organizationId` is given.',
+        },
+      },
+    },
+    examples: {
+      servers: { summary: 'Only one MCP server', value: { serverIds: ['cmo9x1k2a0001abcdpq7rs8tu'] } },
+      workspace: { summary: 'A whole workspace', value: { organizationId: 'cmo9w7y3b0000abcdk1lm2nop' } },
+    },
+  })
   async update(
     @Req() req: any,
     @Param('clientId') clientId: string,

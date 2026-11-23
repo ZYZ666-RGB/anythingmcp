@@ -31,7 +31,7 @@ const svg16 = (path: string, fill: string, size: number) =>
   `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="${size}" height="${size}" fill="${fill}" aria-hidden="true"><path d="${path}"/></svg>`;
 
 export const claudeMark = (size = 28) => svg16(CLAUDE_PATH, '#D97757', size);
-const chatgptMark = (size = 28) => svg16(CHATGPT_PATH, '#10A37F', size);
+export const chatgptMark = (size = 28) => svg16(CHATGPT_PATH, '#10A37F', size);
 
 const LOCK_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
@@ -53,11 +53,11 @@ export function knownClientFor(redirectHost: string): KnownClient {
 }
 
 /**
- * The AI client named on the sign-up link from this page, for the Claude
- * Directory badge: it is left out only for ChatGPT and Meta's Muse, and shown
- * to everyone else. Muse is not recognised by host yet (no Muse client has
- * registered with us), so a client called "Muse" or one on Meta's domains
- * counts too. Only a badge depends on it, so a self-declared name is enough.
+ * The AI client named on the sign-up link from this page, for the directory
+ * badges (see directoryBadgesFor). Muse is not recognised by host yet (no Muse
+ * client has registered with us), so a client called "Muse" or one on Meta's
+ * domains counts too. Only a badge depends on it, so a self-declared name is
+ * enough.
  */
 export type SignupClient = 'claude' | 'chatgpt' | 'muse' | 'other';
 
@@ -79,8 +79,46 @@ export function signupClientFor(clientName: string, redirectHost: string): Signu
   return 'other';
 }
 
-/** Whether the Claude Directory badge is shown to someone connecting this client. */
-export const showsDirectoryBadge = (client: SignupClient) => client !== 'chatgpt' && client !== 'muse';
+/** An AI assistant's directory that lists AnythingMCP Cloud. */
+export type DirectoryListing = 'claude' | 'chatgpt';
+
+/**
+ * Which directory listings are shown to someone connecting this client. One
+ * assistant's listing is never shown to another assistant's users: Claude
+ * sees the Claude Directory, ChatGPT the ChatGPT Plugin Directory, Meta's
+ * Muse neither. Every other client sees both.
+ */
+export function directoryBadgesFor(client: SignupClient): DirectoryListing[] {
+  switch (client) {
+    case 'claude':
+      return ['claude'];
+    case 'chatgpt':
+      return ['chatgpt'];
+    case 'muse':
+      return [];
+    default:
+      return ['claude', 'chatgpt'];
+  }
+}
+
+/**
+ * The directory badge under the card's heading: one pill, in the colours of
+ * the one listing shown, or a neutral one naming both.
+ */
+export function directoryBadgeHtml(listings: DirectoryListing[]): string {
+  const claude = listings.includes('claude');
+  const chatgpt = listings.includes('chatgpt');
+  if (claude && chatgpt) {
+    return `<div class="verified verified-both"><span class="marks">${claudeMark(12)}${chatgptMark(12)}</span><span>Listed in the Claude and ChatGPT directories</span></div>`;
+  }
+  if (claude) {
+    return `<div class="verified">${claudeMark(12)}<span>Listed in Anthropic&#39;s Claude Directory</span></div>`;
+  }
+  if (chatgpt) {
+    return `<div class="verified verified-chatgpt">${chatgptMark(12)}<span>Listed in OpenAI&#39;s ChatGPT Plugin Directory</span></div>`;
+  }
+  return '';
+}
 
 /** The two tiles at the top of the card: the client, dots, AnythingMCP. */
 export function clientTilePair(clientName: string, redirectHost: string): string {
@@ -134,6 +172,9 @@ const STYLES = `
               background: #fff7ed; border: 1px solid #fed7aa; border-radius: 999px; padding: 6px 12px;
               width: max-content; max-width: 100%; margin: -8px auto 20px; text-decoration: none; }
   .verified svg { flex: none; }
+  .verified-chatgpt { color: #065f46; background: #ecfdf5; border-color: #a7f3d0; }
+  .verified-both { color: var(--text-2); background: var(--surface-2); border-color: var(--border); }
+  .verified .marks { display: inline-flex; gap: 3px; flex: none; }
   .consent { border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
   .consent h2 { margin: 0 0 10px; font-size: 13px; color: var(--text-2); font-weight: 500; overflow-wrap: anywhere; }
   .row { display: flex; gap: 10px; font-size: 14px; margin: 8px 0; line-height: 1.45; }
@@ -203,9 +244,12 @@ export function renderAuthPage(opts: {
   trust: TrustRowOptions;
   /** Page-specific CSS, appended to the shared rules. */
   extraStyles?: string;
+  /** The page's language (`<html lang>`); English when absent. */
+  lang?: string;
 }): string {
+  const lang = opts.lang && /^[a-z]{2}$/.test(opts.lang) ? opts.lang : 'en';
   return `<!DOCTYPE html>
-<html lang="en">
+<html lang="${lang}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -221,3 +265,41 @@ export function renderAuthPage(opts: {
 </body>
 </html>`;
 }
+
+/**
+ * The page for a connection request that is no longer open: it expired (30
+ * minutes), was already used, or never existed in this browser (a bookmark).
+ *
+ * Shown wherever the flow used to end in a bare sign-in form that could not
+ * work (`/auth/login` without a pending authorization) or in the OAuth
+ * library's raw JSON 400 (`/callback` without one). It cannot say which of
+ * the cases it is, so it says what to do in all of them. A second press on
+ * Continue lands here too, after the first one already went through: that is
+ * why it does not say the connection failed.
+ */
+export function renderClosedRequestPage(opts: {
+  trust: TrustRowOptions;
+  /** A message from the step that sent the person here (already plain text). */
+  message?: string;
+  /** The dashboard, for someone who only wanted to sign in. */
+  dashboardUrl?: string;
+}): string {
+  const message = opts.message ? `<div class="error" role="alert">${escapeHtml(opts.message)}</div>` : '';
+  const dashboard = opts.dashboardUrl
+    ? `
+    <p class="links">Looking for the dashboard? <a href="${escapeHtml(opts.dashboardUrl)}">Open AnythingMCP</a></p>`
+    : '';
+  return renderAuthPage({
+    title: 'This connection request is no longer open',
+    card: `
+    <div class="pair"><div class="tile" title="AnythingMCP">${AMCP_MARK_SVG}</div></div>
+    <h1>This connection request is no longer open</h1>
+    ${message}
+    <p class="sub" id="closed-what">A connection request stays open for 30 minutes and works once.</p>
+    <p class="sub" id="closed-next" style="margin-bottom:0"><strong>Go back to your AI assistant.</strong> If AnythingMCP is not shown as connected there, press <strong>Connect</strong> again.</p>${dashboard}`,
+    trust: opts.trust,
+    extraStyles: `
+  .sub strong { color: var(--text); font-weight: 600; }`,
+  });
+}
+

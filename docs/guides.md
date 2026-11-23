@@ -2,7 +2,7 @@
 
 Guides for connecting AI clients to AnythingMCP, the connector types you can build, and frequently asked questions. New here? Start with the [README](../README.md) and [Get started in 60 seconds](../README.md#run-it-yourself).
 
-Per-adapter setup guides (English, German, Italian and more) live at **[anythingmcp.com/guides](https://anythingmcp.com/guides)**.
+Per-adapter setup guides (English, German, Italian and more) live at **[anythingmcp.com/guides](https://anythingmcp.com/guides)**. The [connector catalog](catalog/README.md) lists every connector by category, with links to its guide for each AI client.
 
 ---
 
@@ -47,6 +47,7 @@ On an MCP server's page, the **Share this server** card gives you "Add to Cursor
 | [Tool definition format](tool-definition.md) | Parameters, endpoint mapping, response mapping |
 | [Knowledge Graph &amp; AI skills](knowledge-graph.md) | Per-workspace data-relationship map served over MCP, plus AI skills composed into server instructions |
 | [Workspace memory](memory.md) | Personal and company memory AI clients save and search over MCP (Enterprise) |
+| [Learning projects](learning-projects.md) | Keep what one colleague teaches the AI on an MCP server as skills for everyone (Team and Enterprise) |
 | [MCP resources](mcp-resources.md) | Read-only resources on per-server endpoints: URIs, role visibility, fail-closed rules |
 | [Deployment guide](deployment.md) | Docker, production setup, reverse proxy, env vars |
 | [Authentication](deployment.md#authentication) | OAuth2, JWT, API keys, MCP auth modes |
@@ -60,7 +61,7 @@ On an MCP server's page, the **Share this server** card gives you "Add to Cursor
 <details>
 <summary><strong>How do I create a custom connector for Claude?</strong></summary>
 
-Run AnythingMCP (self-hosted or [Cloud](https://cloud.anythingmcp.com)), import your API spec or pick a pre-built adapter, then add the gateway URL in Claude under *Customize → Connectors*. On AnythingMCP Cloud you can instead add AnythingMCP from the [Claude Directory](https://claude.ai/directory/anythingmcp) in one click. No code required — the [Claude guide](integrations/claude.md) walks through it in ~5 minutes.
+Run AnythingMCP (self-hosted or [Cloud](https://cloud.anythingmcp.com)), import your API spec or pick a pre-built adapter, then add the gateway URL in Claude under **Plugins** (still called **Customize** on some plans) → **Connectors**. On AnythingMCP Cloud you can instead add AnythingMCP from the [Claude Directory](https://claude.ai/directory/anythingmcp) in one click. No code required — the [Claude guide](integrations/claude.md) walks through it in ~5 minutes.
 </details>
 
 <details>

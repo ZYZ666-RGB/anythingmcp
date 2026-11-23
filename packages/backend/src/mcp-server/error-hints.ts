@@ -16,6 +16,16 @@
  * is appended, never substituted for the vendor's own message.
  */
 
+import { ipRefusalHint, looksLikeIpRefusal } from '../connectors/egress';
+import {
+  WOOCOMMERCE_CANNOT_VIEW_HINT,
+  WOOCOMMERCE_UNKNOWN_KEY_HINT,
+  wooCommerceAuthHint,
+} from '../adapters/woocommerce-setup';
+
+const WOOCOMMERCE_CANNOT_VIEW_TOOL_HINT = `${WOOCOMMERCE_CANNOT_VIEW_HINT} Retrying will not help.`;
+const WOOCOMMERCE_UNKNOWN_KEY_TOOL_HINT = `${WOOCOMMERCE_UNKNOWN_KEY_HINT} Retrying will not help.`;
+
 export interface ErrorHintInput {
   /** Upstream host the request went to, if known (e.g. `purora.weclapp.com`). */
   host?: string | null;
@@ -34,14 +44,25 @@ export interface ErrorHintInput {
   /**
    * The adapter's `verifyHints`: what the setup check says when this status
    * comes back. Used for a refused credential (401) that no rule here
-   * covers, so a connector saved without a passing check hears the same
-   * advice at its first call.
+   * covers, and for a refusal whose error code the adapter has a hint for,
+   * so a connector saved without a passing check hears the same advice at
+   * its first call.
    */
-  verifyHints?: Record<string, string | { hint: string; suggest?: string }>;
+  verifyHints?: Record<string, string | { hint: string; suggest?: string; field?: string }>;
   /** The connector's page in AnythingMCP, linked from a credential hint. */
   connectorPage?: string;
   /** AnythingMCP Cloud (DEPLOYMENT_MODE=cloud) rather than self-hosted. */
   cloud?: boolean;
+  /** The addresses this instance calls out from (EGRESS_IPS), named when a server refuses them. */
+  egressIps?: string[];
+  /** The call went through the proxy / web-unblocker, whose addresses change. */
+  usedProxy?: boolean;
+  /**
+   * The tool arguments the caller sent. Only a rule that has to name the
+   * offending value reads them (Etsy's tag limit), and it quotes nothing
+   * but that value back.
+   */
+  args?: Record<string, unknown>;
 }
 
 const MISSING_SCOPE_HINT =
@@ -65,7 +86,7 @@ const ATLASSIAN_UNSCOPED_TOKEN_HINT =
   'read:confluence:agent-interface, search:confluence:agent-interface, and the write scopes they ' +
   "want), and paste it into this connector's API token setting in AnythingMCP.";
 
-const ODOO_FIELD_HINT =
+export const ODOO_FIELD_HINT =
   'That field does not exist on this model in this Odoo database; field names differ between ' +
   'Odoo versions and installed apps. Do not guess another spelling: list the model\'s fields ' +
   'first (odoo_fields_get, or fields_get on the model) and use only the names it returns.';
@@ -73,6 +94,14 @@ const ODOO_FIELD_HINT =
 // Odoo 18.3 dropped `mobile` from contacts (res.partner, and res.users through
 // it); one number field is left. On 10 Oct 2026 a scheduled job asked for it 28
 // times in a day on Odoo 19, and the generic field hint did not stop it.
+// Odoo saas-19.3 and later (20.0 included) dropped `company_type` from
+// contacts; Odoo 19.0 and older still have it. In the first week of Nov 2026
+// it failed in 5 workspaces (read, search_read, create, and a KeyError on write).
+const ODOO_PARTNER_COMPANY_TYPE_HINT =
+  'This Odoo database (saas-19.3 or later) has no `company_type` field on contacts. Use the ' +
+  'boolean `is_company` instead: true for a company, false for a person, in fields, domains ' +
+  'and values alike. Leave `company_type` out and call again.';
+
 const ODOO_PARTNER_MOBILE_HINT =
   'Odoo 18.3 and later (Odoo 19 included) have no `mobile` field on contacts: every number is ' +
   'in `phone`. Ask for `phone` instead and leave `mobile` out of fields and domains.';
@@ -147,6 +176,55 @@ const ETSY_NO_SHOP_HINT =
   'User"). Retrying or trying other shop ids will not help. Tell the user to open the connector in ' +
   'AnythingMCP, click Authorize with Provider again and sign in at Etsy with the Etsy account that ' +
   'owns the shop (a buyer or second account has none).';
+
+// Etsy refuses a tag over 20 characters on English (en-US) listings with
+// "There was a problem with /tags : cannot be more than 20 characters", without
+// saying which tag. Listings in other languages take longer tags (up to 30 in
+// the calls Etsy accepted in Oct/Nov 2026), so nothing is refused before the
+// call: the hint names the tags over the limit once Etsy has refused them.
+// createDraftListing answers the same refusal as a JSON array instead:
+// [{"path":"/tags","type":"too_long","message":"cannot be more than 20 characters"}].
+const ETSY_TAG_LIMIT =
+  /\/tags\s*:\s*cannot be more than (\d+) characters|"path"\s*:\s*"\/tags"[^}]*?cannot be more than (\d+) characters/i;
+
+// A tag is quoted back to the model at most this long.
+const QUOTED_ITEM_MAX = 60;
+
+function etsyTagLengthHint(tags: unknown, max: number): string {
+  const rule = `Etsy allows at most ${max} characters per tag on English listings.`;
+  const long = overlongListItems(tags, max);
+  if (long.length === 0) {
+    return `${rule} Shorten every longer tag (spaces count) and call again.`;
+  }
+  const named = long
+    .map(({ item, length }) => {
+      const shown = [...item].length > QUOTED_ITEM_MAX ? `${[...item].slice(0, QUOTED_ITEM_MAX).join('')}…` : item;
+      return `tag ${JSON.stringify(shown)} has ${length} characters`;
+    })
+    .join('; ');
+  return `${named}; ${rule} Shorten or replace ${long.length === 1 ? 'it' : 'them'} and call again with the other tags unchanged.`;
+}
+
+/**
+ * The items of a list argument that are longer than `max` characters, with
+ * their lengths: a comma-separated string or an array of strings. Items are
+ * trimmed and counted in code points, so an emoji is one character.
+ */
+export function overlongListItems(
+  value: unknown,
+  max: number,
+): Array<{ item: string; length: number }> {
+  const items =
+    typeof value === 'string'
+      ? value.split(',')
+      : Array.isArray(value)
+        ? value.filter((v): v is string => typeof v === 'string')
+        : [];
+  return items
+    .map((raw) => raw.trim())
+    .map((item) => ({ item, length: [...item].length }))
+    .filter(({ length }) => length > max);
+}
 
 // Zoho answers NO_PERMISSION naming Crm_Implied_Api_Access when the CRM user
 // may not use the API at all: the Free edition has no API access, and on paid
@@ -302,6 +380,27 @@ const TELEGRAM_CHAT_HINT =
   'the user has sent the bot a message; @usernames only work for public channels. ' +
   'Ask the user to do that instead of trying other ids.';
 
+const TELEGRAM_NO_CHAT_ADVICE =
+  'Pass chat_id: ' +
+  'ask the user to press Start in the bot\'s chat, read the id with telegram_bot_get_updates, ' +
+  'and tell them they can save it as the default chat in the connector\'s settings.';
+
+const TELEGRAM_NO_CHAT_HINT =
+  'The call named no chat and this connector has no default chat ' +
+  '(TELEGRAM_DEFAULT_CHAT_ID is empty), so Telegram got an empty chat_id. ' +
+  TELEGRAM_NO_CHAT_ADVICE;
+
+/** The same advice, for the call refused before it is sent (required-env-defaults.ts). */
+export const TELEGRAM_NO_CHAT_REFUSAL =
+  'The call named no chat and this connector has no default chat ' +
+  '(TELEGRAM_DEFAULT_CHAT_ID is empty), so no request was sent to Telegram. ' +
+  TELEGRAM_NO_CHAT_ADVICE;
+
+const OUTLOOK_SEARCH_SKIP_HINT =
+  'Microsoft Graph does not page a search with skip. Call again with the same search and ' +
+  'top, without skip, and pass skip_token: the $skiptoken value of the @odata.nextLink in ' +
+  'the previous answer. Retrying with skip fails the same way.';
+
 const TELEGRAM_SUPERGROUP_HINT =
   'The group became a supergroup and has a new chat id: it is the ' +
   '`migrate_to_chat_id` in this answer (it starts with -100). Send to that id; ' +
@@ -323,6 +422,18 @@ const SHOPIFY_NOT_INSTALLED_HINT =
   'store (`app_not_installed`). This cannot be fixed by retrying. The store owner must ' +
   'open the app in the Shopify Dev Dashboard, click "Install app" and choose this ' +
   'store (the one in SHOPIFY_STORE), then the tools work. Tell the user exactly that.';
+
+// 89 of the 124 failed calls on Shopify connectors in the four weeks to
+// 15 November 2026: the app was released without the scope, and the model
+// kept asking for the same field.
+const SHOPIFY_MISSING_SCOPE_HINT =
+  'Shopify refused this field because the Dev Dashboard app has no access scope for it ' +
+  '(the message names the scope when Shopify says which; for orders, products and ' +
+  'customers it is `read_orders`, `read_products`, `read_customers`). Retrying or ' +
+  'rewording the query will not help. The store owner must open the app in the Shopify ' +
+  'Dev Dashboard, add the scope on the Versions page, click Release, and then approve ' +
+  'the new access for the store in the Shopify admin. Tell the user exactly that, with ' +
+  'the scope to add.';
 
 const SHOPIFY_PROTECTED_DATA_HINT =
   'Shopify withholds protected customer data (names, emails, phones, addresses) from ' +
@@ -542,9 +653,40 @@ const CREDENTIAL_HINTS = new Set<string>([
   MISSING_SCOPE_HINT,
   ATLASSIAN_TOKEN_REFUSED_HINT,
   ATLASSIAN_UNSCOPED_TOKEN_HINT,
+  WOOCOMMERCE_CANNOT_VIEW_TOOL_HINT,
+  WOOCOMMERCE_UNKNOWN_KEY_TOOL_HINT,
 ]);
 
-function bodyText(body: unknown): string {
+/**
+ * Hints that say the connector's own stored key or token was refused (not a
+ * missing permission, a wrong address or a scope): the ones a repeated
+ * refusal is recorded for (credential-refusal-tracker.ts).
+ */
+const REFUSED_KEY_HINTS = [
+  ODOO_EXPIRED_KEY_HINT,
+  ODOO_ACCESS_DENIED_HINT,
+  TELEGRAM_BAD_TOKEN_HINT,
+  GEMINI_KEY_HINT,
+  OPENAI_KEY_HINT,
+  TAVILY_KEY_HINT,
+  PERPLEXITY_KEY_HINT,
+  SERPAPI_KEY_HINT,
+  GOOGLE_API_KEY_HINT,
+  COMPANIES_HOUSE_KEY_HINT,
+  WOOCOMMERCE_UNKNOWN_KEY_TOOL_HINT,
+];
+
+/** True when `hint` (as returned by deriveErrorHint, link included) says the stored key was refused. */
+export function isRefusedKeyHint(hint: string | undefined): boolean {
+  return !!hint && REFUSED_KEY_HINTS.some((known) => hint.startsWith(known));
+}
+
+/** True when `hint` says the credential works but lacks a scope: re-authorizing fixes it, a new key does not. */
+export function isMissingScopeHint(hint: string | undefined): boolean {
+  return !!hint && hint.startsWith(MISSING_SCOPE_HINT);
+}
+
+export function bodyText(body: unknown): string {
   if (body === undefined || body === null) return '';
   if (typeof body === 'string') return body;
   try {
@@ -552,6 +694,46 @@ function bodyText(body: unknown): string {
   } catch {
     return String(body);
   }
+}
+
+/**
+ * The error code a provider put in its refusal, when the answer names one:
+ * `app_not_installed` in `{"error":"app_not_installed",…}` or in Shopify's
+ * `Oauth error app_not_installed` page. Letters and underscores only, at
+ * most 40: a code, never a sentence, a number or a value someone typed.
+ */
+export function providerErrorCode(text: string | null | undefined): string | undefined {
+  if (!text) return undefined;
+  const head = text.slice(0, 4000);
+  const match =
+    /"(?:error|error_code|errorCode|code)"\s*:\s*"([A-Za-z][A-Za-z_]{2,39})"/.exec(head) ??
+    /\bOauth error ([a-z][a-z_]{2,39})\b/.exec(head);
+  return match?.[1];
+}
+
+type VerifyHint = string | { hint: string; suggest?: string; field?: string };
+
+/** The classifier's failure kinds (connector-error.util.ts), which `verifyHints` is also keyed by. */
+const FAILURE_KINDS = new Set(['auth_failed', 'bad_request', 'not_found', 'rate_limited', 'upstream_error', 'unreachable', 'error']);
+
+/**
+ * The adapter's hint filed under this provider error code, if it has one.
+ * A code that reads like a failure kind (`not_found` in the body of a
+ * missing record) is not one: those keys answer the classifier, not the
+ * provider.
+ */
+export function codeHint<T extends VerifyHint>(
+  hints: Record<string, T> | undefined,
+  code: string | undefined,
+): T | undefined {
+  if (!hints || !code || FAILURE_KINDS.has(code.toLowerCase())) return undefined;
+  // Own keys only: a code such as `constructor` must not reach the prototype.
+  const key = [code, code.toLowerCase()].find((k) => Object.prototype.hasOwnProperty.call(hints, k));
+  return key ? hints[key] : undefined;
+}
+
+function hintText(hint: VerifyHint | undefined): string | undefined {
+  return typeof hint === 'string' ? hint : hint?.hint;
 }
 
 function hostMatches(host: string | null | undefined, suffix: string): boolean {
@@ -568,6 +750,16 @@ export function deriveErrorHint(input: ErrorHintInput): string | undefined {
   const text = `${input.message ?? ''}\n${bodyText(input.body)}`;
   let hint = ruleHint(input, text);
   let credential = hint !== undefined && CREDENTIAL_HINTS.has(hint);
+  // A refusal the adapter's setup check has its own words for, under the
+  // provider's error code (Shopify's `shop_not_permitted`): the same advice
+  // at a call, for a connector saved without a passing check.
+  if (!hint) {
+    const ownText = hintText(codeHint(input.verifyHints, providerErrorCode(text)));
+    if (ownText) {
+      hint = `${ownText.trim()} Retrying will not help.`;
+      credential = true;
+    }
+  }
   // A refused credential no rule covers: the adapter's own setup-check advice,
   // so a connector saved without a passing check hears it at the first call.
   if (!hint && input.status === 401) {
@@ -611,6 +803,20 @@ function ruleHint(input: ErrorHintInput, text: string): string | undefined {
   // the scope claim" is an API token without scopes, which no re-authorization
   // fixes. Only the catalog adapter, which signs in with an API token: a
   // hand-built connector to the same server may use OAuth, where it would.
+  // WooCommerce's two 401s mean different things: a key it does not know, and
+  // a call it treated as coming from a user who may not see the data (or from
+  // nobody: the key was not seen at all). Same texts as the setup check.
+  if (input.adapterSlug === 'woocommerce') {
+    const woo = wooCommerceAuthHint(input.status, text);
+    if (woo === WOOCOMMERCE_CANNOT_VIEW_HINT) return WOOCOMMERCE_CANNOT_VIEW_TOOL_HINT;
+    if (woo === WOOCOMMERCE_UNKNOWN_KEY_HINT) return WOOCOMMERCE_UNKNOWN_KEY_TOOL_HINT;
+  }
+
+  // Graph refuses $skip together with $search; the adapter's skip_token pages it.
+  if (/SearchWithSkip/.test(text) && (input.adapterSlug === 'microsoft-outlook' || hostMatches(input.host, 'graph.microsoft.com'))) {
+    return OUTLOOK_SEARCH_SKIP_HINT;
+  }
+
   if (input.adapterSlug === 'atlassian') {
     if (/missing the scope claim|Unable to resolve user scopes/i.test(text)) {
       return ATLASSIAN_UNSCOPED_TOKEN_HINT;
@@ -635,7 +841,14 @@ function ruleHint(input: ErrorHintInput, text: string): string | undefined {
   if (/Invalid field '?(?:res\.(?:partner|users)\.)?mobile'? (?:on '?res\.(?:partner|users)|in leaf)/i.test(text)) {
     return ODOO_PARTNER_MOBILE_HINT;
   }
-  if (/Invalid field '[^']+' on '[^']+'|Invalid field [\w.]+ in leaf|Invalid field '[^']+' on model/i.test(text)) {
+  if (
+    /Invalid field '?(?:res\.partner\.)?company_type'? (?:on|in) '?res\.partner|"builtins\.KeyError","message":"company_type"/i.test(
+      text,
+    )
+  ) {
+    return ODOO_PARTNER_COMPANY_TYPE_HINT;
+  }
+  if (/Invalid field '[^']+' (?:on|in) '[^']+'|Invalid field [\w.]+ in leaf|Invalid field '[^']+' on model/i.test(text)) {
     return ODOO_FIELD_HINT;
   }
   if (/Object [\w.]+ doesn't exist|Model not found: [\w.]+/i.test(text)) {
@@ -693,6 +906,9 @@ function ruleHint(input: ErrorHintInput, text: string): string | undefined {
     if (/failed to get HTTP URL content|wrong file identifier\/HTTP URL specified/i.test(text)) {
       return TELEGRAM_URL_CONTENT_HINT;
     }
+    if (/chat_id is empty/i.test(text)) {
+      return TELEGRAM_NO_CHAT_HINT;
+    }
     if (/chat not found|bot is not a member|can't initiate conversation|need administrator rights|bot was blocked by the user/i.test(text)) {
       return TELEGRAM_CHAT_HINT;
     }
@@ -703,6 +919,11 @@ function ruleHint(input: ErrorHintInput, text: string): string | undefined {
   }
   if (hostMatches(input.host, 'etsy.com') && /Could not find a shop for User/i.test(text)) {
     return ETSY_NO_SHOP_HINT;
+  }
+  const tagLimit =
+    hostMatches(input.host, 'etsy.com') || input.adapterSlug === 'etsy' ? ETSY_TAG_LIMIT.exec(text) : null;
+  if (tagLimit) {
+    return etsyTagLengthHint(input.args?.tags, Number(tagLimit[1] ?? tagLimit[2]));
   }
 
   if (/Crm_Implied_Api_Access/.test(text)) {
@@ -741,6 +962,9 @@ function ruleHint(input: ErrorHintInput, text: string): string | undefined {
   }
   if (hostMatches(input.host, 'myshopify.com') && /not approved to access the \w+ object|protected-customer-data/i.test(text)) {
     return SHOPIFY_PROTECTED_DATA_HINT;
+  }
+  if (hostMatches(input.host, 'myshopify.com') && /ACCESS_DENIED|Access denied for \w+ field/.test(text)) {
+    return SHOPIFY_MISSING_SCOPE_HINT;
   }
 
   if (hostMatches(input.host, 'graph.facebook.com') || hostMatches(input.host, 'graph.instagram.com')) {
@@ -797,6 +1021,13 @@ function ruleHint(input: ErrorHintInput, text: string): string | undefined {
   if (hostMatches(input.host, 'serpapi.com')) {
     const hint = serpapiHint(input.status);
     if (hint) return hint;
+  }
+
+  // Last, so a vendor's own rule wins: a server that only accepts approved
+  // addresses (a self-hosted Bitrix24 behind a firewall answering 403
+  // "Access Restricted", Shopee's source_ip_undeclared). Name the address.
+  if (looksLikeIpRefusal({ status: input.status, text })) {
+    return ipRefusalHint({ ips: input.egressIps ?? [], cloud: input.cloud, usedProxy: input.usedProxy });
   }
 
   return undefined;

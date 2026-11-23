@@ -50,3 +50,20 @@ export function codeToolCapForPlan(
 export function inlineCodeAllowedForPlan(plan: string | null | undefined): boolean {
   return !!plan && INLINE_PLANS.has(plan);
 }
+
+/**
+ * The plan a workspace is treated as for code-mode gating (saved code tools and
+ * inline code). Every Cloud trial gets the Team experience, so a new workspace
+ * can try everything before it picks a plan (decided 2026-11-09). Run quotas
+ * are resolved separately (`codeRunQuotaPlan`): a trial without a card keeps a
+ * small run budget. A self-hosted trial is unchanged unless it has a card,
+ * which it never does (no Stripe billing there).
+ */
+export function effectiveCodeModePlan(
+  plan: string | null | undefined,
+  cardTrial: boolean,
+  cloud = false,
+): string {
+  if (plan === 'trial' && (cardTrial || cloud)) return 'team';
+  return plan ?? 'community';
+}

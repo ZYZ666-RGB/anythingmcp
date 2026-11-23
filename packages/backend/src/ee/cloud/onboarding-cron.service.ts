@@ -12,6 +12,8 @@ import { CardTrialOfferService } from '../../license/card-trial-offer.service';
 import { RetentionLicenceClient } from '../../license/retention-licence.client';
 import { cloudFrontendOrigin } from '../../license/license-checkout';
 import { createTrialExtensionToken, trialExtensionSecret } from '../../license/trial-extension-token';
+import { FIRST_SUCCESS_KEY } from '../../license/card-trial-offer';
+import { membersFirstSuccessAt } from '../../audit/first-success-markers';
 import {
   WINBACK_HOLDOUT_KEY,
   WINBACK_OFFER_KEY,
@@ -87,6 +89,29 @@ const WINBACK_STAGES = [
     until: DAYS(37),
   },
 ] as const;
+
+/** The win-back stage whose window a trial that ended at `trialEndedAt` is in, if any. */
+function winbackStep(now: number, trialEndedAt: Date): (typeof WINBACK_STAGES)[number] | undefined {
+  const endedFor = now - trialEndedAt.getTime();
+  return WINBACK_STAGES.find((s) => endedFor >= s.after && endedFor < s.until);
+}
+
+/**
+ * Workspace ids per query when a pass loads what its loop checks first in
+ * bulk. Until Nov 2026 the win-back pass asked two queries per workspace in a
+ * stage window (about 4,700 an hour), and one run took 7 minutes.
+ */
+const BATCH_SIZE = 1000;
+
+/** `items` in slices of at most `size`. */
+function chunks<T>(items: readonly T[], size = BATCH_SIZE): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+/** An OrgSettings row (workspace and key) in the sets the passes load. */
+const settingId = (organizationId: string, key: string) => `${organizationId}\u0000${key}`;
 
 /**
  * The offer of each segment, minted per workspace by the licence site
@@ -230,6 +255,7 @@ export class OnboardingCronService {
     trialWarn1: number;
     trialExpired: number;
     trialEmailsWithheld: number;
+    trialEmailsOptedOut: number;
     trialsMarkedExpired: number;
     trialsRepaired: number;
     licensesReverified: number;
@@ -257,6 +283,7 @@ export class OnboardingCronService {
       trialWarn1: 0,
       trialExpired: 0,
       trialEmailsWithheld: 0,
+      trialEmailsOptedOut: 0,
       trialsMarkedExpired: 0,
       trialsRepaired: 0,
       licensesReverified: 0,
@@ -366,9 +393,10 @@ export class OnboardingCronService {
 
       // First nudge: an hour after signup (every candidate is at least that
       // old). Someone who already connected an AI client is told to ask it
-      // for the app in the same chat, naming the client, in both arms; arm B
-      // replaces the generic how-to with one-click Claude chats; the holdout
-      // gets nothing, and moves on to the reminder-2 step all the same.
+      // for the app in the same chat, naming the client; anyone else gets
+      // one-click Claude chats (arm B, the only email arm since 2026-11-17);
+      // the holdout gets nothing, and moves on to the reminder-2 step all the
+      // same.
       const aiClient = aiClients.get(u.id);
       const arm = reminderArm(u.id);
       if (u.onboardingReminderCount === 0) {
@@ -468,7 +496,7 @@ export class OnboardingCronService {
         `firstHoldout=${out.firstReminderHoldout} second=${out.secondReminders} ` +
         `secondWithheld=${out.secondRemindersWithheld} activation=${out.activationReminders} ` +
         `trialWarn3=${out.trialWarn3} trialWarn1=${out.trialWarn1} trialExpired=${out.trialExpired} ` +
-        `trialEmailsWithheld=${out.trialEmailsWithheld} ` +
+        `trialEmailsWithheld=${out.trialEmailsWithheld} trialEmailsOptedOut=${out.trialEmailsOptedOut} ` +
         `trialsMarkedExpired=${out.trialsMarkedExpired} trialsRepaired=${out.trialsRepaired} ` +
         `licensesReverified=${out.licensesReverified} licensesDeactivated=${out.licensesDeactivated} ` +
         `licensesReleased=${out.licensesReleased} licensesBound=${out.licensesBound} winbackOffers=${out.winbackOffers} ` +
@@ -553,9 +581,11 @@ export class OnboardingCronService {
    * Trial lifecycle pass — value-oriented conversion nudges as a trial winds
    * down. For each cloud trial whose `expiresAt` is within 3 days or already
    * past, send the most-urgent unsent stage (expired → warn1 → warn3) to the
-   * org's admins, with a recap of what they've built. These are account-
-   * lifecycle (paid access ending), not marketing, so they ignore the
-   * marketing opt-out. Idempotent via per-org OrgSettings flags
+   * org's admins, with a recap of what they've built. Admins who opted out
+   * of marketing email get none of them: the emails sell a plan, and people
+   * who unsubscribed kept receiving them. When every admin opted out, the
+   * stage is flagged without a send, so it is not decided again every run;
+   * access ending is still shown in the dashboard. Idempotent via per-org OrgSettings flags
    * (`trial_email_{stage}`). Sends at most one stage per org per run.
    *
    * Never to a workspace that already pays or is about to: a paid licence, a
@@ -569,9 +599,9 @@ export class OnboardingCronService {
    * The expired stage of a business workspace (winback-segment.ts) outside
    * the control group is the plain email from Matteo instead: what they
    * built, the one-click 7-day extension and the locked price, with codes
-   * minted for the workspace. Admins who opted out of marketing, and every
-   * admin when the codes cannot be minted (this stage gets one run), get the
-   * standard notice. The control group gets the standard notice too.
+   * minted for the workspace. Every admin gets the standard notice when the
+   * codes cannot be minted (this stage gets one run), and so does the control
+   * group. Admins who opted out of marketing get neither.
    */
   private async runTrialLifecyclePass(
     now: number,
@@ -582,6 +612,7 @@ export class OnboardingCronService {
       trialExpired: number;
       trialExpiredBusiness?: number;
       trialEmailsWithheld: number;
+      trialEmailsOptedOut?: number;
       skipped: number;
     },
   ): Promise<void> {
@@ -654,6 +685,17 @@ export class OnboardingCronService {
         continue;
       }
 
+      const recipients = admins.filter((a) => !a.user.emailMarketingOptOut);
+      if (recipients.length === 0) {
+        await this.prisma.orgSettings.upsert({
+          where: { organizationId_key: { organizationId, key: flagKey } },
+          create: { organizationId, key: flagKey, value: `opted_out ${new Date().toISOString()}` },
+          update: { value: `opted_out ${new Date().toISOString()}` },
+        });
+        if (out.trialEmailsOptedOut !== undefined) out.trialEmailsOptedOut++;
+        continue;
+      }
+
       // Value recap (cheap counts; trial window is 7d so audit isn't pruned).
       const [connectors, successfulCalls] = await Promise.all([
         this.prisma.connector.count({ where: { organizationId } }),
@@ -667,10 +709,9 @@ export class OnboardingCronService {
           : null;
 
       let sentAny = false;
-      for (const a of admins) {
-        const ok =
-          business && !a.user.emailMarketingOptOut
-            ? await this.email.sendTrialEndedBusinessEmail(a.user.email, a.user.name || 'there', business)
+      for (const a of recipients) {
+        const ok = business
+          ? await this.email.sendTrialEndedBusinessEmail(a.user.email, a.user.name || 'there', business)
             : await this.email.sendTrialLifecycleEmail(a.user.email, a.user.name || 'there', stage, {
                 connectors,
                 successfulCalls,
@@ -678,7 +719,7 @@ export class OnboardingCronService {
               });
         if (ok) sentAny = true;
       }
-      if (sentAny && business && admins.some((a) => !a.user.emailMarketingOptOut)) {
+      if (sentAny && business) {
         await this.flag(organizationId, WINBACK_OFFER_KEY, offerValue('business', 'locked', 'expired'));
         if (out.trialExpiredBusiness !== undefined) out.trialExpiredBusiness++;
       }
@@ -728,11 +769,27 @@ export class OnboardingCronService {
       select: { organizationId: true, expiresAt: true },
     });
 
+    // What the loop checks first, loaded for every workspace inside a stage
+    // window in a few queries rather than two per workspace: the stage flags
+    // already set, and the workspaces with any licence besides the free trial.
+    const inWindow = [
+      ...new Set(trials.filter((l) => winbackStep(now, l.expiresAt!)).map((l) => l.organizationId!)),
+    ];
+    const [stageFlags, customers] = await Promise.all([
+      this.storedSettings(inWindow, WINBACK_STAGES.map((s) => s.flagKey)),
+      this.workspacesWithOtherLicence(inWindow),
+    ]);
+    // A stage closed here holds for a second trial licence of the same
+    // workspace later in this loop, as when each licence read its own flag.
+    const closeStage = async (organizationId: string, flagKey: string) => {
+      await this.flag(organizationId, flagKey);
+      stageFlags.add(settingId(organizationId, flagKey));
+    };
+
     for (const lic of trials) {
       const organizationId = lic.organizationId!;
       const trialEndedAt = lic.expiresAt!;
-      const endedFor = now - trialEndedAt.getTime();
-      const step = WINBACK_STAGES.find((s) => endedFor >= s.after && endedFor < s.until);
+      const step = winbackStep(now, trialEndedAt);
       if (!step) continue;
       out.examined++;
 
@@ -740,19 +797,12 @@ export class OnboardingCronService {
       // went through Stripe checkout: a paid plan, a card trial (plan
       // 'starter' while Stripe says trialing), or one since revoked or
       // expired. None of them gets a discount, nor the how-to.
-      const [already, customer] = await Promise.all([
-        this.prisma.orgSettings.findUnique({
-          where: { organizationId_key: { organizationId, key: step.flagKey } },
-          select: { id: true },
-        }),
-        this.prisma.license.count({ where: { organizationId, plan: { not: 'trial' } } }),
-      ]);
-      if (already) {
+      if (stageFlags.has(settingId(organizationId, step.flagKey))) {
         out.skipped++;
         continue;
       }
-      if (customer > 0) {
-        await this.flag(organizationId, step.flagKey);
+      if (customers.has(organizationId)) {
+        await closeStage(organizationId, step.flagKey);
         out.skipped++;
         continue;
       }
@@ -768,7 +818,7 @@ export class OnboardingCronService {
 
       // Someone who never made a call gets the how-to once, in the first stage.
       if (!used && step.stage !== 'first') {
-        await this.flag(organizationId, step.flagKey);
+        await closeStage(organizationId, step.flagKey);
         out.skipped++;
         continue;
       }
@@ -776,7 +826,7 @@ export class OnboardingCronService {
       // Nobody to mail (no admin, all opted out) ends the stage.
       const recipients = admins.filter((a) => !a.user.emailMarketingOptOut).map((a) => a.user);
       if (recipients.length === 0) {
-        await this.flag(organizationId, step.flagKey);
+        await closeStage(organizationId, step.flagKey);
         out.skipped++;
         continue;
       }
@@ -799,7 +849,7 @@ export class OnboardingCronService {
         continue;
       }
       if (paidPlan.paid.has(organizationId)) {
-        await this.flag(organizationId, step.flagKey);
+        await closeStage(organizationId, step.flagKey);
         out.skipped++;
         continue;
       }
@@ -824,7 +874,7 @@ export class OnboardingCronService {
           continue;
         }
         if (await this.inHoldout(organizationId, segment)) {
-          await this.flag(organizationId, step.flagKey);
+          await closeStage(organizationId, step.flagKey);
           out.winbackHoldout++;
           out.skipped++;
           continue;
@@ -856,7 +906,7 @@ export class OnboardingCronService {
         out.skipped++;
         continue;
       }
-      await this.flag(organizationId, step.flagKey);
+      await closeStage(organizationId, step.flagKey);
       if (offer.kind === 'help') {
         await this.flag(organizationId, WINBACK_OFFER_KEY, offerValue(segment, 'help', step.stage));
         out.winbackHelp++;
@@ -982,35 +1032,35 @@ export class OnboardingCronService {
       _count: { _all: true },
     });
     const firstStage = WINBACK_STAGES[0];
+    // What the loop checks first, loaded in a few queries for every workspace
+    // with enough events (one group per workspace): the email already sent
+    // and the stored first success, any licence besides the free trial, and
+    // the latest free trial's end.
+    const eligible = groups
+      .filter((g) => g.organizationId && g._count._all >= BLOCKED_CALLS.minEvents)
+      .map((g) => g.organizationId!);
+    const [sent, customers, trialEnds] = await Promise.all([
+      this.storedSettings(eligible, [BLOCKED_CALLS.flagKey, FIRST_SUCCESS_KEY]),
+      this.workspacesWithOtherLicence(eligible),
+      this.latestTrialEnds(eligible),
+    ]);
     for (const group of groups) {
       const organizationId = group.organizationId;
       if (!organizationId || group._count._all < BLOCKED_CALLS.minEvents) continue;
       out.examined++;
 
-      const [already, customer, trial] = await Promise.all([
-        this.prisma.orgSettings.findUnique({
-          where: { organizationId_key: { organizationId, key: BLOCKED_CALLS.flagKey } },
-          select: { id: true },
-        }),
-        this.prisma.license.count({ where: { organizationId, plan: { not: 'trial' } } }),
-        this.prisma.license.findFirst({
-          where: { organizationId, plan: 'trial' },
-          orderBy: { createdAt: 'desc' },
-          select: { expiresAt: true },
-        }),
-      ]);
-      if (already) {
+      if (sent.has(settingId(organizationId, BLOCKED_CALLS.flagKey))) {
         out.skipped++;
         continue;
       }
-      if (customer > 0) {
+      if (customers.has(organizationId)) {
         await this.flag(organizationId, BLOCKED_CALLS.flagKey);
         out.skipped++;
         continue;
       }
       // The trial must still be over: one extended or reissued since the
       // events were recorded is not blocked any more.
-      const trialEndedAt = trial?.expiresAt ?? null;
+      const trialEndedAt = trialEnds.get(organizationId) ?? null;
       if (!trialEndedAt || trialEndedAt.getTime() > now) {
         out.skipped++;
         continue;
@@ -1024,10 +1074,18 @@ export class OnboardingCronService {
         this.prisma.toolInvocation.count({ where: { organizationId, status: 'SUCCESS' } }),
         this.prisma.connector.findMany({ where: { organizationId }, select: { config: true } }),
       ]);
+      // A workspace back long after its trial may have no SUCCESS row left
+      // (Cloud deletes them after INVOCATION_RETENTION_DAYS): the stored
+      // markers say whether it ever succeeded.
+      const succeededBefore =
+        successfulCalls <= 0 &&
+        (sent.has(settingId(organizationId, FIRST_SUCCESS_KEY)) ||
+          (await membersFirstSuccessAt(this.prisma, organizationId)) !== null);
       const segment = winbackSegment({
         adminEmails: admins.map((a) => a.user.email),
         connectorConfigs: connectors.map((c) => c.config),
         successfulCalls,
+        succeededBefore,
       });
       const recipients = admins.filter((a) => !a.user.emailMarketingOptOut).map((a) => a.user);
       if (recipients.length === 0) {
@@ -1157,6 +1215,52 @@ export class OnboardingCronService {
       select: { id: true },
     });
     return !!recent;
+  }
+
+  /** The OrgSettings rows among `keys` stored for `organizationIds`, as settingId()s. */
+  private async storedSettings(organizationIds: string[], keys: string[]): Promise<Set<string>> {
+    const out = new Set<string>();
+    for (const ids of chunks(organizationIds)) {
+      const rows = await this.prisma.orgSettings.findMany({
+        where: { organizationId: { in: ids }, key: { in: keys } },
+        select: { organizationId: true, key: true },
+      });
+      for (const r of rows) out.add(settingId(r.organizationId, r.key));
+    }
+    return out;
+  }
+
+  /** The workspaces among `organizationIds` with any licence besides the free trial, in any state. */
+  private async workspacesWithOtherLicence(organizationIds: string[]): Promise<Set<string>> {
+    const out = new Set<string>();
+    for (const ids of chunks(organizationIds)) {
+      const rows = await this.prisma.license.findMany({
+        where: { organizationId: { in: ids }, plan: { not: 'trial' } },
+        select: { organizationId: true },
+      });
+      for (const r of rows) if (r.organizationId) out.add(r.organizationId);
+    }
+    return out;
+  }
+
+  /**
+   * When the most recently created free trial of each workspace among
+   * `organizationIds` ends (null without an end); a workspace without a free
+   * trial is left out.
+   */
+  private async latestTrialEnds(organizationIds: string[]): Promise<Map<string, Date | null>> {
+    const out = new Map<string, Date | null>();
+    for (const ids of chunks(organizationIds)) {
+      const rows = await this.prisma.license.findMany({
+        where: { organizationId: { in: ids }, plan: 'trial' },
+        orderBy: { createdAt: 'desc' },
+        select: { organizationId: true, expiresAt: true },
+      });
+      for (const r of rows) {
+        if (r.organizationId && !out.has(r.organizationId)) out.set(r.organizationId, r.expiresAt);
+      }
+    }
+    return out;
   }
 
   /** Stores an OrgSettings value, by default the current time (a sent-flag). */

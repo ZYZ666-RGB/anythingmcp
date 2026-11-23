@@ -20,6 +20,12 @@ import { HarParser } from './parsers/har.parser';
 import { McpOAuthService } from './mcp-oauth.service';
 import { McpOAuthCallbackController } from './mcp-oauth-callback.controller';
 import { ShopeeAuthController } from './shopee-auth.controller';
+import { WooCommerceAuthController } from './woocommerce-auth.controller';
+import { TikTokShopAuthController } from './tiktok-shop-auth.controller';
+import { IopAuthController } from './iop-auth.controller';
+import { SheinAuthController } from './shein-auth.controller';
+import { MetaAuthController } from './meta-auth.controller';
+import { MetaLoginService } from './engines/meta-login.service';
 import { WebhookIngestController } from './webhook-ingest.controller';
 import { CatalogResyncService } from './catalog-resync.service';
 import { CatalogReconciler } from './catalog-reconciler.service';
@@ -27,6 +33,7 @@ import { LicenseModule } from '../license/license.module';
 import { McpServersModule } from '../mcp-servers/mcp-servers.module';
 import { FileSearchCoreModule } from '../file-search/file-search-core.module';
 import { IdentityProvidersModule } from '../identity-providers/identity-providers.module';
+import { MemberVisibilityModule } from '../settings/member-visibility.module';
 
 const ENGINES = [
   RestEngine,
@@ -49,11 +56,21 @@ const PARSERS = [OpenApiParser, WsdlParser, GraphqlParser, PostmanParser, CurlPa
 // not each log in.
 @Module({
   // IdentityProvidersModule: SsoService, for signing in on the connect page.
-  imports: [McpServerModule, McpServersModule, LicenseModule, IdentityProvidersModule, FileSearchCoreModule],
-  controllers: [ConnectorsController, McpOAuthCallbackController, ShopeeAuthController, ToolsController, WebhookIngestController],
+  // MemberVisibilityModule (not SettingsModule): what a restricted member may
+  // read on the connectors and tools routes.
+  imports: [
+    McpServerModule,
+    McpServersModule,
+    LicenseModule,
+    IdentityProvidersModule,
+    FileSearchCoreModule,
+    MemberVisibilityModule,
+  ],
+  controllers: [ConnectorsController, McpOAuthCallbackController, ShopeeAuthController, TikTokShopAuthController, IopAuthController, SheinAuthController, MetaAuthController, WooCommerceAuthController, ToolsController, WebhookIngestController],
   providers: [
     ConnectorsService,
     McpOAuthService,
+    MetaLoginService,
     CatalogResyncService,
     CatalogReconciler,
     GraphqlSchemaService,

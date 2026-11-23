@@ -8,18 +8,23 @@ import { useAuth } from '@/lib/auth-context';
 import {
   users,
   auth,
+  planLimitOf,
   roles,
   knowledgeGraph,
   memory as memoryApi,
   type LearningMode,
+  type PlanLimitError,
   type MemoryAccessLevel,
   type MemoryAccessSetting,
 } from '@/lib/api';
+import { PlanLimitNotice } from '@/components/plan-swap-dialog';
 import { AppSelect } from '@/components/ui/select';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Badge, StatusPill } from '@/components/ui/badge';
+import { RoleChips } from '@/components/member-role-assignments';
 import { useEdition } from '@/lib/use-edition';
+import { useMemberVisibility } from '@/lib/use-member-visibility';
 import { EnterpriseNotice } from '@/components/enterprise-notice';
 
 const ROLES = ['ADMIN', 'EDITOR', 'VIEWER'] as const;
@@ -57,6 +62,8 @@ export default function SettingsUsersPage() {
   const [roleList, setRoleList] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [msg, setMsg] = useState('');
+  // An invitation refused at the plan's user limit (Cloud).
+  const [inviteLimit, setInviteLimit] = useState<PlanLimitError | null>(null);
   const { edition, reload: reloadEdition } = useEdition();
   const seatsFull =
     edition !== null && edition.seatLimit !== null && edition.seatsUsed >= edition.seatLimit;
@@ -64,7 +71,15 @@ export default function SettingsUsersPage() {
   // Invite form
   const [showInvite, setShowInvite] = useState(false);
   const [inviteEmail, setInviteEmail] = useState('');
-  const [inviteRole, setInviteRole] = useState<string>('EDITOR');
+  // Until the admin picks one, the role offered first follows the workspace:
+  // where member visibility is restricted, a member is meant to see only what
+  // their MCP roles reach, which is a VIEWER. An EDITOR also creates
+  // connectors and always sees the ones they own; offering it first there
+  // made the member an admin did not look twice at see more than intended.
+  const visibility = useMemberVisibility();
+  const restrictedWorkspace = visibility.mode === 'restricted';
+  const [inviteRoleChoice, setInviteRole] = useState<string | null>(null);
+  const inviteRole = inviteRoleChoice ?? (restrictedWorkspace ? 'VIEWER' : 'EDITOR');
   const [inviteMcpRoleId, setInviteMcpRoleId] = useState('');
   const [inviting, setInviting] = useState(false);
   const [inviteUrl, setInviteUrl] = useState('');
@@ -271,6 +286,7 @@ export default function SettingsUsersPage() {
     setInviting(true);
     setInviteUrl('');
     setInviteEmailError('');
+    setInviteLimit(null);
     try {
       const result = await auth.inviteUser(
         {
@@ -288,6 +304,11 @@ export default function SettingsUsersPage() {
       // Reload invitations to show the new one
       users.invitations(token).then(setInvitationList).catch(() => {});
     } catch (err: any) {
+      const limit = planLimitOf(err);
+      if (limit) {
+        setInviteLimit(limit);
+        return;
+      }
       setMsg(t('error', { message: err.message }));
     } finally {
       setInviting(false);
@@ -375,6 +396,8 @@ export default function SettingsUsersPage() {
         </Button>
       </div>
 
+      {inviteLimit && <PlanLimitNotice limit={inviteLimit} />}
+
       {msg && (
         <div className="p-3 rounded-[9px] text-sm flex items-center" style={{ background: 'var(--t-info-bg)', color: 'var(--t-info-fg)' }}>
           {msg}
@@ -425,6 +448,11 @@ export default function SettingsUsersPage() {
                 className={selectClass}
                 options={ROLES.map((r) => ({ value: r, label: r }))}
               />
+              {restrictedWorkspace && (
+                <p className="mt-1 text-[11.5px] text-[var(--text-3)]" data-testid="invite-role-hint">
+                  {t('invite.restrictedRoleHint')}
+                </p>
+              )}
             </div>
             <div>
               <label className={labelClass}>{t('invite.mcpRole')}</label>
@@ -602,8 +630,9 @@ export default function SettingsUsersPage() {
                   <td className="px-4 py-3">
                     {u.role === 'ADMIN' ? (
                       <span className="text-xs text-[var(--text-3)]">{t('table.fullAccess')}</span>
-                    ) : u.mcpRole ? (
-                      <Badge tone="info">{u.mcpRole.name}</Badge>
+                    ) : u.mcpRoles?.length ? (
+                      // Every role, not the deprecated single `mcpRole`: access is their union.
+                      <RoleChips roles={u.mcpRoles} />
                     ) : (
                       <span
                         className="text-xs text-[var(--text-3)]"

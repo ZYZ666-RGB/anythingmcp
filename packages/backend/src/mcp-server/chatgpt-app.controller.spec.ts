@@ -3,6 +3,7 @@ import { InMemoryTransport, McpServer } from '@modelcontextprotocol/server';
 import { McpEndpointController } from './mcp-endpoint.controller';
 import { CHATGPT_APP_INSTRUCTIONS, CHATGPT_APP_TOOL_NAMES } from './chatgpt-app-toolset';
 import type { RegisteredTool } from './tool-registry';
+import { withRegistryIndexes } from './registry-test-double';
 
 /**
  * `/mcp/chatgpt-app` end to end through the controller: the same scope as the
@@ -54,13 +55,12 @@ function build(opts: { allowedByOrg?: Record<string, string[] | null> } = {}) {
     ),
     getSharedGuide: jest.fn(async () => undefined),
     getServerNames: jest.fn(async () => []),
-    getServerNamesByOrg: jest.fn(async () => []),
     activityByConnector: jest.fn(async () => []),
   };
   const setup = { get: jest.fn(() => ({ canSetUp: jest.fn(async () => true) })) };
   const controller = new McpEndpointController(
     servers as any,
-    { getAllTools: () => ALL, countByName: () => 2 } as any,
+    withRegistryIndexes({ getAllTools: () => ALL, countByName: () => 2 }) as any,
     executor as any,
     {
       getAllowedToolIds: jest.fn(async (_sub: string, org: string) =>
@@ -72,6 +72,7 @@ function build(opts: { allowedByOrg?: Record<string, string[] | null> } = {}) {
     {
       resolve: jest.fn().mockResolvedValue(null),
       clientRedirectUris: jest.fn(async () => ['https://claude.ai/api/mcp/auth_callback']),
+      serverNamesFor: jest.fn(async () => []),
     } as any,
     { create: jest.fn(), hasVisible: jest.fn().mockResolvedValue(false) } as any,
     setup as any,

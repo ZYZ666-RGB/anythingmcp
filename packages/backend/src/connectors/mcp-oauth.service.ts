@@ -12,6 +12,11 @@ import {
 } from './engines/client-assertion.util';
 import { outboundAxiosOptions } from '../common/outbound-http';
 import { urlForLog } from '../common/log-safe-url.util';
+import {
+  describeMissingTokenFields,
+  tokenFieldsAt,
+  tokenResponsePathOf,
+} from './engines/token-response.util';
 
 export interface OAuthMetadata {
   issuer: string;
@@ -81,6 +86,12 @@ export interface PendingOAuthFlow {
    */
   userAgent?: string;
   /**
+   * `authConfig.tokenResponsePath`: the object of the token answer that holds
+   * the token fields, for providers that wrap them (Joom: `data`). Unset, the
+   * fields are read at the top level. REST and GraphQL connectors only.
+   */
+  tokenResponsePath?: string;
+  /**
    * RFC 8707 resource indicator of the MCP server, sent with the code
    * exchange and stored for the refreshes. MCP connectors only.
    */
@@ -92,10 +103,38 @@ export interface PendingOAuthFlow {
    */
   dynamicClient?: boolean;
   /**
-   * Set on a Shopee shop authorization (shopee-auth.controller.ts), which is
+   * Set on a Shopee shop authorization (shopee-auth.controller.ts) or a
+   * TikTok Shop authorization (tiktok-shop-auth.controller.ts), each
    * completed by its own endpoint; unset on every OAuth flow.
+   * 'tiktok-shop-install' is a TikTok Shop App Store install: it arrived
+   * without a state of ours, so it has no connector and no user yet
+   * (both empty) and carries the authorization code itself. 'meta' is a
+   * Facebook or Instagram sign-in of an Instagram connector
+   * (meta-auth.controller.ts). 'iop' is a seller authorization at an Alibaba
+   * IOP gateway: Lazada, Miravia, AliExpress (iop-auth.controller.ts).
+   * 'shein' is a SHEIN store authorization (shein-auth.controller.ts).
    */
-  provider?: 'shopee';
+  provider?: 'shopee' | 'tiktok-shop' | 'tiktok-shop-install' | 'iop' | 'shein' | 'woocommerce' | 'woocommerce-outcome' | 'meta';
+  /**
+   * A WooCommerce one-click key (woocommerce-auth.controller.ts): the
+   * workspace the key may be written to, the shop address it must work on,
+   * the permission asked for and, on a 'woocommerce-outcome' record, how the
+   * callback ended. Unset on every other flow.
+   */
+  woocommerce?: {
+    organizationId: string;
+    shopUrl: string;
+    scope: 'read' | 'read_write';
+    outcome?: 'ready' | 'failed';
+    message?: string;
+  };
+  /**
+   * The authorization code of a 'tiktok-shop-install', kept here (encrypted
+   * at rest) instead of in the dashboard address. Unset on every other flow.
+   */
+  code?: string;
+  /** The seller's region TikTok named on a 'tiktok-shop-install' (`shop_region`, e.g. GB, US). */
+  shopRegion?: string;
   /**
    * The user signs in with their own account on a connector whose
    * credentials are per user: the tokens go to that user's
@@ -468,6 +507,11 @@ export class McpOAuthService {
     userAgent?: string;
     /** RFC 8707 resource indicator (MCP servers). */
     resource?: string;
+    /**
+     * Where the token fields sit in the answer when the provider wraps them
+     * (see token-response.util.ts). Unset reads them at the top level.
+     */
+    tokenResponsePath?: string;
   }): Promise<{
     accessToken: string;
     refreshToken?: string;
@@ -507,7 +551,12 @@ export class McpOAuthService {
     } else if (useBasic && params.clientSecret) {
       // client_secret_basic (RFC 6749 §2.3.1): credentials go in the
       // Authorization header, NOT the body. Providers like DATEV reject a
-      // body-supplied client_secret for confidential clients with 401.
+      // body-supplied client_secret for confidential clients with 401, and
+      // Okta servers (Constant Contact) refuse a body client_id next to the
+      // header as "multiple client credentials". The client authenticates,
+      // so client_id is not needed in the body (RFC 6749 §4.1.3), and the
+      // MCP SDK leaves it out the same way.
+      delete body.client_id;
       const basic = Buffer.from(
         `${params.clientId}:${params.clientSecret}`,
       ).toString('base64');
@@ -566,6 +615,29 @@ export class McpOAuthService {
       );
     }
 
+    // A provider that wraps the token fields (Joom: { code, message, data }).
+    const wrapper = tokenResponsePathOf(params.tokenResponsePath);
+    if (wrapper) {
+      const fields = tokenFieldsAt(data, wrapper);
+      if (!fields) {
+        throw new TokenExchangeError(
+          `Token exchange failed: ${describeMissingTokenFields(data, wrapper)}`,
+          response.status,
+        );
+      }
+      if (typeof fields.access_token !== 'string' || !fields.access_token) {
+        throw new TokenExchangeError(
+          `Token exchange failed: the object at "${wrapper}" of the token answer carries no access_token`,
+          response.status,
+        );
+      }
+      return {
+        accessToken: fields.access_token,
+        refreshToken: fields.refresh_token,
+        expiresIn: fields.expires_in,
+      };
+    }
+
     return {
       accessToken: data.access_token,
       refreshToken: data.refresh_token,
@@ -609,9 +681,13 @@ export class McpOAuthService {
   async storePendingFlow(
     state: string,
     data: PendingOAuthFlow,
-    opts: { returnTo?: string } = {},
+    opts: { returnTo?: string; ttlMs?: number } = {},
   ): Promise<void> {
-    const expiresAt = Date.now() + PENDING_FLOW_TTL_MS;
+    // A caller may ask for longer (a store install that waits for a sign-up),
+    // never for more than an authorization code lives.
+    const ttl =
+      typeof opts.ttlMs === 'number' && opts.ttlMs > 0 ? Math.min(opts.ttlMs, PENDING_FLOW_MAX_TTL_MS) : PENDING_FLOW_TTL_MS;
+    const expiresAt = Date.now() + ttl;
     const returnTo = safeReturnTo(opts.returnTo);
     if (!this.prisma) {
       this.memoryFlows.set(state, { flow: data, returnTo, expiresAt });
@@ -746,6 +822,8 @@ export function isLocalOnlyHost(hostname: string): boolean {
 
 /** How long a started authorization waits for the user to come back. */
 export const PENDING_FLOW_TTL_MS = 15 * 60 * 1000;
+/** The longest a pending flow may be kept (`ttlMs`): 30 minutes. */
+export const PENDING_FLOW_MAX_TTL_MS = 30 * 60 * 1000;
 
 export interface PendingFlowRecord {
   flow: PendingOAuthFlow;

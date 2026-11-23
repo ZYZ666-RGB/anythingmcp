@@ -3,7 +3,9 @@
 import Link from 'next/link';
 import { useEffect, useState, useCallback } from 'react';
 import { useAuth } from '@/lib/auth-context';
-import { connectors, withSecretsNotice, withImportNotice } from '@/lib/api';
+import { connectors, planLimitOf, withSecretsNotice, withImportNotice } from '@/lib/api';
+import { atPlanCap, pausedByPlanSets, usePlanUsage } from '@/lib/use-plan-fit';
+import { PausedByPlanBadge, PlanSwapDialog, type SwapAxis } from '@/components/plan-swap-dialog';
 import * as Dialog from '@radix-ui/react-dialog';
 import { useTranslations } from 'next-intl';
 import { AppSelect } from '@/components/ui/select';
@@ -17,6 +19,10 @@ import { Button, buttonVariants } from '@/components/ui/button';
 import { ActionMenu } from '@/components/ui/action-menu';
 import { cn } from '@/lib/utils';
 import { useAuthTypeLabel } from '@/lib/use-auth-type-label';
+import { useMemberVisibility } from '@/lib/use-member-visibility';
+import { useMemberAccess } from '@/lib/use-member-access';
+import { useConnectorOwners } from '@/lib/use-connector-owners';
+import { canManageConnector } from '@/lib/can-manage-connector';
 
 type HealthStatus = { total: number; healthy: number; unhealthy: number; connectors: any[] } | null;
 
@@ -92,8 +98,15 @@ const SUPPORTED_TYPES = [
 ];
 
 export default function ConnectorsPage() {
-  const { token } = useAuth();
+  const { token, user, deploymentMode, deploymentModeLoaded } = useAuth();
   const t = useTranslations('connectors');
+  // A VIEWER cannot create or import connectors (the API answers 403), so
+  // the page does not offer it.
+  const canCreate = user?.role !== 'VIEWER';
+  // Restricted member visibility: an empty list means nothing was shared yet.
+  const { restrictedForMe } = useMemberVisibility();
+  // The catalog installs connectors: not offered to a member who may not open it.
+  const canBrowseStore = useMemberAccess().can('/connectors/store');
   const authTypeLabel = useAuthTypeLabel();
   // Only "Database" and "Email" are words; the other type names are the same everywhere.
   const typeLabel = (type: string) =>
@@ -114,11 +127,58 @@ export default function ConnectorsPage() {
   const [checkingHealth, setCheckingHealth] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; name: string } | null>(null);
   const [deleting, setDeleting] = useState(false);
+  // Cloud: which connectors the last automatic downgrade paused, and the swap
+  // dialog when activating one would go past the plan.
+  const { usage, reload: reloadUsage } = usePlanUsage();
+  // Admins of a workspace with several members see who owns each connector.
+  // Cloud: the plan usage this page loads anyway says how many members there
+  // are, so a single-member workspace asks for no members list. Self-hosted
+  // has no such number for the workspace: the hook makes that one request.
+  const memberCount = !deploymentModeLoaded
+    ? null
+    : deploymentMode === 'cloud'
+      ? (usage ? usage.users.current : null)
+      : undefined;
+  const ownerOf = useConnectorOwners(memberCount);
+  const pausedByPlan = pausedByPlanSets(usage).connectors;
+  const tSwap = useTranslations('planSwap');
+  const [swap, setSwap] = useState<{ id: string; name: string; axis: SwapAxis; max: number | null } | null>(null);
+  const [activating, setActivating] = useState<string | null>(null);
 
   useEffect(() => {
     if (!token) return;
     connectors.list(token).then(setList).catch(() => {}).finally(() => setLoading(false));
   }, [token]);
+
+  const refreshAfterSwap = useCallback(() => {
+    if (!token) return;
+    connectors.list(token).then(setList).catch(() => {});
+    reloadUsage();
+  }, [token, reloadUsage]);
+
+  /** Activate a connector the plan paused; at the plan's cap, offer the swap. */
+  const handleActivate = async (c: { id: string; name: string; type: string }) => {
+    if (!token) return;
+    const axis: SwapAxis = c.type === 'FILE_SEARCH' ? 'fileSearchConnectors' : 'connectors';
+    if (axis === 'connectors' && atPlanCap(usage, 'connectors')) {
+      setSwap({ id: c.id, name: c.name, axis, max: usage?.connectors.max ?? null });
+      return;
+    }
+    setActivating(c.id);
+    try {
+      await connectors.update(c.id, { isActive: true }, token);
+      refreshAfterSwap();
+    } catch (err) {
+      const limit = planLimitOf(err);
+      if (limit && limit.axis !== 'users') setSwap({ id: c.id, name: c.name, axis: limit.axis, max: limit.max || null });
+      else {
+        setMsg((err as Error)?.message || String(err));
+        setTimeout(() => setMsg(''), 5000);
+      }
+    } finally {
+      setActivating(null);
+    }
+  };
 
   const handleDelete = useCallback(async () => {
     if (!token || !deleteConfirm) return;
@@ -221,7 +281,8 @@ export default function ConnectorsPage() {
   };
 
   const filtered = list.filter((c) => {
-    if (search && !c.name.toLowerCase().includes(search.toLowerCase()) && !c.baseUrl.toLowerCase().includes(search.toLowerCase())) return false;
+    // The reduced view of a connector shared with a restricted member has no address.
+    if (search && !c.name.toLowerCase().includes(search.toLowerCase()) && !(c.baseUrl ?? '').toLowerCase().includes(search.toLowerCase())) return false;
     if (typeFilter && c.type !== typeFilter) return false;
     return true;
   });
@@ -232,8 +293,8 @@ export default function ConnectorsPage() {
   const utilityActions = [
     { label: checkingHealth ? t('menu.checking') : t('menu.healthCheck'), icon: <HeartPulseIcon />, onSelect: handleHealthCheck, disabled: checkingHealth },
     { label: t('menu.exportAll'), icon: <DownloadIcon />, onSelect: handleExportAll },
-    { label: t('menu.importFromFile'), icon: <UploadIcon />, onSelect: () => setShowImportModal(true) },
-    { label: t('menu.browseAdapters'), icon: <StoreIcon />, href: '/connectors/store' },
+    ...(canCreate ? [{ label: t('menu.importFromFile'), icon: <UploadIcon />, onSelect: () => setShowImportModal(true) }] : []),
+    ...(canBrowseStore ? [{ label: t('menu.browseAdapters'), icon: <StoreIcon />, href: '/connectors/store' }] : []),
   ];
 
   const headerActions = (
@@ -253,23 +314,29 @@ export default function ConnectorsPage() {
         <DownloadIcon />
         <span>{t('header.export')}</span>
       </Button>
-      <Button variant="secondary" size="md" onClick={() => setShowImportModal(true)} title={t('header.importTitle')} className="max-md:hidden">
-        <UploadIcon />
-        <span>{t('header.import')}</span>
-      </Button>
-      <Link
-        href="/connectors/store"
-        title={t('header.adaptersTitle')}
-        className={cn(buttonVariants({ variant: 'secondary', size: 'md' }), 'max-md:hidden')}
-      >
-        <StoreIcon />
-        <span>{t('header.adapters')}</span>
-      </Link>
+      {canCreate && (
+        <Button variant="secondary" size="md" onClick={() => setShowImportModal(true)} title={t('header.importTitle')} className="max-md:hidden">
+          <UploadIcon />
+          <span>{t('header.import')}</span>
+        </Button>
+      )}
+      {canBrowseStore && (
+        <Link
+          href="/connectors/store"
+          title={t('header.adaptersTitle')}
+          className={cn(buttonVariants({ variant: 'secondary', size: 'md' }), 'max-md:hidden')}
+        >
+          <StoreIcon />
+          <span>{t('header.adapters')}</span>
+        </Link>
+      )}
       <ActionMenu items={utilityActions} className="md:hidden" />
-      <Link href="/connectors/new" className={cn(buttonVariants({ variant: 'primary', size: 'md' }))}>
-      <PlusIcon />
-      {t('add')}
-      </Link>
+      {canCreate && (
+        <Link href="/connectors/new" className={cn(buttonVariants({ variant: 'primary', size: 'md' }))}>
+          <PlusIcon />
+          {t('add')}
+        </Link>
+      )}
     </div>
   );
 
@@ -327,6 +394,19 @@ export default function ConnectorsPage() {
       </Dialog.Root>
 
       {/* Delete Confirmation Dialog */}
+      {swap && (
+        <PlanSwapDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setSwap(null);
+          }}
+          axis={swap.axis}
+          target={{ id: swap.id, name: swap.name }}
+          max={swap.max}
+          onDone={refreshAfterSwap}
+        />
+      )}
+
       <Dialog.Root open={!!deleteConfirm} onOpenChange={(open) => { if (!open) setDeleteConfirm(null); }}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 z-50 bg-black/50" />
@@ -408,6 +488,16 @@ export default function ConnectorsPage() {
             </Card>
           ))}
         </div>
+      ) : list.length === 0 && restrictedForMe ? (
+        <div className="rounded-[14px] border border-dashed border-[var(--border-strong)] px-6 py-16 text-center" data-testid="nothing-shared">
+          <p className="mb-6 text-sm text-[var(--text-3)]">{t('empty.nothingShared')}</p>
+          {canCreate && (
+            <Link href="/connectors/new" className={cn(buttonVariants({ variant: 'primary', size: 'md' }))}>
+              <PlusIcon />
+              {t('add')}
+            </Link>
+          )}
+        </div>
       ) : list.length === 0 ? (
         <div className="rounded-[14px] border border-dashed border-[var(--border-strong)] py-16 text-center">
           <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-[var(--brand-tint)]">
@@ -429,18 +519,22 @@ export default function ConnectorsPage() {
             })}
           </p>
           <div className="flex flex-wrap items-center justify-center gap-3">
-            <Link href="/connectors/new" className={cn(buttonVariants({ variant: 'primary', size: 'md' }))}>
-              <PlusIcon />
-              {t('add')}
-            </Link>
+            {canCreate && (
+              <Link href="/connectors/new" className={cn(buttonVariants({ variant: 'primary', size: 'md' }))}>
+                <PlusIcon />
+                {t('add')}
+              </Link>
+            )}
             <Link href="/connectors/store" className={cn(buttonVariants({ variant: 'secondary', size: 'md' }))}>
               <StoreIcon />
               {t('empty.browse')}
             </Link>
-            <Button variant="secondary" size="md" onClick={() => setShowImportModal(true)}>
-              <UploadIcon size={14} />
-              {t('empty.importBackup')}
-            </Button>
+            {canCreate && (
+              <Button variant="secondary" size="md" onClick={() => setShowImportModal(true)}>
+                <UploadIcon size={14} />
+                {t('empty.importBackup')}
+              </Button>
+            )}
           </div>
         </div>
       ) : (
@@ -481,6 +575,14 @@ export default function ConnectorsPage() {
           <div className="grid grid-cols-1 gap-[14px] sm:grid-cols-2 xl:grid-cols-3">
             {filtered.map((c) => {
               const tone: Tone = TYPE_TONE[c.type] ?? 'neutral';
+              // Owner or admin: the card's actions all write, and the API
+              // answers 403 to anyone else.
+              const canManage = canManageConnector(user, c);
+              const paused = !c.isActive && pausedByPlan.has(c.id);
+              const canImportSpec = c.type === 'REST' || c.type === 'GRAPHQL' || c.type === 'SOAP';
+              // Admins of a workspace with several members; undefined otherwise
+              // and while loading, null for a former member.
+              const owner = ownerOf(c.userId);
               return (
                 <Card
                   key={c.id}
@@ -493,7 +595,14 @@ export default function ConnectorsPage() {
                       <div className="flex items-center gap-2">
                         <span className="truncate text-[14.5px] font-semibold text-[var(--text)]">{c.name}</span>
                       </div>
-                      <div className="mt-0.5 truncate font-mono text-[12px] text-[var(--text-3)]">{c.baseUrl}</div>
+                      {c.baseUrl && (
+                        <div className="mt-0.5 truncate font-mono text-[12px] text-[var(--text-3)]">{c.baseUrl}</div>
+                      )}
+                      {owner !== undefined && (
+                        <div className="mt-0.5 truncate text-[12px] text-[var(--text-3)]" data-testid="connector-owner">
+                          {owner === null ? t('card.ownerGone') : t('card.owner', { name: owner })}
+                        </div>
+                      )}
                     </div>
                     <Badge tone={tone} className="flex-shrink-0">{typeLabel(c.type)}</Badge>
                   </div>
@@ -504,23 +613,36 @@ export default function ConnectorsPage() {
                         <div className="text-[11px] text-[var(--text-3)]">{t('card.tools')}</div>
                         <div className="text-[14px] font-semibold text-[var(--text)]">{c.tools?.length || 0}</div>
                       </div>
-                      <div className="min-w-0">
-                        <div className="text-[11px] text-[var(--text-3)]">{t('card.auth')}</div>
-                        <div className="truncate text-[14px] font-semibold text-[var(--text)]">{authTypeLabel(c.authType)}</div>
-                      </div>
+                      {/* Not part of the reduced view (memberView). */}
+                      {!c.memberView && (
+                        <div className="min-w-0">
+                          <div className="text-[11px] text-[var(--text-3)]">{t('card.auth')}</div>
+                          <div className="truncate text-[14px] font-semibold text-[var(--text)]">{authTypeLabel(c.authType)}</div>
+                        </div>
+                      )}
                     </div>
-                    <StatusPill
-                      tone={c.isActive ? 'success' : 'neutral'}
-                      dot={c.isActive ? 'var(--ok)' : 'var(--text-3)'}
-                    >
-                      {c.isActive ? t('card.active') : t('card.inactive')}
-                    </StatusPill>
+                    {paused ? (
+                      <PausedByPlanBadge className="flex-shrink-0" />
+                    ) : (
+                      <StatusPill
+                        tone={c.isActive ? 'success' : 'neutral'}
+                        dot={c.isActive ? 'var(--ok)' : 'var(--text-3)'}
+                      >
+                        {c.isActive ? t('card.active') : t('card.inactive')}
+                      </StatusPill>
+                    )}
                     <SetupStatusPill status={c.setupStatus} />
                     <AuthStatusPill connector={c} />
                   </div>
                   {/* Hover actions (above the full-card link) */}
+                  {canManage && (
                   <div className="relative z-10 mt-[14px] flex gap-2 sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100 sm:group-focus-within:opacity-100">
-                    {(c.type === 'REST' || c.type === 'GRAPHQL' || c.type === 'SOAP') && (
+                    {paused && (
+                      <Button size="sm" onClick={() => handleActivate(c)} disabled={activating === c.id}>
+                        {tSwap('activate')}
+                      </Button>
+                    )}
+                    {canImportSpec && (
                       <Button variant="secondary" size="sm" onClick={() => handleImportSpec(c.id)}>
                         {t('card.importSpec')}
                       </Button>
@@ -529,24 +651,27 @@ export default function ConnectorsPage() {
                       {t('card.delete')}
                     </Button>
                   </div>
+                  )}
                 </Card>
               );
             })}
 
             {/* Add a connector tile */}
-            <Link
-              href="/connectors/new"
-              className={cn(
-                'flex min-h-[140px] flex-col items-center justify-center gap-2 rounded-[14px] border-[1.5px] border-dashed border-[var(--border-strong)] p-[18px] text-[var(--text-2)]',
-                'transition-colors hover:border-[var(--brand)] hover:bg-[var(--brand-tint)] hover:text-[var(--brand)]'
-              )}
-            >
-              <span className="flex h-[38px] w-[38px] items-center justify-center rounded-[10px] bg-[var(--surface-2)]">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
-              </span>
-              <span className="text-[13px] font-semibold">{t('addTile.title')}</span>
-              <span className="text-[12px] text-[var(--text-3)]">{t('addTile.hint')}</span>
-            </Link>
+            {canCreate && (
+              <Link
+                href="/connectors/new"
+                className={cn(
+                  'flex min-h-[140px] flex-col items-center justify-center gap-2 rounded-[14px] border-[1.5px] border-dashed border-[var(--border-strong)] p-[18px] text-[var(--text-2)]',
+                  'transition-colors hover:border-[var(--brand)] hover:bg-[var(--brand-tint)] hover:text-[var(--brand)]'
+                )}
+              >
+                <span className="flex h-[38px] w-[38px] items-center justify-center rounded-[10px] bg-[var(--surface-2)]">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
+                </span>
+                <span className="text-[13px] font-semibold">{t('addTile.title')}</span>
+                <span className="text-[12px] text-[var(--text-3)]">{t('addTile.hint')}</span>
+              </Link>
+            )}
           </div>
         </>
       )}

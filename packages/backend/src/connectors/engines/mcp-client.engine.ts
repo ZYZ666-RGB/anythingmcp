@@ -6,9 +6,16 @@ import { assertSafeOutboundUrl } from '../../common/ssrf.util';
 import { DEFAULT_MCP_PATH, resolveMcpEndpointUrl } from '../../common/url.util';
 import { ssrfGuardedFetch } from '../../common/outbound-http';
 import { engineLogSecrets, urlForLog } from '../../common/log-safe-url.util';
+import { withMcpFixedArguments } from '../mcp-connector-config.util';
 
-/** Pages of tools/list followed at most (MCP pagination). */
-const MAX_TOOL_LIST_PAGES = 50;
+/**
+ * Pages of tools/list followed at most (MCP pagination). Enforced by the SDK
+ * through `listMaxPages`: since client 2.4 a `listTools()` call without a
+ * cursor walks every page itself, so a loop of our own never saw a cursor.
+ */
+export const MAX_TOOL_LIST_PAGES = 50;
+/** Bound background cleanup before aborting the local transport. */
+const SESSION_TERMINATION_TIMEOUT_MS = 5_000;
 
 @Injectable()
 export class McpClientEngine {
@@ -31,6 +38,9 @@ export class McpClientEngine {
       connectorId?: string;
       // Masked in log lines; see RestEngine.
       logSecrets?: readonly string[];
+      // The connector's `config.mcpFixedArguments`, variables resolved:
+      // merged into the arguments of the call, winning over the caller's.
+      fixedArguments?: Record<string, unknown>;
     },
     endpointMapping: {
       method: string; // MCP tool name on remote server
@@ -51,6 +61,9 @@ export class McpClientEngine {
     const headers: Record<string, string> = { ...config.headers };
     await this.injectAuth(headers, config.authType, config.authConfig, config.connectorId);
 
+    // Without fixed arguments this is `params` itself.
+    const args = withMcpFixedArguments(params, config.fixedArguments);
+
     const transport = new StreamableHTTPClientTransport(mcpUrl, {
       fetch: ssrfGuardedFetch,
       requestInit: { headers },
@@ -67,7 +80,7 @@ export class McpClientEngine {
 
       const result = await client.callTool({
         name: endpointMapping.method,
-        arguments: params,
+        arguments: args,
       });
 
       return result;
@@ -101,20 +114,16 @@ export class McpClientEngine {
             await retryClient.connect(retryTransport);
             return await retryClient.callTool({
               name: endpointMapping.method,
-              arguments: params,
+              arguments: args,
             });
           } finally {
-            try { await retryClient.close(); } catch { /* ignore */ }
+            void this.closeSession(retryClient, retryTransport);
           }
         }
       }
       throw error;
     } finally {
-      try {
-        await client.close();
-      } catch {
-        // Ignore close errors
-      }
+      void this.closeSession(client, transport);
     }
   }
 
@@ -157,10 +166,13 @@ export class McpClientEngine {
       requestInit: { headers },
     });
 
-    const client = new Client({
-      name: 'anythingmcp-bridge',
-      version: '1.0.0',
-    });
+    const client = new Client(
+      {
+        name: 'anythingmcp-bridge',
+        version: '1.0.0',
+      },
+      { listMaxPages: MAX_TOOL_LIST_PAGES },
+    );
 
     try {
       try {
@@ -169,15 +181,14 @@ export class McpClientEngine {
         throw explainMcpConnectError(err, mcpUrl, config.authType);
       }
       // tools/list is paginated (MCP spec): a server with a large catalogue
-      // (Atlassian with ?tools=all) returns a nextCursor. Follow it, with a
-      // ceiling so a server that never stops cannot hold the request.
-      const tools: Awaited<ReturnType<Client['listTools']>>['tools'] = [];
-      let cursor: string | undefined;
-      for (let page = 0; page < MAX_TOOL_LIST_PAGES; page++) {
-        const result = await client.listTools(cursor ? { cursor } : undefined);
-        tools.push(...(result.tools || []));
-        cursor = typeof result.nextCursor === 'string' && result.nextCursor ? result.nextCursor : undefined;
-        if (!cursor) break;
+      // (Atlassian with ?tools=all) returns a nextCursor. Called without a
+      // cursor, the SDK follows every page and stops at listMaxPages, so a
+      // server that never stops cannot hold the request.
+      let tools: Awaited<ReturnType<Client['listTools']>>['tools'];
+      try {
+        tools = (await client.listTools()).tools || [];
+      } catch (err) {
+        throw explainToolListPageCap(err);
       }
 
       return tools.map((tool) => ({
@@ -197,10 +208,29 @@ export class McpClientEngine {
           : {}),
       }));
     } finally {
+      void this.closeSession(client, transport);
+    }
+  }
+
+  private async closeSession(client: Client, transport: StreamableHTTPClientTransport): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // close() aborts locally; it does not release the upstream session.
+      // The SDK makes termination a no-op when the server issued no session ID.
+      await Promise.race([
+        transport.terminateSession(),
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, SESSION_TERMINATION_TIMEOUT_MS); }),
+      ]);
+    } catch {
+      // Cleanup must never replace the tool result or its original error.
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      // Also abort a DELETE that exceeded the deadline. Its rejection is still
+      // observed by Promise.race, so it cannot become an unhandled rejection.
       try {
         await client.close();
       } catch {
-        // Ignore close errors
+        // Background cleanup must not produce an unhandled rejection.
       }
     }
   }
@@ -338,6 +368,21 @@ export function assertNotThisServer(mcpUrl: URL, env: NodeJS.ProcessEnv = proces
  * was not told about, e.g. its own public tunnel (trycloudflare, ngrok). The
  * raw message reads like our fault; say which setting on their side to change.
  */
+/**
+ * The SDK refuses a tools/list walk longer than {@link MAX_TOOL_LIST_PAGES}
+ * pages. Say what happened in words an operator can act on; any other error
+ * passes through unchanged.
+ */
+export function explainToolListPageCap(err: unknown): unknown {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (code !== 'LIST_PAGINATION_EXCEEDED') return err;
+  return new Error(
+    `The MCP server listed its tools on more than ${MAX_TOOL_LIST_PAGES} pages, ` +
+      'so discovery stopped. Narrow the tool list on the server side (for example ' +
+      'a toolset or filter option in the endpoint address) and discover again.',
+  );
+}
+
 export function explainMcpConnectError(err: unknown, mcpUrl: URL, authType?: string): Error {
   const message = String((err as Error)?.message ?? err);
   if (!/invalid host header|host not allowed|dns rebinding/i.test(message)) {

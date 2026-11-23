@@ -30,6 +30,7 @@ export interface ParsedTool {
     path: string;
     queryParams?: Record<string, unknown>;
     bodyMapping?: Record<string, unknown>;
+    bodyTemplate?: string;
     bodyEncoding?: string;
     headers?: Record<string, string>;
   };
@@ -55,6 +56,33 @@ export interface ParsedSpec {
    * have a root handler).
    */
   healthcheckPath?: string;
+}
+
+const PASTE_SPEC_HINT =
+  'Open the address in your browser, copy the whole spec, clear the URL field and paste the spec into the content field instead.';
+
+/**
+ * Why a spec URL could not be downloaded, in words a user can act on. Some
+ * documentation sites block downloads that do not come from a browser (bot
+ * checks that redirect in a loop or answer 403): the raw axios message
+ * ("Maximum number of redirects exceeded") says nothing about the way out,
+ * which is pasting the spec.
+ */
+export function describeSpecDownloadFailure(url: string, err: any): string {
+  const status: number | undefined = err?.response?.status;
+  if (err?.code === 'ERR_FR_TOO_MANY_REDIRECTS') {
+    return `${url} keeps redirecting and never returns the spec: the site probably blocks downloads that do not come from a browser. ${PASTE_SPEC_HINT}`;
+  }
+  if (status === 401 || status === 403 || status === 429) {
+    return `${url} refused the download (HTTP ${status}): the site probably blocks downloads that do not come from a browser, or needs a sign-in. ${PASTE_SPEC_HINT}`;
+  }
+  if (status) {
+    return `${url} answered HTTP ${status} instead of the spec. Check the address, or paste the spec into the content field instead.`;
+  }
+  if (err?.code === 'ECONNABORTED' || err?.code === 'ETIMEDOUT') {
+    return `${url} did not answer within 15 seconds. ${PASTE_SPEC_HINT}`;
+  }
+  return `Could not download ${url}: ${err?.message ?? err}. Check the address, or paste the spec into the content field instead.`;
 }
 
 @Injectable()
@@ -90,7 +118,14 @@ export class OpenApiParser {
     // step still resolves $ref so we can extract tools, just without schema
     // validation. This is intentional: rejecting 3.1 outright (the previous
     // behaviour) blocks every modern spec from MS, AWS, etc.
-    const declaredVersion = (rawSpec as { openapi?: string }).openapi || '';
+    // YAML reads an unquoted `openapi: 3.0` as the number 3 (and `3.1` as
+    // 3.1): spell it out as the version string it stands for.
+    const openapi = (rawSpec as { openapi?: unknown }).openapi;
+    if (typeof openapi === 'number' && Number.isFinite(openapi)) {
+      (rawSpec as any).openapi = Number.isInteger(openapi) ? `${openapi}.0.0` : `${openapi}.0`;
+    }
+    const declaredVersion =
+      typeof (rawSpec as any).openapi === 'string' ? ((rawSpec as any).openapi as string) : '';
     const isOpenApi31 = declaredVersion.startsWith('3.1');
 
     // swagger-parser only recognises OAS 3.0.0–3.0.3; newer patch releases
@@ -203,7 +238,12 @@ export class OpenApiParser {
     this.logger.debug(`Fetching OpenAPI spec from: ${url}`);
 
     await assertSafeOutboundUrl(url);
-    const response = await axios.get(url, { timeout: 15000, ...outboundAxiosOptions() });
+    let response;
+    try {
+      response = await axios.get(url, { timeout: 15000, ...outboundAxiosOptions() });
+    } catch (err: any) {
+      throw new Error(describeSpecDownloadFailure(url, err));
+    }
 
     // If the response is already a valid spec object, parse directly
     if (typeof response.data === 'object' && response.data !== null) {
@@ -225,6 +265,13 @@ export class OpenApiParser {
       if (spec) {
         return this.parseSpec(spec);
       }
+    }
+
+    // An HTML page with no spec in it: often a bot check or a sign-in page.
+    if (text.includes('<html') || text.includes('<!DOCTYPE')) {
+      throw new Error(
+        `${url} answered with a web page, not an OpenAPI spec. ${PASTE_SPEC_HINT}`,
+      );
     }
 
     // Fallback: try parsing as-is (will throw a descriptive error)
@@ -405,13 +452,20 @@ export class OpenApiParser {
       headerMapping[param.name] = `$${param.name}`;
     }
 
-    // Request body
+    // Request body. OpenAPI 3 declares it as `requestBody`; Swagger 2.0 as a
+    // parameter `in: body` (Amazon SP-API models, many older APIs), which was
+    // dropped before, so those tools sent no body and no Content-Type.
     const requestBody = operation.requestBody;
-    if (requestBody) {
-      const content = requestBody.content;
-      const jsonContent =
-        content?.['application/json'] ||
-        content?.['application/x-www-form-urlencoded'];
+    const swaggerBody = allParams.find((p: any) => p.in === 'body' && p.schema);
+    let declaresJsonBody = false;
+    let bodyIsRequired = false;
+    if (requestBody || swaggerBody) {
+      const content = requestBody?.content;
+      const jsonContent = requestBody
+        ? content?.['application/json'] || content?.['application/x-www-form-urlencoded']
+        : { schema: swaggerBody.schema };
+      declaresJsonBody = !!jsonContent?.schema;
+      bodyIsRequired = !!(requestBody?.required || swaggerBody?.required);
       if (jsonContent?.schema) {
         const bodyProps = this.flattenSchema(jsonContent.schema, api);
         for (const [propName, propSchema] of Object.entries(bodyProps)) {
@@ -442,6 +496,10 @@ export class OpenApiParser {
     }
     if (Object.keys(bodyMapping).length > 0) {
       endpointMapping.bodyMapping = bodyMapping;
+    } else if (declaresJsonBody && bodyIsRequired) {
+      // A required body whose schema has no fields of its own: send `{}`, so
+      // the request still carries a JSON body and its Content-Type.
+      endpointMapping.bodyTemplate = '{}';
     }
     if (Object.keys(headerMapping).length > 0) {
       endpointMapping.headers = headerMapping;

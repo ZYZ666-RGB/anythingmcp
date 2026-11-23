@@ -2,7 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { createHash, randomBytes } from 'crypto';
 import { PrismaService } from '../common/prisma.service';
 import { AdaptersService } from './adapters.service';
-import { describeAdapterEnvVars, needsBrowserAuthorization } from './env-var-meta';
+import { describeAdapterEnvVars, describeEnvVarOptions, needsBrowserAuthorization } from './env-var-meta';
 import { normalizeAdapterEnvValue } from './env-var-checks';
 import { addressFix, describeAddressFix } from './address-fix';
 import { LicenseGuardService } from '../license/license-guard.service';
@@ -15,13 +15,27 @@ import {
   SharedSetupProvider,
   SharedSetupRegistry,
 } from '../mcp-server/shared-setup';
-import { ReturnAssistant, isExcludedAdapterSlug, sharedEndpointAccess } from '../mcp-server/shared-toolset';
+import {
+  ReturnAssistant,
+  isExcludedAdapterSlug,
+  sharedEndpointAccess,
+  withheldGenerationTools,
+} from '../mcp-server/shared-toolset';
 import { computeSetupState } from '../connectors/connector-setup-status.util';
 import { decrypt } from '../common/crypto/encryption.util';
 import { findSecretLiterals } from '../common/secret-literals.util';
 import { searchCatalog } from './catalog-search';
 import { fileSearchSetupPath } from './file-search-setup';
 import { CHAT_SETUP_SOURCE } from '../license/license-checkout';
+import { inspectOdooAddress } from './odoo-database-hint';
+import { WOOCOMMERCE_SLUG, WOOCOMMERCE_URL_VAR } from './woocommerce-setup';
+import { appApprovalAnnounced, signInPath } from './app-approval-watch';
+import {
+  MemberVisibilityService,
+  VisibilityScope,
+  connectorWhere,
+  ownsConnector,
+} from '../settings/member-visibility.service';
 
 /** Assistants a setup link can name (see assistantForRedirectUris). */
 const RETURN_ASSISTANTS: readonly ReturnAssistant[] = ['claude', 'chatgpt', 'muse'];
@@ -32,6 +46,24 @@ export const SETUP_LINK_TTL_MS = 30 * 60 * 1000;
 export const SETUP_LINK_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 /** Installs through a chat, per user and hour. A model does not need more. */
 const INSTALLS_PER_HOUR = 10;
+
+/** The Odoo connectors: JSON-2 needs Odoo 19 or later, JSON-RPC covers 14-18. */
+const JSON2_SLUG = 'odoo';
+const JSONRPC_SLUG = 'odoo-jsonrpc';
+const ODOO_SLUGS = new Set([JSON2_SLUG, JSONRPC_SLUG]);
+
+/** setup_get_status checks a ready connector never used if it was saved this recently. */
+const READY_CHECK_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** At most this many setup checks per setup_get_status call (each is a call to the provider). */
+const READY_CHECKS_PER_STATUS = 3;
+/** setup_get_status points out a catalog connector still waiting for its values after this long. */
+const UNFINISHED_AFTER_MS = 24 * 60 * 60 * 1000;
+
+/** Installed from the catalog (not hand-built). */
+function isCatalogConnector(config: unknown): boolean {
+  const slug = (config as { adapterSlug?: unknown } | null | undefined)?.adapterSlug;
+  return typeof slug === 'string' && slug !== '';
+}
 
 /**
  * Where providers send the browser back after sign-in: the URL a user must
@@ -93,6 +125,28 @@ function providerApp(definition: {
  * - the trial's connector limit, and INSTALLS_PER_HOUR per user;
  * - every install is recorded as a security event.
  */
+/**
+ * Why an install from the chat was refused, as a short code read from the
+ * answer the assistant got. Order matters: the first match wins.
+ */
+export function installRefusalReason(body: unknown): string {
+  const b = (body ?? {}) as { error?: unknown; upgradeUrl?: unknown; setupUrl?: unknown };
+  const text = typeof b.error === 'string' ? b.error : '';
+  if (/^No catalog connector/.test(text)) return 'unknown_app';
+  if (/File Search wizard/.test(text)) return 'file_search_wizard';
+  if (/is not a setting of/.test(text)) return 'unknown_setting';
+  if (/is a secret and is never taken|looks like a password, API key or token/.test(text)) return 'secret_in_chat';
+  if (/must be one of:|does not look right/.test(text)) return 'invalid_setting';
+  if (/connectors an hour can be installed/.test(text)) return 'too_many_installs';
+  // No licence to add to (LicenseGuardService.checkLicenseActive): the admin's
+  // answer carries an upgradeUrl too, so these come before plan_limit.
+  if (/trial has ended/i.test(text)) return 'trial_ended';
+  if (/no active licen[cs]e|licen[cs]e is not active|licen[cs]e has expired/i.test(text)) return 'no_licence';
+  // The plan's connector cap (checkCanCreateConnector), on a trial or a paid plan.
+  if (typeof b.upgradeUrl === 'string' || /limit reached|your plan includes/i.test(text)) return 'plan_limit';
+  return 'other';
+}
+
 @Injectable()
 export class ConnectorSetupService implements SharedSetupProvider, OnModuleInit {
   private readonly logger = new Logger(ConnectorSetupService.name);
@@ -105,6 +159,9 @@ export class ConnectorSetupService implements SharedSetupProvider, OnModuleInit 
     private readonly registry: SharedSetupRegistry,
     private readonly securityEvents: SecurityEventService,
     private readonly productEvents: ProductEventService,
+    // Not @Optional: Nest refuses to boot without it. It is missing only in
+    // unit specs that build the service by hand and predate the setting.
+    private readonly visibility?: MemberVisibilityService,
   ) {}
 
   onModuleInit(): void {
@@ -215,7 +272,9 @@ export class ConnectorSetupService implements SharedSetupProvider, OnModuleInit 
             alreadyInstalled: installed.has(a.slug),
             ...(sharedEndpointAccess(a.slug, ctx.profile ?? 'chatgpt') === 'read'
               ? { servedHere: 'Read tools only. Tools that move money or change payment data run on the server\'s own URL.' }
-              : {}),
+              : withheldGenerationTools(a.slug, ctx.profile ?? 'chatgpt').length
+                ? { servedHere: 'All tools except image, video and audio generation, which run on the server\'s own URL.' }
+                : {}),
             setup:
               full.setupKind === 'none'
                 ? 'Nothing to enter: installs and works right away.'
@@ -230,7 +289,21 @@ export class ConnectorSetupService implements SharedSetupProvider, OnModuleInit 
             ...(full.setupKind === 'oauth_browser' && !registersItsOwnClient(full) ? providerApp(full) : {}),
             settingsYouMayPass: vars
               .filter((v) => !v.secret)
-              .map((v) => ({ name: v.name, label: v.label, required: v.required, help: v.help, example: v.example })),
+              .map((v) => ({
+                name: v.name,
+                label: v.label,
+                required: v.required,
+                help: v.help,
+                example: v.example,
+                // A fixed list of choices (one API host per country): the
+                // user picks, the model passes that choice's value.
+                ...(v.options?.length
+                  ? {
+                      options: v.options,
+                      howToPass: 'Takes one of the options and nothing else. Ask the user which one applies (name the labels), then pass the value of the one they pick, exactly as listed.',
+                    }
+                  : {}),
+              })),
             enteredByTheUserOnTheLinkedPage: vars.filter((v) => v.secret).map((v) => v.label),
           };
         }),
@@ -260,7 +333,48 @@ export class ConnectorSetupService implements SharedSetupProvider, OnModuleInit 
     args: { adapter?: string; settings?: Record<string, unknown> },
     opts: SetupCallOptions = {},
   ): Promise<SetupCallResult> {
-    const slug = String(args.adapter ?? '').trim();
+    const out = await this.installOnce(ctx, args, opts);
+    if (out.isError) this.recordInstallRefused(ctx, args, opts, out);
+    return out;
+  }
+
+  /**
+   * `setup_install_failed`: an install asked for from a chat (or the picker
+   * after approval) that did not add a connector, with the reason as a short
+   * code. A successful one already logs `setup_completed`. Together they say
+   * how many found an app and tried to add it, and why it did not work; an
+   * app that was found and never asked for leaves neither.
+   *
+   * Only the code and the catalog id are kept: the refusal texts can repeat a
+   * setting name or an address the model sent.
+   */
+  private recordInstallRefused(
+    ctx: SetupContext,
+    args: { adapter?: string },
+    opts: SetupCallOptions,
+    out: SetupCallResult,
+  ): void {
+    const slug = String(args.adapter ?? '').trim().toLowerCase();
+    // log() catches its own failures: a refused install is answered regardless.
+    void this.productEvents.log({
+      event: ProductEvents.SETUP_INSTALL_FAILED,
+      userId: ctx.userId,
+      organizationId: ctx.organizationId,
+      metadata: {
+        ...(/^[a-z0-9][a-z0-9-]{0,59}$/.test(slug) ? { adapterSlug: slug } : {}),
+        via: opts.via ?? 'mcp',
+        // `kind`: the key the event store keeps for why a setup failed.
+        kind: installRefusalReason(out.body),
+      },
+    });
+  }
+
+  private async installOnce(
+    ctx: SetupContext,
+    args: { adapter?: string; settings?: Record<string, unknown> },
+    opts: SetupCallOptions = {},
+  ): Promise<SetupCallResult> {
+    let slug = String(args.adapter ?? '').trim();
     let definition: ReturnType<AdaptersService['describe']>;
     try {
       if (!slug || isExcludedAdapterSlug(slug, ctx.profile ?? 'chatgpt')) throw new Error('unknown');
@@ -301,7 +415,7 @@ export class ConnectorSetupService implements SharedSetupProvider, OnModuleInit 
       // An address typed without https:// (`acme.odoo.com`) gets it when the
       // field's pattern wants it, as on the setup page (address-fix.ts).
       const typed = value !== undefined && value !== null ? String(value).trim() : '';
-      const text = typed ? normalizeAdapterEnvValue(d, typed) : '';
+      const text = typed ? normalizeAdapterEnvValue(d, typed, slug) : '';
       // A shop URL with `?access_token=…`, a tenant field holding a key: the
       // chat is the wrong place for it, whatever the setting is called.
       if (text && findSecretLiterals(text).length > 0) {
@@ -313,7 +427,17 @@ export class ConnectorSetupService implements SharedSetupProvider, OnModuleInit 
           },
         };
       }
-      if (text && d.pattern && !matchesPattern(d.pattern, text)) {
+      // A variable with a fixed list of choices takes one of their values.
+      if (text && d.options?.length && !d.options.some((o) => o.value === text)) {
+        return {
+          isError: true,
+          body: {
+            error: `'${d.label}' must be one of: ${describeEnvVarOptions(d.options)}.`,
+            hint: 'Ask the user which one applies and pass its value exactly as listed (the value, not the label), or install without it: they can choose it on the page linked in the answer.',
+          },
+        };
+      }
+      if (text && !d.options?.length && d.pattern && !matchesPattern(d.pattern, text)) {
         // Secrets never get here, so the fixed address can be named.
         const fix = d.kind !== 'credential' ? addressFix(d.pattern, text) : undefined;
         return {
@@ -325,6 +449,33 @@ export class ConnectorSetupService implements SharedSetupProvider, OnModuleInit 
         };
       }
       if (text) settings[name] = text;
+    }
+
+    // Odoo: the address is asked, without a key, before anything is
+    // installed. 315 Odoo connectors came from a chat in two weeks of Oct-Nov
+    // 2026, often with the subdomain as the database name and the JSON-2
+    // connector on an Odoo below 19; both were only found on the setup page.
+    let addressNotes: string[] = [];
+    if (ODOO_SLUGS.has(slug) && settings.ODOO_URL) {
+      const checked = await this.checkOdooAddress(ctx, slug, settings);
+      if ('error' in checked) return { isError: true, body: checked.error };
+      if (checked.slug !== slug) {
+        slug = checked.slug;
+        definition = this.adapters.describe(slug);
+        // Labels for what the user still enters (the JSON-RPC one adds the user id).
+        for (const d of describeAdapterEnvVars(definition)) descriptors.set(d.name, d);
+      }
+      addressNotes = checked.notes;
+    }
+    // WooCommerce: the shop is asked, without a key, the same way as on the
+    // setup page: its own address is used, a name that does not exist is
+    // refused so the assistant asks again, and anything the user must change
+    // in WordPress first (Plain permalinks, WooCommerce inactive, a firewall)
+    // is said before they create the key.
+    if (slug === WOOCOMMERCE_SLUG && settings[WOOCOMMERCE_URL_VAR]) {
+      const checked = await this.checkWooCommerceAddress(settings);
+      if ('error' in checked) return { isError: true, body: checked.error };
+      addressNotes = checked.notes;
     }
 
     if (!this.takeInstallSlot(ctx.userId)) {
@@ -366,10 +517,12 @@ export class ConnectorSetupService implements SharedSetupProvider, OnModuleInit 
     const state = await this.connectorState(imported.connectorId);
     if (state.status === 'ready') {
       return {
+        connectorId: imported.connectorId,
         body: {
           installed: definition.name,
           status: 'ready',
           tools: definition.tools.length,
+          ...(addressNotes.length ? { checkedTheAddress: addressNotes.join(' ') } : {}),
           ...(imported.probe ? { firstCall: imported.probe.ok ? 'worked' : imported.probe.message } : {}),
           next: 'Its tools are available now: find them with anythingmcp_search_tools.',
         },
@@ -377,9 +530,11 @@ export class ConnectorSetupService implements SharedSetupProvider, OnModuleInit 
     }
     const link = await this.createLink(ctx, imported.connectorId);
     return {
+      connectorId: imported.connectorId,
       body: {
         installed: definition.name,
         status: state.status,
+        ...(addressNotes.length ? { checkedTheAddress: addressNotes.join(' ') } : {}),
         ...(needsBrowserAuthorization(definition) && !registersItsOwnClient(definition)
           ? providerApp(definition)
           : {}),
@@ -435,21 +590,144 @@ export class ConnectorSetupService implements SharedSetupProvider, OnModuleInit 
     return {
       error: reason,
       whatTheUserCanDo: onTrial
-        ? 'Add a card to continue the trial on the full plan (nothing is charged before the trial ends), or remove a connector.'
+        ? 'Add a payment method to continue the trial on the full plan (nothing is charged before the trial ends), or remove a connector.'
         : 'Choose a plan with more connectors, or remove a connector.',
       upgradeUrl: `${ctx.dashboardBase}${onTrial ? '/start-trial' : '/settings/license'}?source=${CHAT_SETUP_SOURCE}`,
     };
   }
 
+  /**
+   * What the Odoo address says about itself, applied to a chat install:
+   * - no database at the address (Odoo Online's typo page): refused, so the
+   *   assistant asks for the right address before anything is created;
+   * - below 19 on the JSON-2 connector: the JSON-RPC connector instead;
+   * - one database: its name, whatever the assistant passed;
+   * - several, and the one passed is not among them: none is passed, and the
+   *   note names them so the assistant can ask.
+   * Nothing changes when the address says nothing.
+   */
+  private async checkOdooAddress(
+    ctx: SetupContext,
+    slug: string,
+    settings: Record<string, string>,
+  ): Promise<{ slug: string; notes: string[] } | { error: Record<string, unknown> }> {
+    const facts = await inspectOdooAddress(settings.ODOO_URL);
+    if (!facts) return { slug, notes: [] };
+    if (facts.noDatabase) {
+      return {
+        error: {
+          error: `There is no Odoo database at ${settings.ODOO_URL}: Odoo answered with its "database not found" page.`,
+          hint: 'Ask the user for the address they open Odoo at (copy it from the browser after signing in, up to the host, e.g. https://mycompany.odoo.com), then install again.',
+        },
+      };
+    }
+    const notes: string[] = [];
+    let target = slug;
+    if (
+      slug === JSON2_SLUG &&
+      facts.major !== undefined &&
+      facts.major < 19 &&
+      !isExcludedAdapterSlug(JSONRPC_SLUG, ctx.profile ?? 'chatgpt')
+    ) {
+      target = JSONRPC_SLUG;
+      notes.push(
+        `This Odoo is version ${facts.version}, older than 19, which has no JSON-2 API: the Odoo 14-18 (JSON-RPC) connector was installed instead.`,
+      );
+    }
+    const databases = facts.databases ?? [];
+    if (databases.length === 1 && settings.ODOO_DB !== databases[0]) {
+      notes.push(
+        settings.ODOO_DB
+          ? `The database is called "${databases[0]}", not "${settings.ODOO_DB}": that name was used.`
+          : `The database is called "${databases[0]}": that name was used.`,
+      );
+      settings.ODOO_DB = databases[0];
+    } else if (databases.length > 1 && settings.ODOO_DB && !databases.includes(settings.ODOO_DB)) {
+      notes.push(
+        `This Odoo has no database "${settings.ODOO_DB}"; it serves ${databases
+          .slice(0, 5)
+          .map((d) => `"${d}"`)
+          .join(', ')}. The user picks the right one on the linked page.`,
+      );
+      delete settings.ODOO_DB;
+    }
+    return { slug: target, notes };
+  }
+
+  /**
+   * What a WooCommerce address says about itself, applied to a chat install
+   * (woocommerce-setup.ts): WordPress's own address replaces the one passed;
+   * no such host is refused; a problem the user fixes in WordPress (Plain
+   * permalinks, WooCommerce inactive or too old, a firewall, no https) goes
+   * into the notes, so the assistant tells it with the link. Nothing changes
+   * when the address says nothing.
+   */
+  private async checkWooCommerceAddress(
+    settings: Record<string, string>,
+  ): Promise<{ notes: string[] } | { error: Record<string, unknown> }> {
+    const typed = settings[WOOCOMMERCE_URL_VAR];
+    const found = await this.adapters.inspectWooCommerceAddress(typed);
+    if (!found) return { notes: [] };
+    if (found.problem === 'dns') {
+      return {
+        error: {
+          error: found.message,
+          hint: 'Ask the user for the address their shop opens at in the browser (e.g. https://myshop.com), then install again.',
+        },
+      };
+    }
+    const notes: string[] = [];
+    if (found.corrected && found.corrected !== typed) {
+      settings[WOOCOMMERCE_URL_VAR] = found.corrected;
+      notes.push(`WooCommerce answers at ${found.corrected}: that address was used instead of ${typed}.`);
+    } else if (found.woocommerce) {
+      notes.push(`WooCommerce found at ${found.home ?? typed}.`);
+    }
+    if (found.problem && found.message) {
+      notes.push(
+        `${found.message} Tell the user this before they create the key${found.fixUrl ? `, with the link ${found.fixUrl}` : ''}.`,
+      );
+    }
+    return { notes };
+  }
+
   // ── Status ────────────────────────────────────────────────────────────
 
+  /**
+   * The caller's member visibility in the workspace of this connection, from
+   * their role there (the membership, as everywhere on the MCP endpoint).
+   * Someone who is no longer an active member sees nothing.
+   */
+  private async visibilityScope(ctx: SetupContext): Promise<VisibilityScope> {
+    if (!this.visibility) return { restricted: false };
+    const member = await this.prisma.organizationMember.findFirst({
+      where: { userId: ctx.userId, organizationId: ctx.organizationId, deactivatedAt: null },
+      select: { role: true },
+    });
+    if (!member) return { restricted: true, userId: ctx.userId, allowedToolIds: [], ownerAccess: false };
+    return this.visibility.scopeFor({
+      sub: ctx.userId,
+      role: member.role as string,
+      organizationId: ctx.organizationId,
+    });
+  }
+
   async status(ctx: SetupContext): Promise<SetupCallResult> {
+    // Member visibility: in a restricted workspace a member who is not an
+    // admin gets the connectors the dashboard shows them, and of one they do
+    // not own only that it exists and whether it is set up. This answer used
+    // to list every connector of the workspace to any EDITOR, with the
+    // provider's words for a refused credential and the last error of a call.
+    const scope = await this.visibilityScope(ctx);
     const rows = await this.prisma.connector.findMany({
-      where: { organizationId: ctx.organizationId },
+      where: scope.restricted
+        ? { AND: [{ organizationId: ctx.organizationId }, connectorWhere(scope)] }
+        : { organizationId: ctx.organizationId },
       orderBy: { createdAt: 'desc' },
       take: 50,
       select: {
         id: true,
+        userId: true,
         name: true,
         authType: true,
         authConfig: true,
@@ -458,26 +736,157 @@ export class ConnectorSetupService implements SharedSetupProvider, OnModuleInit 
         envVars: true,
         config: true,
         createdAt: true,
+        updatedAt: true,
+        authStatus: true,
+        authStatusMessage: true,
+        authStatusAt: true,
         tools: { where: { isEnabled: true }, select: { endpointMapping: true } },
       },
     });
+    // "ready" only means every value is filled in: a connector saved with a
+    // wrong value ("Save anyway") is ready too. So each ready one also says
+    // how its last call went, and one finished in the last day but never
+    // used gets the setup check, with its stored values.
+    const states = rows.map((r) => ({
+      row: r,
+      state: this.stateOf(r),
+      // Shared with a restricted member through their roles, not theirs.
+      reduced: scope.restricted && !ownsConnector(scope, r),
+    }));
+    const checks = await this.readyChecks(
+      ctx,
+      states.filter(({ state, reduced }) => !reduced && state.status === 'ready').map(({ row }) => row),
+    );
+    const now = Date.now();
     const out = [];
-    for (const r of rows) {
-      const state = this.stateOf(r);
+    let unfinished = 0;
+    let refused = 0;
+    let approved = 0;
+    for (const { row: r, state, reduced } of states) {
+      if (reduced) {
+        // The reduced view: no link that opens its setup, no provider message.
+        out.push({ name: r.name, status: state.status });
+        continue;
+      }
+      const check = checks.get(r.id);
+      // The provider approved the user's app (Etsy: it left Pending) and only
+      // the sign-in is left: said first, with the link of the approval email.
+      const appApproved = state.status === 'needs_authorization' && appApprovalAnnounced(r.config);
+      if (appApproved) approved++;
+      // A catalog connector added (mostly from a chat) whose values were never
+      // entered: 28 of the 41 WooCommerce connectors never called in Oct-Nov
+      // 2026 still held {{WOOCOMMERCE_URL}}, their link long expired. After a
+      // day the answer says so, so the assistant offers the new link.
+      const waiting =
+        state.status === 'needs_input' &&
+        isCatalogConnector(r.config) &&
+        r.createdAt instanceof Date &&
+        now - r.createdAt.getTime() >= UNFINISHED_AFTER_MS;
+      if (waiting) unfinished++;
+      // The provider kept refusing the stored credential (connector-auth-status).
+      const credentialRefused = state.status === 'ready' && r.authStatus === 'needs_reauth';
+      if (credentialRefused) refused++;
       out.push({
         name: r.name,
         status: state.status,
         ...(state.status !== 'ready' ? { finishSetupUrl: await this.createLink(ctx, r.id) } : {}),
+        ...(appApproved ? { appApproved: true, finishSignInUrl: `${ctx.dashboardBase}${signInPath(r.id)}` } : {}),
+        ...(waiting ? { unfinishedSince: r.createdAt.toISOString() } : {}),
+        ...(credentialRefused
+          ? {
+              credential: {
+                ok: false,
+                ...(r.authStatusAt ? { since: r.authStatusAt.toISOString() } : {}),
+                message: String(r.authStatusMessage ?? 'The provider refuses the stored credential.').slice(0, 600),
+              },
+            }
+          : {}),
+        ...(check?.lastCall ? { lastCall: check.lastCall } : {}),
+        ...(check?.check ? { check: check.check } : {}),
+        ...(check?.check?.ok === false || credentialRefused ? { fixUrl: await this.createLink(ctx, r.id) } : {}),
       });
     }
     const trial = await this.trialAnswer(ctx);
     return {
       body: {
+        ...(approved
+          ? {
+              appApprovedHint:
+                "appApproved: the provider approved the user's app for that connector; only the sign-in is left. Before anything else, tell the user and show them its finishSignInUrl as a clickable link: it starts the provider's sign-in.",
+            }
+          : {}),
         connectors: out,
         ...(out.length === 0 ? { hint: 'No connectors yet: use setup_find_connectors.' } : {}),
+        ...([...checks.values()].some((c) => c.check?.ok === false)
+          ? { checkHint: 'check.ok false: the values saved on that connector do not work. Tell the user what check.message says and give them its fixUrl.' }
+          : {}),
+        ...(unfinished
+          ? {
+              unfinishedHint:
+                'unfinishedSince: that connector was added but its setup was never finished, and the link given then has expired. ' +
+                'Offer the user its finishSetupUrl (a new link, valid 30 minutes) as a clickable link, or ask whether to remove it.',
+            }
+          : {}),
+        ...(refused
+          ? {
+              credentialHint:
+                'credential.ok false: the provider has been refusing that connector\'s saved credentials. Tell the user what credential.message says and give them its fixUrl to enter new ones.',
+            }
+          : {}),
         ...(trial ? { trial } : {}),
       },
     };
+  }
+
+  /**
+   * For ready connectors: the last call (worked or not, with the error), and
+   * for at most three catalog connectors finished in the last 24 hours with no
+   * call yet, the setup check run on their stored values.
+   */
+  private async readyChecks(
+    ctx: SetupContext,
+    ready: Array<{ id: string; config: unknown; updatedAt?: Date | null }>,
+  ): Promise<Map<string, { lastCall?: Record<string, unknown>; check?: { ok: boolean; message?: string } }>> {
+    const out = new Map<string, { lastCall?: Record<string, unknown>; check?: { ok: boolean; message?: string } }>();
+    const lastCalls = await Promise.all(
+      ready.map((r) =>
+        this.prisma.toolInvocation
+          .findFirst({
+            where: { connectorId: r.id, organizationId: ctx.organizationId },
+            orderBy: { createdAt: 'desc' },
+            select: { status: true, error: true, createdAt: true },
+          })
+          .catch(() => null),
+      ),
+    );
+    const unused: typeof ready = [];
+    ready.forEach((r, i) => {
+      const call = lastCalls[i];
+      if (call) {
+        out.set(r.id, {
+          lastCall:
+            call.status === 'SUCCESS'
+              ? { ok: true, at: call.createdAt.toISOString() }
+              : { ok: false, at: call.createdAt.toISOString(), error: String(call.error ?? call.status).slice(0, 240) },
+        });
+      } else if (r.updatedAt && Date.now() - r.updatedAt.getTime() < READY_CHECK_WINDOW_MS) {
+        unused.push(r);
+      }
+    });
+    const toCheck = unused
+      .filter((r) => typeof (r.config as { adapterSlug?: unknown } | null)?.adapterSlug === 'string')
+      .slice(0, READY_CHECKS_PER_STATUS);
+    await Promise.all(
+      toCheck.map(async (r) => {
+        const slug = (r.config as { adapterSlug: string }).adapterSlug;
+        const result = await Promise.resolve()
+          .then(() => this.adapters.verifyCredentials(slug, ctx.organizationId, {}, r.id))
+          .catch(() => null);
+        if (!result || result.ok === null) return;
+        out.set(r.id, { check: result.ok ? { ok: true } : { ok: false, message: result.message } });
+      }),
+    );
+    return out;
   }
 
   /**
@@ -543,8 +952,9 @@ export class ConnectorSetupService implements SharedSetupProvider, OnModuleInit 
     connectorId: string,
   ): Promise<string> {
     const token = randomBytes(24).toString('base64url');
-    // Expired links stop working at once (resolveLink checks expiresAt); the
-    // rows are kept a week so the share of links that get opened can be read.
+    // Expired links stop working at once without a dashboard session (see
+    // resolveLink); the rows are kept a week, for a signed-in user's late
+    // click and to read the share of links that get opened.
     await this.prisma.connectorSetupLink
       .deleteMany({ where: { expiresAt: { lt: new Date(Date.now() - SETUP_LINK_RETENTION_MS) } } })
       .catch(() => undefined);
@@ -569,9 +979,17 @@ export class ConnectorSetupService implements SharedSetupProvider, OnModuleInit 
     token: string,
     userId: string,
     from?: unknown,
+    /**
+     * Opened with the user's own dashboard session: a link past its 30
+     * minutes still leads to the setup (it is kept a week). A chat may hand
+     * out a link it was given much earlier, and the link then gives the
+     * signed-in user nothing they could not open in the dashboard. Without a
+     * session (a sign-in cookie only) the 30 minutes hold.
+     */
+    opts: { signedIn?: boolean } = {},
   ): Promise<{ redirect: string; organizationId: string } | { error: string }> {
     const row = await this.prisma.connectorSetupLink.findUnique({ where: { tokenHash: this.hash(String(token || '')) } });
-    if (!row || row.expiresAt.getTime() < Date.now()) {
+    if (!row || (!opts.signedIn && row.expiresAt.getTime() < Date.now())) {
       return { error: 'This link has expired. Ask your AI client for a new one, or open the connector in the dashboard.' };
     }
     if (row.userId !== userId) {
@@ -633,6 +1051,11 @@ export class ConnectorSetupService implements SharedSetupProvider, OnModuleInit 
         .create({ data: { mcpServerId: s.id, connectorId } })
         .catch(() => undefined); // already there
     }
+  }
+
+  /** Where a connector stands: ready, needs_input (with the missing variables) or needs_authorization. */
+  connectorStatus(connectorId: string): Promise<{ status: string; missing: string[] }> {
+    return this.connectorState(connectorId) as Promise<{ status: string; missing: string[] }>;
   }
 
   private async connectorState(connectorId: string) {

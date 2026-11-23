@@ -14,14 +14,18 @@ export const EXCLUDED_DOCS = [
   'docs/operations/signup-attribution.md',
   'docs/plans/file-search.md',
 ];
+// Generated per-connector pages (docs/catalog/connectors/<slug>.md, 700+ of
+// them): the catalog's category pages, which llms.txt lists, link to each one.
+// Listing every page would bury the guides.
+export const EXCLUDED_DOC_DIRS = ['docs/catalog/connectors/'];
 const SECTIONS = [
   ['Getting started', ['README.md', 'docs/deployment.md', 'docs/guides.md']],
   ['Connectors', ['docs/connectors/*.md', 'docs/tool-definition.md']],
   ['AI clients', ['docs/integrations/*.md']],
-  ['Operations and security', ['docs/operations/*.md', 'docs/sso.md', 'docs/scim-entra-setup.md', 'docs/code-mode.md', 'docs/license-faq.md']],
-  ['Reference', ['docs/api-reference.md', 'docs/mcp-resources.md', 'docs/knowledge-graph.md', 'docs/memory.md']],
+  ['Operations and security', ['docs/operations/*.md', 'docs/sso.md', 'docs/scim-entra-setup.md', 'docs/code-mode.md', 'docs/license-faq.md', 'docs/cloud-invoices.md', 'docs/cloud-plans.md']],
+  ['Reference', ['docs/api-reference.md', 'docs/mcp-resources.md', 'docs/knowledge-graph.md', 'docs/memory.md', 'docs/learning-projects.md']],
   ['Contributing', ['.github/CONTRIBUTING.md', 'AGENTS.md']],
-  ['Optional', ['docs/guides/*.md', 'docs/ROADMAP.md', 'docs/ADOPTERS.md']],
+  ['Optional', ['docs/catalog/*.md', 'docs/guides/*.md', 'docs/ROADMAP.md', 'docs/ADOPTERS.md']],
 ];
 const DESCRIPTIONS = {
   'README.md': 'Run AnythingMCP locally, connect an AI client, and discover ready-made connectors.',
@@ -30,6 +34,7 @@ const DESCRIPTIONS = {
   'docs/api-reference.md': 'REST API reference for authentication, connectors, tools, MCP servers, and administration.',
   'docs/tool-definition.md': 'Define MCP tool parameters, endpoint mappings, response transforms, and adapter metadata.',
   'docs/operations/observability.md': 'Configure structured logging, Sentry error reporting, and Prometheus metrics for your deployment.',
+  'docs/operations/member-visibility.md': 'Limit what members who are not admins see in the dashboard and the API to their own calls and what their MCP roles reach.',
   'docs/ROADMAP.md': 'Review current development priorities, planned features, and contribution opportunities.',
   'docs/guides/connect-sorare-to-chatgpt.md': 'Connect Sorare fantasy football tools to ChatGPT through AnythingMCP.',
   'docs/guides/connect-sorare-to-claude.md': 'Connect Sorare fantasy football tools to Claude Desktop and Claude Code.',
@@ -40,6 +45,8 @@ const DESCRIPTIONS = {
   'docs/connectors/file-search.md': 'Search inside the documents of SFTP, FTP/FTPS, WebDAV, S3 and network folders from AI clients, with File Share download links, plan limits and pauses.',
   'docs/code-mode.md': 'Run isolated JavaScript that orchestrates several MCP tools in one step: saved code tools, inline code_execute, governance and deployment.',
   'docs/license-faq.md': 'Understand the AGPL license, the commercial EE boundary, and contributor licensing.',
+  'docs/cloud-invoices.md': 'Find your AnythingMCP Cloud invoices and have each paid invoice emailed as a PDF, from the dashboard or the CLI.',
+  'docs/cloud-plans.md': 'What each AnythingMCP Cloud plan includes (connectors, servers, users, File Search, code mode) and what happens above a plan\'s limits.',
   '.github/CONTRIBUTING.md': 'Set up development, test changes, and submit a contribution.',
   'AGENTS.md': 'Repository instructions, setup commands, tests, and contribution boundaries for coding agents.',
 };

@@ -7,7 +7,13 @@ import {
 } from '../knowledge-graph/kg-skill.service';
 import { KnowledgeFoldersService } from '../knowledge-folders/knowledge-folders.service';
 import { connectorInstructions } from '../adapters/instruction-facts';
+import { appApprovalAnnounced } from '../adapters/app-approval-watch';
 import { McpSessionManager } from './mcp-session.manager';
+import {
+  connectorWhere,
+  serverWhere,
+  type VisibilityScope,
+} from '../settings/member-visibility.service';
 
 /** What the per-server endpoint may serve as text to one caller. */
 export interface VisibleServerContent {
@@ -46,7 +52,7 @@ export class McpServersService {
     return this.prisma.mcpServerConfig.findMany({
       where: { userId },
       include: {
-        _count: { select: { connectors: true, apiKeys: true } },
+        _count: { select: { connectors: true, apiKeys: { where: { isSupport: false } } } },
       },
       orderBy: { createdAt: 'asc' },
     });
@@ -147,7 +153,7 @@ export class McpServersService {
     return this.prisma.mcpServerConfig.findMany({
       where: { organizationId },
       include: {
-        _count: { select: { connectors: true, apiKeys: true } },
+        _count: { select: { connectors: true, apiKeys: { where: { isSupport: false } } } },
         // Names only, for "exposes …" on the server cards: servers look alike
         // and a client wired to the wrong one is otherwise invisible.
         connectors: {
@@ -159,6 +165,77 @@ export class McpServersService {
       ...(opts?.limit !== undefined ? { take: opts.limit } : {}),
       ...(opts?.offset !== undefined ? { skip: opts.offset } : {}),
     });
+  }
+
+  /**
+   * `findAllByOrg` for a member whose view is narrowed by member visibility:
+   * only the servers they own (`serverWhere`), and in each one only the
+   * connectors they may see (names and `_count.connectors`). Filtered in the
+   * query, so `limit` and `offset` page over visible servers only.
+   */
+  async findAllVisibleByOrg(
+    organizationId: string,
+    scope: VisibilityScope,
+    opts?: { limit?: number; offset?: number },
+  ) {
+    const visibleConnector = { connector: connectorWhere(scope) };
+    return this.prisma.mcpServerConfig.findMany({
+      where: { AND: [{ organizationId }, serverWhere(scope)] },
+      include: {
+        _count: {
+          select: {
+            connectors: { where: visibleConnector },
+            apiKeys: { where: { isSupport: false } },
+          },
+        },
+        connectors: {
+          where: visibleConnector,
+          select: { connector: { select: { name: true } } },
+          orderBy: { createdAt: 'asc' },
+        },
+      },
+      orderBy: { createdAt: 'asc' },
+      ...(opts?.limit !== undefined ? { take: opts.limit } : {}),
+      ...(opts?.offset !== undefined ? { skip: opts.offset } : {}),
+    });
+  }
+
+  /**
+   * `findById` for a member whose view is narrowed by member visibility:
+   * null when the server is not in the workspace or not theirs (the caller
+   * answers both with the unknown-id 404), otherwise the server with only the
+   * connectors they may see.
+   */
+  async findVisibleById(id: string, organizationId: string, scope: VisibilityScope) {
+    const visibleConnector = { connector: connectorWhere(scope) };
+    return this.prisma.mcpServerConfig.findFirst({
+      where: { AND: [{ id, organizationId }, serverWhere(scope)] },
+      include: {
+        connectors: {
+          where: visibleConnector,
+          include: {
+            connector: {
+              select: { id: true, name: true, type: true, isActive: true },
+            },
+          },
+        },
+        _count: {
+          select: {
+            connectors: { where: visibleConnector },
+            apiKeys: { where: { isSupport: false } },
+          },
+        },
+      },
+    });
+  }
+
+  /** Whether the server is in the workspace and visible to the scope. */
+  async isVisibleTo(id: string, organizationId: string, scope: VisibilityScope): Promise<boolean> {
+    const row = await this.prisma.mcpServerConfig.findFirst({
+      where: { AND: [{ id, organizationId }, serverWhere(scope)] },
+      select: { id: true },
+    });
+    return !!row;
   }
 
   /**
@@ -192,7 +269,7 @@ export class McpServersService {
             },
           },
         },
-        _count: { select: { connectors: true, apiKeys: true } },
+        _count: { select: { connectors: true, apiKeys: { where: { isSupport: false } } } },
       },
     });
   }
@@ -204,7 +281,7 @@ export class McpServersService {
    */
   async listOwnKeysForServer(mcpServerId: string, userId: string, organizationId: string) {
     const keys = await this.prisma.mcpApiKey.findMany({
-      where: { mcpServerId, userId, organizationId },
+      where: { mcpServerId, userId, organizationId, isSupport: false },
       select: {
         id: true,
         name: true,
@@ -234,7 +311,7 @@ export class McpServersService {
           instructions: data.instructions,
         },
         include: {
-          _count: { select: { connectors: true, apiKeys: true } },
+          _count: { select: { connectors: true, apiKeys: { where: { isSupport: false } } } },
         },
       }),
     );
@@ -246,7 +323,7 @@ export class McpServersService {
         where: { id },
         data,
         include: {
-          _count: { select: { connectors: true, apiKeys: true } },
+          _count: { select: { connectors: true, apiKeys: { where: { isSupport: false } } } },
         },
       }),
     );
@@ -409,20 +486,27 @@ export class McpServersService {
    * organization. Fails closed: an unknown server yields nothing.
    */
   /**
-   * Name of each connector, and whether it carries notes for the model. For
-   * the shared endpoint's tool set; the ids come from the caller's already
-   * scoped tools.
+   * Name of each connector, whether it carries notes for the model, and
+   * whether its provider approved the user's app while the watch has not seen
+   * the sign-in (read from the row, because the watcher writes that state
+   * without reloading the tool registry). For the shared endpoint's tool set;
+   * the ids come from the caller's already scoped tools.
    */
   async getConnectorSummaries(
     connectorIds: string[],
-  ): Promise<Array<{ id: string; name: string; hasGuide: boolean }>> {
+  ): Promise<Array<{ id: string; name: string; hasGuide: boolean; appApproved?: boolean }>> {
     const ids = [...new Set(connectorIds)];
     if (ids.length === 0) return [];
     const rows = await this.prisma.connector.findMany({
       where: { id: { in: ids } },
-      select: { id: true, name: true, instructions: true },
+      select: { id: true, name: true, instructions: true, config: true },
     });
-    return rows.map((r) => ({ id: r.id, name: r.name, hasGuide: !!r.instructions }));
+    return rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      hasGuide: !!r.instructions,
+      ...(appApprovalAnnounced(r.config) ? { appApproved: true } : {}),
+    }));
   }
 
   /**
@@ -489,17 +573,6 @@ export class McpServersService {
     if (serverIds.length === 0) return [];
     return this.prisma.mcpServerConfig.findMany({
       where: { id: { in: [...new Set(serverIds)] }, isActive: true },
-      select: { id: true, name: true },
-      orderBy: { createdAt: 'asc' },
-    });
-  }
-
-  /** Active servers of one workspace, for links handed to the model. */
-  async getServerNamesByOrg(
-    organizationId: string,
-  ): Promise<Array<{ id: string; name: string }>> {
-    return this.prisma.mcpServerConfig.findMany({
-      where: { organizationId, isActive: true },
       select: { id: true, name: true },
       orderBy: { createdAt: 'asc' },
     });

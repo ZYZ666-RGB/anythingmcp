@@ -1,10 +1,32 @@
-import { ConnectorSetupService, SETUP_LINK_RETENTION_MS } from './connector-setup.service';
+import { ConnectorSetupService, SETUP_LINK_RETENTION_MS, installRefusalReason } from './connector-setup.service';
 import { AdaptersService } from './adapters.service';
+import { describeAdapterEnvVars } from './env-var-meta';
 import { encrypt } from '../common/crypto/encryption.util';
+import { getAdapter } from './catalog';
+import { outboundRequest } from '../common/outbound-http';
+import { TrialEndedException } from '../license/license-guard.service';
+import { MemberVisibilityService } from '../settings/member-visibility.service';
+
+// The chat install asks an Odoo address about itself: no real request here.
+jest.mock('../common/outbound-http', () => ({ outboundRequest: jest.fn().mockRejectedValue(new Error('offline')) }));
+const outbound = outboundRequest as jest.MockedFunction<typeof outboundRequest>;
 
 const KEY = 'k'.repeat(32);
 
-function build(opts: { role?: string; connectors?: any[]; importResult?: any; trial?: any; cloud?: boolean } = {}) {
+function build(
+  opts: {
+    role?: string;
+    connectors?: any[];
+    importResult?: any;
+    trial?: any;
+    cloud?: boolean;
+    lastCalls?: Record<string, any>;
+    verify?: any;
+    woo?: any;
+    /** Member visibility of the workspace and the tool ids the caller's roles allow (null: no whitelist). */
+    visibility?: { mode: 'open' | 'restricted'; allowed: string[] | null };
+  } = {},
+) {
   process.env.ENCRYPTION_KEY = KEY;
   const links: any[] = [];
   const serverConnectors: any[] = [];
@@ -24,6 +46,7 @@ function build(opts: { role?: string; connectors?: any[]; importResult?: any; tr
     },
     mcpServerConfig: { findMany: jest.fn(async ({ where }: any) => where.id.in.map((id: string) => ({ id }))) },
     mcpServerConnector: { create: jest.fn(async ({ data }: any) => serverConnectors.push(data)) },
+    toolInvocation: { findFirst: jest.fn(async ({ where }: any) => opts.lastCalls?.[where.connectorId] ?? null) },
   };
   const realAdapters = new AdaptersService(
     { connector: {}, mcpTool: {} } as any,
@@ -36,6 +59,8 @@ function build(opts: { role?: string; connectors?: any[]; importResult?: any; tr
   const adapters: any = {
     listAll: () => realAdapters.listAll(),
     describe: (slug: string) => realAdapters.describe(slug),
+    verifyCredentials: jest.fn().mockResolvedValue(opts.verify ?? { ok: null, skipped: 'no_probe' }),
+    inspectWooCommerceAddress: jest.fn().mockResolvedValue(opts.woo),
     importAdapter: jest.fn(async (slug: string, _u: string, orgId: string, settings: Record<string, string>) => {
       const def = realAdapters.getBySlug(slug);
       const id = `c-${slug}`;
@@ -60,7 +85,21 @@ function build(opts: { role?: string; connectors?: any[]; importResult?: any; tr
   };
   const securityEvents: any = { log: jest.fn() };
   const productEvents: any = { log: jest.fn() };
-  const service = new ConnectorSetupService(prisma, adapters as unknown as AdaptersService, licenseGuard, { register: jest.fn() } as any, securityEvents, productEvents);
+  const visibility = opts.visibility
+    ? new MemberVisibilityService(
+        { get: jest.fn(async () => (opts.visibility!.mode === 'restricted' ? 'restricted' : null)) } as any,
+        { getAllowedToolIds: jest.fn(async () => opts.visibility!.allowed) } as any,
+      )
+    : undefined;
+  const service = new ConnectorSetupService(
+    prisma,
+    adapters as unknown as AdaptersService,
+    licenseGuard,
+    { register: jest.fn() } as any,
+    securityEvents,
+    productEvents,
+    visibility,
+  );
   const ctx = { userId: 'u1', organizationId: 'org-1', serverIds: ['srv-granted'], dashboardBase: 'https://cloud.example.com' };
   return { service, prisma, adapters, licenseGuard, securityEvents, productEvents, links, serverConnectors, ctx };
 }
@@ -100,8 +139,8 @@ describe('ConnectorSetupService — find', () => {
       // Where to create the app, and how to show both addresses: a link to
       // tap and the callback alone in a code block to copy.
       for (const r of [etsy, installed]) {
-        expect(r.createTheAppAt).toBe('https://www.etsy.com/developers/register');
-        expect(r.showToTheUser).toMatch(/\[Create the app\]\(https:\/\/www\.etsy\.com\/developers\/register\)/);
+        expect(r.createTheAppAt).toBe('https://www.etsy.com/developers/register-seller-app');
+        expect(r.showToTheUser).toMatch(/\[Create the app\]\(https:\/\/www\.etsy\.com\/developers\/register-seller-app\)/);
         expect(r.showToTheUser).toMatch(/fenced code block/);
       }
       expect(openplz.createTheAppAt).toBeUndefined();
@@ -180,6 +219,23 @@ describe('ConnectorSetupService — find', () => {
       expect.arrayContaining([expect.stringMatching(/^(binance|coinbase|sorare)$/)]),
     );
     expect((await service.install(claude, { adapter: 'binance' })).isError).toBe(true);
+  });
+
+  it('keeps generation connectors off the default profile and betting odds off ChatGPT', async () => {
+    const { service, ctx } = build();
+    const claude = { ...ctx, profile: 'default' as const };
+    const media: any = (await service.find(claude, { query: 'elevenlabs stability heygen', limit: 10 })).body;
+    expect(media.results.map((r: any) => r.adapter)).not.toEqual(
+      expect.arrayContaining([expect.stringMatching(/^(elevenlabs|stability-ai|heygen)$/)]),
+    );
+    expect((await service.install(claude, { adapter: 'stability-ai' })).isError).toBe(true);
+    const openai: any = (await service.find(claude, { query: 'openai', limit: 10 })).body;
+    expect(openai.results.find((r: any) => r.adapter === 'openai').servedHere).toMatch(/except image, video and audio generation/);
+
+    const odds: any = (await service.find(ctx, { query: 'the odds api', limit: 10 })).body;
+    expect(odds.results.map((r: any) => r.adapter)).not.toContain('the-odds-api');
+    const claudeOdds: any = (await service.find(claude, { query: 'the odds api', limit: 10 })).body;
+    expect(claudeOdds.results.map((r: any) => r.adapter)).toContain('the-odds-api');
   });
 });
 
@@ -335,10 +391,86 @@ describe('ConnectorSetupService — install', () => {
     );
 
     adapters.importAdapter.mockClear();
-    const out: any = await service.install(ctx, { adapter: 'woocommerce', settings: { WOOCOMMERCE_URL: 'http://shop.example.com/' } });
+    const out: any = await service.install(ctx, { adapter: 'prestashop', settings: { PRESTASHOP_URL: 'http://shop.example.com/' } });
     expect(out.isError).toBe(true);
-    expect(out.body.error).toMatch(/Use https:\/\/ instead of http:\/\/ and remove the \/ at the end: https:\/\/shop\.example\.com\./);
+    expect(out.body.error).toMatch(/Use https:\/\/ instead of http:\/\//);
     expect(adapters.importAdapter).not.toHaveBeenCalled();
+  });
+
+  it('cleans a WooCommerce address from the chat silently (WooCommerce has its own rule)', async () => {
+    const { service, ctx, adapters } = build();
+    await service.install(ctx, {
+      adapter: 'woocommerce',
+      settings: { WOOCOMMERCE_URL: 'http://shop.example.com/wp-admin/admin.php?page=wc-settings' },
+    });
+    expect(adapters.importAdapter).toHaveBeenLastCalledWith(
+      'woocommerce',
+      'u1',
+      'org-1',
+      { WOOCOMMERCE_URL: 'https://shop.example.com' },
+      { addressMayWait: true },
+    );
+    expect(adapters.inspectWooCommerceAddress).toHaveBeenCalledWith('https://shop.example.com');
+  });
+
+  // setup_install_failed: an install that added nothing, with a reason code
+  // and never the refusal text (it can repeat what the model sent).
+  it('records a refused install with a reason code, and nothing for a successful one', async () => {
+    const { service, ctx, licenseGuard, productEvents } = build();
+    const failed = () =>
+      productEvents.log.mock.calls.map(([e]: any) => e).filter((e: any) => e.event === 'setup_install_failed');
+
+    await service.install(ctx, { adapter: 'no-such-app' });
+    licenseGuard.checkCanCreateConnector.mockRejectedValueOnce(new Error('Trial limit reached (2 connectors).'));
+    await service.install(ctx, { adapter: 'openplz' }, { via: 'post_approve' });
+    await service.install(ctx, { adapter: 'Not A Slug!!' });
+    expect(failed()).toEqual([
+      { event: 'setup_install_failed', userId: 'u1', organizationId: ctx.organizationId, metadata: { adapterSlug: 'no-such-app', via: 'mcp', kind: 'unknown_app' } },
+      { event: 'setup_install_failed', userId: 'u1', organizationId: ctx.organizationId, metadata: { adapterSlug: 'openplz', via: 'post_approve', kind: 'plan_limit' } },
+      // An id that is not a catalog id is not stored.
+      { event: 'setup_install_failed', userId: 'u1', organizationId: ctx.organizationId, metadata: { via: 'mcp', kind: 'unknown_app' } },
+    ]);
+
+    productEvents.log.mockClear();
+    const ok = await service.install(ctx, { adapter: 'openplz' });
+    expect(ok.isError).toBeFalsy();
+    expect(failed()).toHaveLength(0);
+  });
+
+  // An ended trial is answered like a cap (with the licence page as
+  // upgradeUrl for an admin) but is no plan limit: it gets its own code.
+  it('records an install refused by an ended trial as trial_ended, not plan_limit', async () => {
+    const { service, ctx, licenseGuard, productEvents } = build({ role: 'ADMIN' });
+    licenseGuard.checkCanCreateConnector.mockRejectedValueOnce(new TrialEndedException(new Date('2026-11-01T00:00:00Z')));
+    licenseGuard.getUsage.mockResolvedValueOnce({ plan: null, connectors: { current: 0, max: null } });
+    const out = await service.install(ctx, { adapter: 'openplz' });
+    expect(out.isError).toBe(true);
+    expect(typeof (out.body as any).upgradeUrl).toBe('string');
+    const kinds = productEvents.log.mock.calls
+      .map(([e]: any) => e)
+      .filter((e: any) => e.event === 'setup_install_failed')
+      .map((e: any) => e.metadata.kind);
+    expect(kinds).toEqual(['trial_ended']);
+  });
+
+  it('reads the reason of a refusal from the answer the assistant got', () => {
+    expect(installRefusalReason({ error: "No catalog connector 'x'. Use setup_find_connectors to get its id." })).toBe('unknown_app');
+    expect(installRefusalReason({ error: 'SFTP is a File Search connector and is set up in the File Search wizard, not from the chat.', setupUrl: 'https://x' })).toBe('file_search_wizard');
+    expect(installRefusalReason({ error: "'FOO' is not a setting of Odoo. Settings: ODOO_URL." })).toBe('unknown_setting');
+    expect(installRefusalReason({ error: "'Bot token' is a secret and is never taken from the chat. Install without it." })).toBe('secret_in_chat');
+    expect(installRefusalReason({ error: "'Shop address' contains what looks like a password, API key or token." })).toBe('secret_in_chat');
+    expect(installRefusalReason({ error: "'Region' must be one of: eu, us." })).toBe('invalid_setting');
+    expect(installRefusalReason({ error: "'Shop address' does not look right." })).toBe('invalid_setting');
+    expect(installRefusalReason({ error: 'At most 10 connectors an hour can be installed from a chat.' })).toBe('too_many_installs');
+    expect(installRefusalReason({ error: 'Trial limit reached (2 connectors).', upgradeUrl: 'https://x/start-trial' })).toBe('plan_limit');
+    expect(installRefusalReason({ error: 'Your plan includes 5 active connectors. Pause one under Connectors to add this one, or upgrade the plan.' })).toBe('plan_limit');
+    expect(installRefusalReason({ error: new TrialEndedException(null).message, upgradeUrl: 'https://x/settings/license' })).toBe('trial_ended');
+    expect(installRefusalReason({ error: new TrialEndedException(null).message })).toBe('trial_ended');
+    expect(installRefusalReason({ error: 'This workspace has no active license. Ask a workspace administrator to activate one.', upgradeUrl: 'https://x/settings/license' })).toBe('no_licence');
+    expect(installRefusalReason({ error: "This workspace's license is not active. Ask a workspace administrator to renew it." })).toBe('no_licence');
+    expect(installRefusalReason({ error: "This workspace's license has expired. Ask a workspace administrator to renew it." })).toBe('no_licence');
+    expect(installRefusalReason({ error: 'Something else went wrong.' })).toBe('other');
+    expect(installRefusalReason(undefined)).toBe('other');
   });
 
   it('respects the trial limit', async () => {
@@ -397,6 +529,80 @@ describe('ConnectorSetupService — install', () => {
   });
 });
 
+describe('ConnectorSetupService — a setting with a fixed list of choices (envVarMeta.options)', () => {
+  const countries = [
+    { value: 'https://fr.shop.example.test', label: 'France' },
+    { value: 'https://es.shop.example.test', label: 'Spain' },
+  ];
+  /** Magento as it is, with choices put on its address (no catalog adapter is pinned here). */
+  function buildWithChoices() {
+    const built = build();
+    const describe = built.adapters.describe;
+    built.adapters.describe = (slug: string) => {
+      const d = describe(slug);
+      if (slug !== 'magento') return d;
+      const envVarMeta = { ...d.envVarMeta, MAGENTO_BASE_URL: { ...d.envVarMeta.MAGENTO_BASE_URL, label: 'Country', options: countries } };
+      return { ...d, envVarMeta, envVars: describeAdapterEnvVars({ ...d, envVarMeta }) };
+    };
+    return built;
+  }
+
+  it('lists the choices to the model, with how to pass one', async () => {
+    const { service, ctx } = buildWithChoices();
+    const out: any = (await service.find(ctx, { query: 'magento' })).body;
+    const magento = out.results.find((r: any) => r.adapter === 'magento');
+    expect(magento.settingsYouMayPass).toEqual([
+      {
+        name: 'MAGENTO_BASE_URL',
+        label: 'Country',
+        required: true,
+        help: expect.any(String),
+        example: expect.any(String),
+        options: countries,
+        howToPass: expect.stringMatching(/Ask the user which one applies.*pass the value/),
+      },
+    ]);
+  });
+
+  it('says nothing about choices for a setting without them', async () => {
+    const { service, ctx } = build();
+    const out: any = (await service.find(ctx, { query: 'magento' })).body;
+    const magento = out.results.find((r: any) => r.adapter === 'magento');
+    expect(Object.keys(magento.settingsYouMayPass[0]).sort()).toEqual(['example', 'help', 'label', 'name', 'required']);
+  });
+
+  it('refuses a value that is not one of them, naming the choices, before installing anything', async () => {
+    const { service, ctx, adapters } = buildWithChoices();
+    for (const value of ['https://de.shop.example.test', 'France', 'fr.shop.example.test']) {
+      const out: any = await service.install(ctx, { adapter: 'magento', settings: { MAGENTO_BASE_URL: value } });
+      expect(out.isError).toBe(true);
+      expect(out.body.error).toBe(
+        "'Country' must be one of: France (https://fr.shop.example.test), Spain (https://es.shop.example.test).",
+      );
+      expect(out.body.hint).toMatch(/Ask the user which one applies/);
+    }
+    expect(adapters.importAdapter).not.toHaveBeenCalled();
+  });
+
+  it('installs with a listed value, and without the setting when the user chooses on the page', async () => {
+    const { service, ctx, adapters } = buildWithChoices();
+    const out: any = await service.install(ctx, { adapter: 'magento', settings: { MAGENTO_BASE_URL: ' https://es.shop.example.test ' } });
+    expect(out.isError).toBeFalsy();
+    expect(adapters.importAdapter).toHaveBeenLastCalledWith(
+      'magento',
+      'u1',
+      'org-1',
+      { MAGENTO_BASE_URL: 'https://es.shop.example.test' },
+      { addressMayWait: true },
+    );
+
+    const { service: second, ctx: ctx2, adapters: adapters2 } = buildWithChoices();
+    const empty: any = await second.install(ctx2, { adapter: 'magento', settings: { MAGENTO_BASE_URL: '' } });
+    expect(empty.isError).toBeFalsy();
+    expect(adapters2.importAdapter).toHaveBeenLastCalledWith('magento', 'u1', 'org-1', {}, { addressMayWait: true });
+  });
+});
+
 describe('ConnectorSetupService — status', () => {
   const DAY = 86_400_000;
   const running = (days: number, cardTrialAvailable = true) => ({
@@ -452,6 +658,188 @@ describe('ConnectorSetupService — status', () => {
     const found: any = (await service.find(ctx, { query: 'etsy' })).body;
     const installed: any = (await service.install(ctx, { adapter: 'openplz' })).body;
     expect(JSON.stringify([found, installed])).not.toMatch(/start-trial|choosePlanUrl|daysLeft/);
+  });
+});
+
+describe('ConnectorSetupService — an Odoo address asked before a chat install', () => {
+  /** Answers like an Odoo: `version` on /jsonrpc, `databases` on /web/database/list. */
+  function odoo(opts: { major?: number | string; serie?: string; databases?: string[]; typo?: boolean }) {
+    outbound.mockImplementation(async (config: any) => {
+      if (opts.typo) {
+        return { status: 404, data: '<script>window.location = `https://www.odoo.com/typo?domain=x.odoo.com`;</script>' } as any;
+      }
+      if (config.url.endsWith('/jsonrpc')) {
+        return { status: 200, data: { result: { server_version_info: [opts.major, 0, 0, 'final', 0, ''], server_serie: opts.serie } } } as any;
+      }
+      if (config.url.endsWith('/web/database/list')) return { status: 200, data: { result: opts.databases ?? [] } } as any;
+      throw new Error(`unexpected ${config.url}`);
+    });
+  }
+  afterEach(() => outbound.mockReset().mockRejectedValue(new Error('offline')));
+
+  it('installs the JSON-RPC connector for an Odoo below 19, and the one database it serves', async () => {
+    odoo({ major: 17, serie: '17.0', databases: ['acme-main-123'] });
+    const { service, ctx, adapters } = build();
+    const out: any = await service.install(ctx, {
+      adapter: 'odoo',
+      settings: { ODOO_URL: 'https://acme.odoo.com', ODOO_DB: 'acme' },
+    });
+    expect(out.isError).toBeUndefined();
+    expect(adapters.importAdapter).toHaveBeenCalledWith(
+      'odoo-jsonrpc',
+      'u1',
+      'org-1',
+      { ODOO_URL: 'https://acme.odoo.com', ODOO_DB: 'acme-main-123' },
+      expect.anything(),
+    );
+    expect(out.body.installed).toBe('Odoo 14-18 (JSON-RPC)');
+    expect(out.body.checkedTheAddress).toMatch(/version 17\.0, older than 19/);
+    expect(out.body.checkedTheAddress).toMatch(/called "acme-main-123", not "acme"/);
+    expect(out.body.finishSetupUrl).toMatch(/\/s\//);
+  });
+
+  it('keeps the JSON-2 connector on Odoo 19 and fills in a database the assistant left out', async () => {
+    odoo({ major: 'saas~19', serie: 'saas~19.3', databases: ['acme-main-123'] });
+    const { service, ctx, adapters } = build();
+    const out: any = await service.install(ctx, { adapter: 'odoo', settings: { ODOO_URL: 'https://acme.odoo.com' } });
+    expect(adapters.importAdapter.mock.calls[0][0]).toBe('odoo');
+    expect(adapters.importAdapter.mock.calls[0][3].ODOO_DB).toBe('acme-main-123');
+    expect(out.body.checkedTheAddress).toBe('The database is called "acme-main-123": that name was used.');
+  });
+
+  it('drops a database the address does not serve when it serves several, and names them', async () => {
+    odoo({ major: 19, serie: '19.0', databases: ['prod', 'staging'] });
+    const { service, ctx, adapters } = build();
+    const out: any = await service.install(ctx, {
+      adapter: 'odoo',
+      settings: { ODOO_URL: 'https://erp.example.com', ODOO_DB: 'erp' },
+    });
+    expect(adapters.importAdapter.mock.calls[0][3]).toEqual({ ODOO_URL: 'https://erp.example.com' });
+    expect(out.body.checkedTheAddress).toMatch(/no database "erp"; it serves "prod", "staging"/);
+  });
+
+  it('installs nothing when there is no Odoo database at the address', async () => {
+    odoo({ typo: true });
+    const { service, ctx, adapters } = build();
+    const out: any = await service.install(ctx, { adapter: 'odoo', settings: { ODOO_URL: 'https://acme.odoo.com' } });
+    expect(out.isError).toBe(true);
+    expect(out.body.error).toMatch(/no Odoo database at https:\/\/acme\.odoo\.com/);
+    expect(adapters.importAdapter).not.toHaveBeenCalled();
+  });
+
+  it('installs as asked when the address says nothing, or the right values were passed', async () => {
+    const { service, ctx, adapters } = build();
+    const quiet: any = await service.install(ctx, {
+      adapter: 'odoo',
+      settings: { ODOO_URL: 'https://erp.example.com', ODOO_DB: 'prod' },
+    });
+    expect(quiet.body.checkedTheAddress).toBeUndefined();
+    expect(adapters.importAdapter.mock.calls[0].slice(0, 4)).toEqual([
+      'odoo', 'u1', 'org-1', { ODOO_URL: 'https://erp.example.com', ODOO_DB: 'prod' },
+    ]);
+
+    odoo({ major: 19, serie: '19.0', databases: ['prod'] });
+    const right: any = await build().service.install(ctx, {
+      adapter: 'odoo',
+      settings: { ODOO_URL: 'https://erp.example.com', ODOO_DB: 'prod' },
+    });
+    expect(right.body.checkedTheAddress).toBeUndefined();
+  });
+});
+
+describe('ConnectorSetupService — status of ready connectors', () => {
+  /** A ready (keyless) connector row as status() reads it. */
+  async function readyRow(updatedAt: Date) {
+    const { service, ctx, prisma } = build();
+    await service.install(ctx, { adapter: 'openplz' });
+    const row = await prisma.connector.findUnique({ where: { id: 'c-openplz' } });
+    return { ...row, name: 'OpenPLZ', createdAt: updatedAt, updatedAt };
+  }
+
+  it('says how the last call of a ready connector went', async () => {
+    const row = await readyRow(new Date(Date.now() - 5 * 86_400_000));
+    const at = new Date();
+    const { service, ctx, adapters } = build({
+      connectors: [row],
+      lastCalls: { 'c-openplz': { status: 'ERROR', error: '401 Unauthorized: key revoked', createdAt: at } },
+    });
+    const out: any = (await service.status(ctx)).body;
+    expect(out.connectors[0]).toMatchObject({
+      status: 'ready',
+      lastCall: { ok: false, at: at.toISOString(), error: '401 Unauthorized: key revoked' },
+    });
+    expect(adapters.verifyCredentials).not.toHaveBeenCalled();
+  });
+
+  it('runs the setup check on one finished today and never used, and gives a link to fix it when it fails', async () => {
+    const row = await readyRow(new Date());
+    const { service, ctx, adapters } = build({
+      connectors: [row],
+      verify: { ok: false, kind: 'auth_failed', message: 'The provider refused the key.' },
+    });
+    const out: any = (await service.status(ctx)).body;
+    expect(adapters.verifyCredentials).toHaveBeenCalledWith('openplz', 'org-1', {}, 'c-openplz');
+    expect(out.connectors[0]).toMatchObject({ check: { ok: false, message: 'The provider refused the key.' } });
+    expect(out.connectors[0].fixUrl).toMatch(/\/s\//);
+    expect(out.checkHint).toMatch(/fixUrl/);
+  });
+
+  describe('an app the provider approved, with the sign-in still missing', () => {
+    const etsy = getAdapter('etsy')!;
+    const etsyRow = (watch: Record<string, string> | undefined, envVars: Record<string, string> = {}) => ({
+      id: 'c-etsy',
+      name: 'Etsy',
+      organizationId: 'org-1',
+      authType: 'OAUTH2',
+      authConfig: encrypt(JSON.stringify(etsy.connector.authConfig), KEY),
+      baseUrl: etsy.connector.baseUrl,
+      headers: null,
+      envVars: { ETSY_CLIENT_ID: 'abcdefghijklmnopqrstuvwx', ETSY_CLIENT_SECRET: 'secret1234', ...envVars },
+      config: { adapterSlug: 'etsy', ...(watch ? { appApprovalWatch: watch } : {}) },
+      createdAt: new Date(Date.now() - 2 * 86_400_000),
+      updatedAt: new Date(),
+      tools: [],
+    });
+    const approved = { pendingSince: '2026-11-01T10:00:00.000Z', approvedAt: '2026-11-02T10:00:00.000Z', notifiedAt: '2026-11-02T10:00:00.000Z' };
+
+    it('is said first, with the link that starts the sign-in', async () => {
+      const { service, ctx } = build({ connectors: [etsyRow(approved)] });
+      const out: any = (await service.status(ctx)).body;
+      expect(Object.keys(out)[0]).toBe('appApprovedHint');
+      expect(out.appApprovedHint).toBe(
+        "appApproved: the provider approved the user's app for that connector; only the sign-in is left. Before anything else, tell the user and show them its finishSignInUrl as a clickable link: it starts the provider's sign-in.",
+      );
+      expect(out.connectors[0]).toMatchObject({
+        name: 'Etsy',
+        status: 'needs_authorization',
+        appApproved: true,
+        finishSignInUrl: 'https://cloud.example.com/connectors/c-etsy?signin=1',
+      });
+    });
+
+    it('is absent while the app is pending, and once the user signed in', async () => {
+      const pending = build({ connectors: [etsyRow({ pendingSince: '2026-11-01T10:00:00.000Z' })] });
+      const waiting: any = (await pending.service.status(pending.ctx)).body;
+      expect(waiting.appApprovedHint).toBeUndefined();
+      expect(waiting.connectors[0].status).toBe('needs_authorization');
+      expect(waiting.connectors[0].appApproved).toBeUndefined();
+      expect(waiting.connectors[0].finishSignInUrl).toBeUndefined();
+
+      const signedIn = build({ connectors: [etsyRow(approved, { ETSY_REFRESH_TOKEN: 'rt-1' })] });
+      const done: any = (await signedIn.service.status(signedIn.ctx)).body;
+      expect(done.connectors[0].status).toBe('ready');
+      expect(done.appApprovedHint).toBeUndefined();
+      expect(JSON.stringify(done)).not.toContain('signin=1');
+    });
+  });
+
+  it('leaves an old unused connector unchecked', async () => {
+    const row = await readyRow(new Date(Date.now() - 3 * 86_400_000));
+    const { service, ctx, adapters } = build({ connectors: [row] });
+    const out: any = (await service.status(ctx)).body;
+    expect(adapters.verifyCredentials).not.toHaveBeenCalled();
+    expect(out.connectors[0].check).toBeUndefined();
+    expect(out.checkHint).toBeUndefined();
   });
 });
 
@@ -539,6 +927,22 @@ describe('ConnectorSetupService — links', () => {
     await expect(b.service.resolveLink(token, 'u1')).resolves.toEqual({ error: expect.stringContaining('expired') });
     await expect(b.service.resolveLink('made-up', 'u1')).resolves.toEqual({ error: expect.stringContaining('expired') });
   });
+
+  it('still leads a signed-in user to the setup after the 30 minutes, never anyone else', async () => {
+    // A chat may hand out a link it was given an hour earlier.
+    const b = build();
+    const token = await linkFor(b);
+    b.links[0].expiresAt = new Date(Date.now() - 60 * 60 * 1000);
+    await expect(b.service.resolveLink(token, 'u1', 'claude', { signedIn: true })).resolves.toMatchObject({
+      redirect: expect.stringContaining('/connectors/setup/'),
+    });
+    await expect(b.service.resolveLink(token, 'someone-else', 'claude', { signedIn: true })).resolves.toEqual({
+      error: expect.stringContaining('another account'),
+    });
+    await expect(b.service.resolveLink('made-up', 'u1', undefined, { signedIn: true })).resolves.toEqual({
+      error: expect.stringContaining('expired'),
+    });
+  });
 });
 
 describe('ConnectorSetupService — where a setup call comes from', () => {
@@ -564,6 +968,229 @@ describe('ConnectorSetupService — where a setup call comes from', () => {
       adapterSlug: 'telegram-bot',
       via: 'post_approve',
       verified: false,
+    });
+  });
+});
+
+describe('ConnectorSetupService — a WooCommerce address asked before a chat install', () => {
+  it('uses the address WordPress names itself, and says WooCommerce was found', async () => {
+    const { service, ctx, adapters } = build({
+      woo: {
+        url: 'https://shop.example.com',
+        home: 'https://www.shop.example.com',
+        corrected: 'https://www.shop.example.com',
+        woocommerce: true,
+      },
+    });
+    const out: any = await service.install(ctx, { adapter: 'woocommerce', settings: { WOOCOMMERCE_URL: 'shop.example.com' } });
+    expect(adapters.importAdapter.mock.calls[0][3]).toEqual({ WOOCOMMERCE_URL: 'https://www.shop.example.com' });
+    expect(out.body.checkedTheAddress).toBe(
+      'WooCommerce answers at https://www.shop.example.com: that address was used instead of https://shop.example.com.',
+    );
+    expect(out.body.finishSetupUrl).toMatch(/\/s\//);
+  });
+
+  it('refuses a host name that does not exist, so the assistant asks again', async () => {
+    const { service, ctx, adapters } = build({
+      woo: { url: 'https://shpo.example.com', problem: 'dns', final: true, message: 'No site answers at shpo.example.com: that name does not exist.' },
+    });
+    const out: any = await service.install(ctx, { adapter: 'woocommerce', settings: { WOOCOMMERCE_URL: 'https://shpo.example.com' } });
+    expect(out.isError).toBe(true);
+    expect(out.body.error).toMatch(/that name does not exist/);
+    expect(adapters.importAdapter).not.toHaveBeenCalled();
+  });
+
+  it('installs, and passes on what the user must change in WordPress first, with the link', async () => {
+    const { service, ctx, adapters } = build({
+      woo: {
+        url: 'https://shop.example.com',
+        home: 'https://shop.example.com',
+        problem: 'plain_permalinks',
+        final: true,
+        fixUrl: 'https://shop.example.com/wp-admin/options-permalink.php',
+        message: 'Permalinks are Plain.',
+      },
+    });
+    const out: any = await service.install(ctx, { adapter: 'woocommerce', settings: { WOOCOMMERCE_URL: 'https://shop.example.com' } });
+    expect(adapters.importAdapter).toHaveBeenCalled();
+    expect(out.body.checkedTheAddress).toBe(
+      'Permalinks are Plain. Tell the user this before they create the key, with the link https://shop.example.com/wp-admin/options-permalink.php.',
+    );
+  });
+
+  it('changes nothing when the address says nothing', async () => {
+    const { service, ctx, adapters } = build();
+    const out: any = await service.install(ctx, { adapter: 'woocommerce', settings: { WOOCOMMERCE_URL: 'https://shop.example.com' } });
+    expect(adapters.importAdapter.mock.calls[0][3]).toEqual({ WOOCOMMERCE_URL: 'https://shop.example.com' });
+    expect(out.body.checkedTheAddress).toBeUndefined();
+  });
+});
+
+describe('ConnectorSetupService — unfinished and refused connectors in status', () => {
+  /** A WooCommerce connector installed from a chat without any value, created `ageMs` ago. */
+  async function pendingRow(ageMs: number) {
+    const { service, ctx, prisma } = build();
+    await service.install(ctx, { adapter: 'woocommerce' });
+    const row = await prisma.connector.findUnique({ where: { id: 'c-woocommerce' } });
+    const at = new Date(Date.now() - ageMs);
+    return { ...row, name: 'WooCommerce', envVars: {}, createdAt: at, updatedAt: at };
+  }
+
+  it('offers the link again for a catalog connector still waiting for its values after a day', async () => {
+    const row = await pendingRow(2 * 86_400_000);
+    const { service, ctx } = build({ connectors: [row] });
+    const out: any = (await service.status(ctx)).body;
+    expect(out.connectors[0]).toMatchObject({
+      status: 'needs_input',
+      finishSetupUrl: expect.stringMatching(/\/s\//),
+      unfinishedSince: row.createdAt.toISOString(),
+    });
+    expect(out.unfinishedHint).toMatch(/Offer the user its finishSetupUrl/);
+  });
+
+  it('says nothing extra about one added today', async () => {
+    const row = await pendingRow(60 * 60 * 1000);
+    const { service, ctx } = build({ connectors: [row] });
+    const out: any = (await service.status(ctx)).body;
+    expect(out.connectors[0].finishSetupUrl).toMatch(/\/s\//);
+    expect(out.connectors[0].unfinishedSince).toBeUndefined();
+    expect(out.unfinishedHint).toBeUndefined();
+  });
+
+  it('names a ready connector whose saved credentials the provider keeps refusing, with a link to fix them', async () => {
+    const first = build();
+    await first.service.install(first.ctx, { adapter: 'openplz' });
+    const ready = await first.prisma.connector.findUnique({ where: { id: 'c-openplz' } });
+    const since = new Date(Date.now() - 3 * 86_400_000);
+    const row = {
+      ...ready,
+      name: 'OpenPLZ',
+      createdAt: since,
+      updatedAt: since,
+      authStatus: 'needs_reauth',
+      authStatusMessage: "The API refused this connector's saved credentials on 5 calls in a row (HTTP 401).",
+      authStatusAt: since,
+    };
+    const { service, ctx } = build({ connectors: [row] });
+    const out: any = (await service.status(ctx)).body;
+    expect(out.connectors[0]).toMatchObject({
+      status: 'ready',
+      credential: { ok: false, since: since.toISOString(), message: expect.stringMatching(/5 calls in a row/) },
+      fixUrl: expect.stringMatching(/\/s\//),
+    });
+    expect(out.credentialHint).toMatch(/fixUrl/);
+  });
+});
+
+/**
+ * setup_get_status on the shared endpoint listed up to 50 connectors of the
+ * workspace to any EDITOR, each with its status and, when a call or a
+ * credential failed, the provider's words. In a workspace with restricted
+ * member visibility a member must get there what the dashboard shows them.
+ */
+describe('ConnectorSetupService — status follows member visibility', () => {
+  const since = new Date(Date.now() - 3 * 86_400_000);
+  /** A ready connector the provider refuses, with a failed last call. */
+  async function rows() {
+    const first = build();
+    await first.service.install(first.ctx, { adapter: 'openplz' });
+    const ready = await first.prisma.connector.findUnique({ where: { id: 'c-openplz' } });
+    const refused = {
+      createdAt: since,
+      updatedAt: since,
+      authStatus: 'needs_reauth',
+      authStatusMessage: 'HTTP 401 from erp-db.internal.example.invalid',
+      authStatusAt: since,
+    };
+    return [
+      { ...ready, ...refused, id: 'c-mine', name: 'Mine', userId: 'u1', tools: [{ id: 't-mine', endpointMapping: {} }] },
+      { ...ready, ...refused, id: 'c-shared', name: 'Shared', userId: 'u-admin', tools: [{ id: 't-shared', endpointMapping: {} }] },
+    ];
+  }
+  const lastCalls = {
+    'c-mine': { status: 'ERROR', error: 'own error', createdAt: since },
+    'c-shared': { status: 'ERROR', error: 'timeout talking to erp-db.internal.example.invalid:5432', createdAt: since },
+  };
+
+  it('a restricted editor: the query stays inside the workspace and asks for visible connectors only', async () => {
+    const { service, ctx, prisma } = build({
+      role: 'EDITOR',
+      connectors: await rows(),
+      lastCalls,
+      visibility: { mode: 'restricted', allowed: ['t-shared'] },
+    });
+    await service.status(ctx);
+    expect(prisma.connector.findMany.mock.calls[0][0].where).toEqual({
+      AND: [{ organizationId: 'org-1' }, { OR: [{ userId: 'u1' }, { tools: { some: { id: { in: ['t-shared'] } } } }] }],
+    });
+  });
+
+  it('a restricted editor: their own connector in full, a shared one by name and status only', async () => {
+    const { service, ctx, links, adapters, prisma } = build({
+      role: 'EDITOR',
+      connectors: await rows(),
+      lastCalls,
+      visibility: { mode: 'restricted', allowed: ['t-shared'] },
+    });
+    const out: any = (await service.status(ctx)).body;
+
+    expect(out.connectors[0]).toMatchObject({
+      name: 'Mine',
+      status: 'ready',
+      credential: { ok: false, message: 'HTTP 401 from erp-db.internal.example.invalid' },
+      lastCall: { ok: false, error: 'own error' },
+      fixUrl: expect.stringMatching(/\/s\//),
+    });
+    // The shared one: that it exists and whether it is set up. No provider
+    // message, no last error, no link that opens its setup.
+    expect(out.connectors[1]).toEqual({ name: 'Shared', status: 'ready' });
+    expect(JSON.stringify(out)).not.toContain('5432');
+    expect(links.map((l) => l.connectorId)).toEqual(['c-mine']);
+    // Nothing is read or checked for a connector the member does not manage.
+    expect(prisma.toolInvocation.findFirst.mock.calls.map((c: any[]) => c[0].where.connectorId)).toEqual(['c-mine']);
+    expect(adapters.verifyCredentials).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), 'c-shared');
+  });
+
+  it('a restricted editor without any role sees only what they own', async () => {
+    const { service, ctx, prisma } = build({
+      role: 'EDITOR',
+      connectors: [],
+      visibility: { mode: 'restricted', allowed: [] },
+    });
+    await service.status(ctx);
+    expect(prisma.connector.findMany.mock.calls[0][0].where).toEqual({
+      AND: [{ organizationId: 'org-1' }, { userId: 'u1' }],
+    });
+  });
+
+  it.each([
+    ['an admin of a restricted workspace', 'ADMIN', 'restricted'],
+    ['an editor of an open workspace', 'EDITOR', 'open'],
+  ] as const)('%s reads every connector in full, as before', async (_who, role, mode) => {
+    const { service, ctx, prisma } = build({
+      role,
+      connectors: await rows(),
+      lastCalls,
+      visibility: { mode, allowed: ['t-shared'] },
+    });
+    const out: any = (await service.status(ctx)).body;
+    expect(prisma.connector.findMany.mock.calls[0][0].where).toEqual({ organizationId: 'org-1' });
+    expect(out.connectors[1]).toMatchObject({
+      name: 'Shared',
+      credential: { ok: false, message: 'HTTP 401 from erp-db.internal.example.invalid' },
+      lastCall: { ok: false, error: 'timeout talking to erp-db.internal.example.invalid:5432' },
+      fixUrl: expect.stringMatching(/\/s\//),
+    });
+  });
+
+  it('someone who is no longer a member gets no connector at all', async () => {
+    const { service, ctx, prisma } = build({
+      connectors: [],
+      visibility: { mode: 'restricted', allowed: null },
+    });
+    await service.status(ctx);
+    expect(prisma.connector.findMany.mock.calls[0][0].where).toEqual({
+      AND: [{ organizationId: 'org-1' }, { id: { in: [] } }],
     });
   });
 });
